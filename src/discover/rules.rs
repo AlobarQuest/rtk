@@ -671,6 +671,39 @@ pub const RULES: &[RtkRule] = &[
         savings_pct: 75.0,
         ..RtkRule::DEFAULT
     },
+    // Bun/Deno
+    RtkRule {
+        pattern: r"^bun\s+(install|add|remove|test|build|run|pm)",
+        rtk_cmd: "rtk bun",
+        rewrite_prefixes: &["bun"],
+        category: "PackageManager",
+        savings_pct: 75.0,
+        subcmd_savings: &[("test", 90.0), ("install", 80.0)],
+        subcmd_status: &[("run", RtkStatus::Passthrough)],
+        ..RtkRule::DEFAULT
+    },
+    RtkRule {
+        pattern: r"^bunx\s+",
+        rtk_cmd: "rtk bunx",
+        rewrite_prefixes: &["bunx"],
+        category: "PackageManager",
+        savings_pct: 70.0,
+        ..RtkRule::DEFAULT
+    },
+    RtkRule {
+        pattern: r"^deno\s+(test|lint|check|run|task|compile|install)",
+        rtk_cmd: "rtk deno",
+        rewrite_prefixes: &["deno"],
+        category: "Build",
+        savings_pct: 75.0,
+        subcmd_savings: &[("test", 90.0), ("lint", 80.0)],
+        subcmd_status: &[
+            ("run", RtkStatus::Passthrough),
+            ("task", RtkStatus::Passthrough),
+        ],
+        ..RtkRule::DEFAULT
+    },
+    // TOML-filtered commands
     RtkRule {
         pattern: r"^ansible-playbook\b",
         rtk_cmd: "rtk ansible-playbook",
