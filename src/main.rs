@@ -2407,91 +2407,82 @@ fn run_cli() -> Result<i32> {
             CargoCommands::Other(args) => cargo_cmd::run_passthrough(&args, cli.verbose)?,
         },
 
-        Commands::Bun { command } => {
-            match command {
-                BunCommands::Install { args }
-                | BunCommands::Add { args }
-                | BunCommands::Remove { args } => {
-                    bun_cmd::run_install(&args, cli.verbose)?;
-                }
-                BunCommands::Run { args } => {
-                    bun_cmd::run_run(&args, cli.verbose)?;
-                }
-                BunCommands::Build { args } => {
-                    let cmd = format!("bun build {}", args.join(" "));
-                    runner::run_err(&cmd, cli.verbose)?;
-                }
-                BunCommands::Test { args } => {
-                    let cmd = format!("bun test {}", args.join(" "));
-                    runner::run_test(&cmd, cli.verbose)?;
-                }
-                BunCommands::Pm { args } => {
-                    if args.first().map(|s| s.as_str()) == Some("ls") {
-                        bun_cmd::run_pm_ls(&args[1..], cli.verbose)?;
-                    } else {
-                        bun_cmd::run_other(
-                            &args.iter().map(OsString::from).collect::<Vec<_>>(),
-                            cli.verbose,
-                        )?;
-                    }
-                }
-                BunCommands::Other(args) => {
-                    bun_cmd::run_other(&args, cli.verbose)?;
+        Commands::Bun { command } => match command {
+            BunCommands::Install { args } => bun_cmd::run_pkg("install", &args, cli.verbose)?,
+            BunCommands::Add { args } => bun_cmd::run_pkg("add", &args, cli.verbose)?,
+            BunCommands::Remove { args } => bun_cmd::run_pkg("remove", &args, cli.verbose)?,
+            BunCommands::Run { args } => {
+                let os_args: Vec<OsString> = std::iter::once(OsString::from("run"))
+                    .chain(args.into_iter().map(OsString::from))
+                    .collect();
+                bun_cmd::run_passthrough(&os_args, cli.verbose)?
+            }
+            BunCommands::Build { args } => {
+                let cmd = format!("bun build {}", args.join(" "));
+                runner::run_err(&cmd, cli.verbose)?
+            }
+            BunCommands::Test { args } => {
+                let cmd = format!("bun test {}", args.join(" "));
+                runner::run_test(&cmd, cli.verbose)?
+            }
+            BunCommands::Pm { args } => {
+                if args.first().map(|s| s.as_str()) == Some("ls") {
+                    bun_cmd::run_pm_ls(&args[1..], cli.verbose)?
+                } else {
+                    let os_args: Vec<OsString> = std::iter::once(OsString::from("pm"))
+                        .chain(args.into_iter().map(OsString::from))
+                        .collect();
+                    bun_cmd::run_passthrough(&os_args, cli.verbose)?
                 }
             }
-            0
-        }
+            BunCommands::Other(args) => bun_cmd::run_passthrough(&args, cli.verbose)?,
+        },
 
         Commands::Bunx { args } => {
             if args.is_empty() {
                 anyhow::bail!("bunx requires a command argument");
             }
             match args[0].as_str() {
-                "tsc" | "typescript" => {
-                    tsc_cmd::run(&args[1..], cli.verbose)?;
-                }
-                "eslint" => {
-                    lint_cmd::run(&args[1..], cli.verbose)?;
-                }
+                "tsc" | "typescript" => tsc_cmd::run(&args[1..], cli.verbose)?,
+                "eslint" => lint_cmd::run(&args[1..], cli.verbose)?,
                 _ => {
                     let cmd = format!("bunx {}", args.join(" "));
-                    runner::run_err(&cmd, cli.verbose)?;
+                    runner::run_err(&cmd, cli.verbose)?
                 }
             }
-            0
         }
 
-        Commands::Deno { command } => {
-            match command {
-                DenoCommands::Test { args } => {
-                    let cmd = format!("deno test {}", args.join(" "));
-                    runner::run_test(&cmd, cli.verbose)?;
-                }
-                DenoCommands::Check { args } => {
-                    deno_cmd::run_check(&args, cli.verbose)?;
-                }
-                DenoCommands::Lint { args } => {
-                    deno_cmd::run_lint(&args, cli.verbose)?;
-                }
-                DenoCommands::Run { args } | DenoCommands::Task { args } => {
-                    deno_cmd::run_task(&args, cli.verbose)?;
-                }
-                DenoCommands::Compile { args } => {
-                    let cmd = format!("deno compile {}", args.join(" "));
-                    runner::run_err(&cmd, cli.verbose)?;
-                }
-                DenoCommands::Install { args } => {
-                    deno_cmd::run_other(
-                        &args.iter().map(OsString::from).collect::<Vec<_>>(),
-                        cli.verbose,
-                    )?;
-                }
-                DenoCommands::Other(args) => {
-                    deno_cmd::run_other(&args, cli.verbose)?;
-                }
+        Commands::Deno { command } => match command {
+            DenoCommands::Test { args } => {
+                let cmd = format!("deno test {}", args.join(" "));
+                runner::run_test(&cmd, cli.verbose)?
             }
-            0
-        }
+            DenoCommands::Check { args } => deno_cmd::run_check(&args, cli.verbose)?,
+            DenoCommands::Lint { args } => deno_cmd::run_lint(&args, cli.verbose)?,
+            DenoCommands::Run { args } => {
+                let os_args: Vec<OsString> = std::iter::once(OsString::from("run"))
+                    .chain(args.into_iter().map(OsString::from))
+                    .collect();
+                deno_cmd::run_passthrough(&os_args, cli.verbose)?
+            }
+            DenoCommands::Task { args } => {
+                let os_args: Vec<OsString> = std::iter::once(OsString::from("task"))
+                    .chain(args.into_iter().map(OsString::from))
+                    .collect();
+                deno_cmd::run_passthrough(&os_args, cli.verbose)?
+            }
+            DenoCommands::Compile { args } => {
+                let cmd = format!("deno compile {}", args.join(" "));
+                runner::run_err(&cmd, cli.verbose)?
+            }
+            DenoCommands::Install { args } => {
+                let os_args: Vec<OsString> = std::iter::once(OsString::from("install"))
+                    .chain(args.into_iter().map(OsString::from))
+                    .collect();
+                deno_cmd::run_passthrough(&os_args, cli.verbose)?
+            }
+            DenoCommands::Other(args) => deno_cmd::run_passthrough(&args, cli.verbose)?,
+        },
 
         Commands::Npm { args } => npm_cmd::run(&args, cli.verbose, cli.skip_env)?,
 

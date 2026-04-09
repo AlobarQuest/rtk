@@ -1,11 +1,14 @@
+//! Filters deno output — lint, check, and task command output.
+
 use crate::core::tracking;
+use crate::core::utils::{exit_code_from_output, resolved_command, strip_ansi};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
-use std::process::Command;
 
-/// Filter deno output: strip download lines and empty lines.
+/// Filter deno output: strip ANSI codes, download lines, and empty lines.
 pub fn filter_deno_output(output: &str) -> String {
-    let filtered: Vec<&str> = output
+    let cleaned = strip_ansi(output);
+    let filtered: Vec<&str> = cleaned
         .lines()
         .filter(|line| {
             let trimmed = line.trim();
@@ -20,189 +23,66 @@ pub fn filter_deno_output(output: &str) -> String {
     }
 }
 
-pub fn run_lint(args: &[String], verbose: u8) -> Result<()> {
+/// Run a deno subcommand with filtered output and tee recovery.
+fn run_filtered_subcmd(subcmd: &str, args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    let mut cmd = Command::new("deno");
-    cmd.arg("lint");
+    let mut cmd = resolved_command("deno");
+    cmd.arg(subcmd);
     for arg in args {
         cmd.arg(arg);
     }
 
     if verbose > 0 {
-        eprintln!("Running: deno lint {}", args.join(" "));
+        eprintln!("Running: deno {} {}", subcmd, args.join(" "));
     }
 
     let output = cmd
         .output()
-        .context("Failed to run deno lint. Is Deno installed?")?;
+        .with_context(|| format!("Failed to run deno {}. Is Deno installed?", subcmd))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let raw = format!("{}\n{}", stdout, stderr);
+    let combined = format!("{}{}", stdout, stderr);
 
-    let exit_code = output
-        .status
-        .code()
-        .unwrap_or(if output.status.success() { 0 } else { 1 });
-    let filtered = filter_deno_output(&raw);
+    let exit_code = exit_code_from_output(&output, "deno");
+    let filtered = filter_deno_output(&combined);
 
-    if let Some(hint) = crate::core::tee::tee_and_hint(&raw, "deno_lint", exit_code) {
+    if let Some(hint) = crate::core::tee::tee_and_hint(&combined, &format!("deno_{}", subcmd), exit_code) {
         println!("{}\n{}", filtered, hint);
     } else {
         println!("{}", filtered);
     }
 
     timer.track(
-        &format!("deno lint {}", args.join(" ")),
-        &format!("rtk deno lint {}", args.join(" ")),
-        &raw,
+        &format!("deno {} {}", subcmd, args.join(" ")),
+        &format!("rtk deno {} {}", subcmd, args.join(" ")),
+        &combined,
         &filtered,
     );
 
-    if !output.status.success() {
-        std::process::exit(exit_code);
-    }
-
-    Ok(())
+    Ok(exit_code)
 }
 
-pub fn run_check(args: &[String], verbose: u8) -> Result<()> {
-    let timer = tracking::TimedExecution::start();
-
-    let mut cmd = Command::new("deno");
-    cmd.arg("check");
-    for arg in args {
-        cmd.arg(arg);
-    }
-
-    if verbose > 0 {
-        eprintln!("Running: deno check {}", args.join(" "));
-    }
-
-    let output = cmd
-        .output()
-        .context("Failed to run deno check. Is Deno installed?")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let raw = format!("{}\n{}", stdout, stderr);
-
-    let exit_code = output
-        .status
-        .code()
-        .unwrap_or(if output.status.success() { 0 } else { 1 });
-    let filtered = filter_deno_output(&raw);
-
-    if let Some(hint) = crate::core::tee::tee_and_hint(&raw, "deno_check", exit_code) {
-        println!("{}\n{}", filtered, hint);
-    } else {
-        println!("{}", filtered);
-    }
-
-    timer.track(
-        &format!("deno check {}", args.join(" ")),
-        &format!("rtk deno check {}", args.join(" ")),
-        &raw,
-        &filtered,
-    );
-
-    if !output.status.success() {
-        std::process::exit(exit_code);
-    }
-
-    Ok(())
+pub fn run_lint(args: &[String], verbose: u8) -> Result<i32> {
+    run_filtered_subcmd("lint", args, verbose)
 }
 
-pub fn run_task(args: &[String], verbose: u8) -> Result<()> {
-    let timer = tracking::TimedExecution::start();
-
-    let mut cmd = Command::new("deno");
-    cmd.arg("task");
-    for arg in args {
-        cmd.arg(arg);
-    }
-
-    if verbose > 0 {
-        eprintln!("Running: deno task {}", args.join(" "));
-    }
-
-    let output = cmd
-        .output()
-        .context("Failed to run deno task. Is Deno installed?")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let raw = format!("{}\n{}", stdout, stderr);
-
-    let exit_code = output
-        .status
-        .code()
-        .unwrap_or(if output.status.success() { 0 } else { 1 });
-    let filtered = filter_deno_output(&raw);
-
-    println!("{}", filtered);
-
-    timer.track(
-        &format!("deno task {}", args.join(" ")),
-        &format!("rtk deno task {}", args.join(" ")),
-        &raw,
-        &filtered,
-    );
-
-    if !output.status.success() {
-        std::process::exit(exit_code);
-    }
-
-    Ok(())
+pub fn run_check(args: &[String], verbose: u8) -> Result<i32> {
+    run_filtered_subcmd("check", args, verbose)
 }
 
-pub fn run_other(args: &[OsString], verbose: u8) -> Result<()> {
-    if args.is_empty() {
-        anyhow::bail!("deno: no subcommand specified");
-    }
-
-    let timer = tracking::TimedExecution::start();
-
-    let subcommand = args[0].to_string_lossy();
-    let mut cmd = Command::new("deno");
-    cmd.arg(&*subcommand);
-    for arg in &args[1..] {
-        cmd.arg(arg);
-    }
-
-    if verbose > 0 {
-        eprintln!("Running: deno {} ...", subcommand);
-    }
-
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to run deno {}", subcommand))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let raw = format!("{}\n{}", stdout, stderr);
-
-    print!("{}", stdout);
-    eprint!("{}", stderr);
-
-    timer.track(
-        &format!("deno {}", subcommand),
-        &format!("rtk deno {}", subcommand),
-        &raw,
-        &raw,
-    );
-
-    if !output.status.success() {
-        std::process::exit(output.status.code().unwrap_or(1));
-    }
-
-    Ok(())
+/// Passthrough for `deno run`, `deno task`, and other unfiltered subcommands.
+pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
+    crate::core::runner::run_passthrough("deno", args, verbose)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn count_tokens(text: &str) -> usize {
+        text.split_whitespace().count()
+    }
 
     #[test]
     fn test_filter_deno_output_strips_download() {
@@ -218,6 +98,37 @@ some warning here"#;
     }
 
     #[test]
+    fn test_filter_deno_output_token_savings() {
+        // Realistic deno output with many download lines before actual content
+        let input = r#"Download https://deno.land/std@0.200.0/path/mod.ts
+Download https://deno.land/x/oak@v12.6.1/mod.ts
+Download https://deno.land/std@0.200.0/fmt/colors.ts
+Download https://deno.land/std@0.200.0/io/mod.ts
+Download https://deno.land/std@0.200.0/http/server.ts
+Download https://deno.land/std@0.200.0/async/mod.ts
+Download https://deno.land/std@0.200.0/testing/asserts.ts
+Download https://deno.land/std@0.200.0/encoding/base64.ts
+Download https://deno.land/std@0.200.0/crypto/mod.ts
+Download https://deno.land/std@0.200.0/streams/mod.ts
+Download https://deno.land/std@0.200.0/bytes/mod.ts
+Download https://deno.land/std@0.200.0/collections/mod.ts
+Download https://deno.land/std@0.200.0/datetime/mod.ts
+Download https://deno.land/std@0.200.0/flags/mod.ts
+Download https://deno.land/std@0.200.0/uuid/mod.ts
+Check file:///project/main.ts
+error: Expected ';' at main.ts:5:10
+warning: Unused variable 'x' at main.ts:3:7
+"#;
+        let output = filter_deno_output(input);
+        let savings = 100.0 - (count_tokens(&output) as f64 / count_tokens(input) as f64 * 100.0);
+        assert!(
+            savings >= 60.0,
+            "Deno filter: expected >=60% savings, got {:.1}%",
+            savings
+        );
+    }
+
+    #[test]
     fn test_filter_deno_output_empty() {
         let input = r#"Download https://deno.land/std@0.200.0/path/mod.ts
 
@@ -227,6 +138,14 @@ Download https://deno.land/x/oak@v12.6.1/mod.ts
 
         let result = filter_deno_output(input);
         assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn test_filter_deno_strips_ansi() {
+        let input = "\x1b[33mDownload https://deno.land/std@0.200.0/path/mod.ts\x1b[0m\n\x1b[31merror: something\x1b[0m\n";
+        let result = filter_deno_output(input);
+        assert!(!result.contains("Download"));
+        assert!(result.contains("error: something"));
     }
 
     #[test]
