@@ -1,0 +1,11 @@
+---
+source: src/cmds/php/phpt_cmd.rs
+expression: filter_phpt_output(input)
+---
+phpt: 1 passed, 1 failed, 1 skipped, 1 xfailed  (4 total, 2.5s)
+PHP 8.4.20  SAPI cli  OS Linux
+
+FAILURES (1):
+  Zend/tests/d.phpt -- Bug #123
+    001- int(1)
+    001+ int(2)
