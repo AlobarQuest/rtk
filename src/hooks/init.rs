@@ -5836,6 +5836,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_claude_md_mode_refuses_malformed_block() {
+        // Mirrors `test_copilot_init_refuses_malformed_block`: a malformed
+        // CLAUDE.md previously emitted a warning and exited 0, silently
+        // skipping the OpenCode plugin step. The shared `write_rtk_block`
+        // dispatcher now bails for both paths.
+        let tmp = TempDir::new().unwrap();
+        with_claude_dir_override(&tmp, |claude_dir| {
+            let claude_md = claude_dir.join(CLAUDE_MD);
+            let malformed = format!(
+                "# Existing notes\n\n{}\nincomplete RTK block\n",
+                RTK_BLOCK_START
+            );
+            fs::write(&claude_md, &malformed).unwrap();
+
+            let result = run_claude_md_mode(true, false, InitContext::default());
+
+            assert!(
+                result.is_err(),
+                "Malformed CLAUDE.md must cause a hard error, not silent skip"
+            );
+
+            let after = fs::read_to_string(&claude_md).unwrap();
+            assert_eq!(after, malformed, "File must not be modified when malformed");
+        });
+    }
+
     // ─── Pi integration tests ───────────────────────────────────────────
 
     #[test]
@@ -6015,6 +6042,78 @@ mod tests {
             !tmp.path().join(".pi").join(PI_EXTENSIONS_SUBDIR).exists(),
             "dry-run must not create .pi/extensions/"
         );
+    }
+
+    #[test]
+    fn test_pi_global_uninstall_dry_run_keeps_plugin() {
+        let tmp = TempDir::new().unwrap();
+        with_pi_dir_override(&tmp, |pi_dir| {
+            run_pi_mode(true, InitContext::default()).unwrap();
+            let plugin = pi_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
+            assert!(
+                plugin.exists(),
+                "plugin must exist before uninstall dry-run"
+            );
+
+            uninstall(
+                true,
+                false,
+                false,
+                false,
+                true,
+                InitContext {
+                    verbose: 0,
+                    dry_run: true,
+                },
+            )
+            .unwrap();
+
+            assert!(
+                plugin.exists(),
+                "dry-run uninstall must not remove the Pi extension"
+            );
+        });
+    }
+
+    #[test]
+    fn test_pi_local_uninstall_dry_run_keeps_plugin() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        run_pi_mode(false, InitContext::default()).unwrap();
+        let plugin = tmp
+            .path()
+            .join(".pi")
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE);
+        assert!(
+            plugin.exists(),
+            "plugin must exist before uninstall dry-run"
+        );
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext {
+                verbose: 0,
+                dry_run: true,
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+        result.unwrap();
+
+        assert!(
+            plugin.exists(),
+            "dry-run uninstall must not remove the local Pi extension"
+        );
+    }
+
+    // ─── Copilot tests ───────────────────────────────────────────────
 
     #[test]
     fn test_copilot_init_preserves_existing_instructions() {
@@ -6191,100 +6290,5 @@ mod tests {
             "Hook config must not be written when the upsert aborts: {}",
             hook_path.display()
         );
-    }
-
-    #[test]
-    fn test_pi_global_uninstall_dry_run_keeps_plugin() {
-        let tmp = TempDir::new().unwrap();
-        with_pi_dir_override(&tmp, |pi_dir| {
-            run_pi_mode(true, InitContext::default()).unwrap();
-            let plugin = pi_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
-            assert!(
-                plugin.exists(),
-                "plugin must exist before uninstall dry-run"
-            );
-
-            uninstall(
-                true,
-                false,
-                false,
-                false,
-                true,
-                InitContext {
-                    verbose: 0,
-                    dry_run: true,
-                },
-            )
-            .unwrap();
-
-            assert!(
-                plugin.exists(),
-                "dry-run uninstall must not remove the Pi extension"
-            );
-        });
-    }
-
-    #[test]
-    fn test_pi_local_uninstall_dry_run_keeps_plugin() {
-        let tmp = TempDir::new().unwrap();
-        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
-
-        run_pi_mode(false, InitContext::default()).unwrap();
-        let plugin = tmp
-            .path()
-            .join(".pi")
-            .join(PI_EXTENSIONS_SUBDIR)
-            .join(PI_PLUGIN_FILE);
-        assert!(
-            plugin.exists(),
-            "plugin must exist before uninstall dry-run"
-        );
-
-        let result = uninstall(
-            false,
-            false,
-            false,
-            false,
-            true,
-            InitContext {
-                verbose: 0,
-                dry_run: true,
-            },
-        );
-        std::env::set_current_dir(&cwd).unwrap();
-        result.unwrap();
-
-        assert!(
-            plugin.exists(),
-            "dry-run uninstall must not remove the local Pi extension"
-        );
-
-
-    fn test_claude_md_mode_refuses_malformed_block() {
-        // Mirrors `test_copilot_init_refuses_malformed_block`: a malformed
-        // CLAUDE.md previously emitted a warning and exited 0, silently
-        // skipping the OpenCode plugin step. The shared `write_rtk_block`
-        // dispatcher now bails for both paths.
-        let tmp = TempDir::new().unwrap();
-        with_claude_dir_override(&tmp, |claude_dir| {
-            let claude_md = claude_dir.join(CLAUDE_MD);
-            let malformed = format!(
-                "# Existing notes\n\n{}\nincomplete RTK block\n",
-                RTK_BLOCK_START
-            );
-            fs::write(&claude_md, &malformed).unwrap();
-
-            let result = run_claude_md_mode(true, false, InitContext::default());
-
-            assert!(
-                result.is_err(),
-                "Malformed CLAUDE.md must cause a hard error, not silent skip"
-            );
-
-            let after = fs::read_to_string(&claude_md).unwrap();
-            assert_eq!(after, malformed, "File must not be modified when malformed");
-        });
     }
 }
