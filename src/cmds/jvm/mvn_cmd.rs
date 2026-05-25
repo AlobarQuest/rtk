@@ -144,16 +144,167 @@ fn keep_outside_block(line: &str) -> bool {
 
 // ── Surefire block filter ───────────────────────────────────────────────────
 
+/// Shared state machine driving the inner Surefire block + failure-trail
+/// behaviour for `filter_surefire` and `filter_package`. Each filter wraps it
+/// with its own outside-block keep logic (`[WARNING]` dedup, module-banner
+/// keep, `keep_continuation` for compile-error continuations, etc.) which is
+/// applied on the [`SurefireStep::Passthrough`] arm.
+///
+/// Inner machine responsibilities:
+///   - `[INFO] --- … @ … ---` plugin banner skip
+///   - `[INFO] Running <FQN>` opens a buffered block (flushes any prior open
+///     block as keep — happens on truncated output)
+///   - in-block buffering until the next CLOSE line
+///   - CLOSE with `Failures > 0` or `Errors > 0` → yields
+///     [`SurefireStep::FailingClose`] so the outer loop can decide whether to
+///     emit (Commit D uses this seam to enforce `mvn_max_failures`)
+///   - failure-trail handling for the exception/user-frame trail Surefire 3.x
+///     emits **after** the close line, terminated by a blank line. Framework
+///     frames (junit, jdk.proxy, java.base, etc.) are stripped from both the
+///     buffered block and the trail; user-code frames are preserved.
+struct SurefireBlock {
+    block_lines: Vec<String>,
+    block_running: Option<String>,
+    in_block: bool,
+    failure_trail: bool,
+}
+
+enum SurefireStep {
+    /// Inner machine consumed the line; outer loop should `continue;`.
+    Consumed,
+    /// A CLOSE line with `Failures > 0` or `Errors > 0` was reached. Outer
+    /// loop decides whether to commit (via [`SurefireBlock::commit_failing`]).
+    FailingClose {
+        running: Option<String>,
+        lines: Vec<String>,
+        close: String,
+    },
+    /// Inner machine did not handle the line; outer loop applies its own
+    /// outside-block keep logic.
+    Passthrough,
+}
+
+impl SurefireBlock {
+    fn new() -> Self {
+        Self {
+            block_lines: Vec::new(),
+            block_running: None,
+            in_block: false,
+            failure_trail: false,
+        }
+    }
+
+    fn step(&mut self, line: &str, out: &mut String) -> SurefireStep {
+        if PLUGIN_BANNER.is_match(line) {
+            return SurefireStep::Consumed;
+        }
+
+        if RUNNING.is_match(line) {
+            if self.in_block {
+                self.flush_open_block_as_keep(out);
+            }
+            self.block_lines.clear();
+            self.block_running = Some(line.to_string());
+            self.in_block = true;
+            self.failure_trail = false;
+            return SurefireStep::Consumed;
+        }
+
+        if self.in_block {
+            if let Some(caps) = CLOSE.captures(line) {
+                let fail = caps.get(1).map(|m| m.as_str() != "0").unwrap_or(false);
+                let err = caps.get(2).map(|m| m.as_str() != "0").unwrap_or(false);
+                if fail || err {
+                    let lines = std::mem::take(&mut self.block_lines);
+                    let running = self.block_running.take();
+                    self.in_block = false;
+                    return SurefireStep::FailingClose {
+                        running,
+                        lines,
+                        close: line.to_string(),
+                    };
+                }
+                self.block_lines.clear();
+                self.block_running = None;
+                self.in_block = false;
+                return SurefireStep::Consumed;
+            }
+            self.block_lines.push(line.to_string());
+            return SurefireStep::Consumed;
+        }
+
+        if self.failure_trail {
+            if line.is_empty() {
+                out.push('\n');
+                self.failure_trail = false;
+                return SurefireStep::Consumed;
+            }
+            let t = line.trim_start();
+            if t.starts_with("at ") && is_framework_frame(t) {
+                return SurefireStep::Consumed;
+            }
+            out.push_str(line);
+            out.push('\n');
+            return SurefireStep::Consumed;
+        }
+
+        SurefireStep::Passthrough
+    }
+
+    /// Commit a `FailingClose` to `out`: writes `running`, then `lines` (with
+    /// framework frames stripped), then `close`. Enables `failure_trail` so
+    /// the post-close exception/user-frame trail is preserved.
+    fn commit_failing(
+        &mut self,
+        out: &mut String,
+        running: Option<&str>,
+        lines: &[String],
+        close: &str,
+    ) {
+        if let Some(r) = running {
+            out.push_str(r);
+            out.push('\n');
+        }
+        for l in lines {
+            let t = l.trim_start();
+            if t.starts_with("at ") && is_framework_frame(t) {
+                continue;
+            }
+            out.push_str(l);
+            out.push('\n');
+        }
+        out.push_str(close);
+        out.push('\n');
+        self.failure_trail = true;
+    }
+
+    /// End-of-stream flush: if a block opened and never closed (truncated
+    /// output), surface what we have rather than dropping it silently.
+    fn finish(&mut self, out: &mut String) {
+        if self.in_block {
+            self.flush_open_block_as_keep(out);
+        }
+    }
+
+    fn flush_open_block_as_keep(&mut self, out: &mut String) {
+        if let Some(r) = self.block_running.take() {
+            out.push_str(&r);
+            out.push('\n');
+        }
+        for l in self.block_lines.drain(..) {
+            out.push_str(&l);
+            out.push('\n');
+        }
+        self.in_block = false;
+    }
+}
+
 /// Buffered single-pass filter for `mvn test` / `mvn integration-test`.
 ///
-/// State machine: when a `[INFO] Running <FQN>` line is seen, start buffering
-/// the block. When the close line arrives, decide:
-/// - Failures == 0 && Errors == 0 → drop the block silently.
-/// - Else → emit the block with framework frames stripped, then enter a
-///   failure-trail mode that preserves the exception line and user-code
-///   frames Surefire 3.x emits *after* the close line (until the next
-///   blank line ends the trail). Raw durations are preserved — the
-///   user/LLM needs them.
+/// Drives [`SurefireBlock`] for the inner block/trail machine; applies the
+/// outside-block keep-list with `keep_continuation` for indented compile-error
+/// continuations (`symbol:` / `location:` after a `[ERROR] cannot find symbol`
+/// line).
 ///
 /// English-footer guard: if no `BUILD SUCCESS`/`BUILD FAILURE` line is present,
 /// return the ANSI-stripped raw input (non-English locale or truncated output).
@@ -164,61 +315,22 @@ pub fn filter_surefire(raw: &str) -> String {
     }
 
     let mut out = String::new();
-    let mut block_lines: Vec<String> = Vec::new();
-    let mut block_running: Option<String> = None;
-    let mut in_block = false;
-    let mut failure_trail = false;
+    let mut block = SurefireBlock::new();
     let mut keep_continuation = false;
 
     for line in stripped.lines() {
-        if PLUGIN_BANNER.is_match(line) {
-            continue;
-        }
-
-        if RUNNING.is_match(line) {
-            if in_block {
-                flush_block_as_keep(&mut out, &block_running, &block_lines);
-            }
-            block_lines.clear();
-            block_running = Some(line.to_string());
-            in_block = true;
-            failure_trail = false;
-            keep_continuation = false;
-            continue;
-        }
-
-        if in_block {
-            if let Some(caps) = CLOSE.captures(line) {
-                let fail = caps.get(1).map(|m| m.as_str() != "0").unwrap_or(false);
-                let err = caps.get(2).map(|m| m.as_str() != "0").unwrap_or(false);
-                if fail || err {
-                    emit_block(&mut out, &block_running, &block_lines);
-                    out.push_str(line);
-                    out.push('\n');
-                    failure_trail = true;
-                }
-                block_lines.clear();
-                block_running = None;
-                in_block = false;
+        match block.step(line, &mut out) {
+            SurefireStep::Consumed => continue,
+            SurefireStep::FailingClose {
+                running,
+                lines,
+                close,
+            } => {
+                block.commit_failing(&mut out, running.as_deref(), &lines, &close);
+                keep_continuation = false;
                 continue;
             }
-            block_lines.push(line.to_string());
-            continue;
-        }
-
-        if failure_trail {
-            if line.is_empty() {
-                out.push('\n');
-                failure_trail = false;
-                continue;
-            }
-            let t = line.trim_start();
-            if t.starts_with("at ") && is_framework_frame(t) {
-                continue;
-            }
-            out.push_str(line);
-            out.push('\n');
-            continue;
+            SurefireStep::Passthrough => {}
         }
 
         if keep_continuation && (line.starts_with(' ') || line.starts_with('\t')) {
@@ -238,36 +350,8 @@ pub fn filter_surefire(raw: &str) -> String {
         }
     }
 
-    if in_block {
-        flush_block_as_keep(&mut out, &block_running, &block_lines);
-    }
+    block.finish(&mut out);
     out
-}
-
-fn flush_block_as_keep(out: &mut String, running: &Option<String>, lines: &[String]) {
-    if let Some(r) = running {
-        out.push_str(r);
-        out.push('\n');
-    }
-    for l in lines {
-        out.push_str(l);
-        out.push('\n');
-    }
-}
-
-fn emit_block(out: &mut String, running: &Option<String>, lines: &[String]) {
-    if let Some(r) = running {
-        out.push_str(r);
-        out.push('\n');
-    }
-    for l in lines {
-        let t = l.trim_start();
-        if t.starts_with("at ") && is_framework_frame(t) {
-            continue;
-        }
-        out.push_str(l);
-        out.push('\n');
-    }
 }
 
 // ── Compile filter ──────────────────────────────────────────────────────────
@@ -350,62 +434,23 @@ pub fn filter_package(raw: &str) -> String {
     }
 
     let mut out = String::new();
-    let mut block_lines: Vec<String> = Vec::new();
-    let mut block_running: Option<String> = None;
-    let mut in_block = false;
+    let mut block = SurefireBlock::new();
     let mut keep_continuation = false;
-    let mut failure_trail = false;
     let mut seen_warnings: HashSet<String> = HashSet::new();
 
     for line in stripped.lines() {
-        if PLUGIN_BANNER.is_match(line) {
-            continue;
-        }
-
-        if RUNNING.is_match(line) {
-            if in_block {
-                flush_block_as_keep(&mut out, &block_running, &block_lines);
-            }
-            block_lines.clear();
-            block_running = Some(line.to_string());
-            in_block = true;
-            keep_continuation = false;
-            failure_trail = false;
-            continue;
-        }
-
-        if in_block {
-            if let Some(caps) = CLOSE.captures(line) {
-                let fail = caps.get(1).map(|m| m.as_str() != "0").unwrap_or(false);
-                let err = caps.get(2).map(|m| m.as_str() != "0").unwrap_or(false);
-                if fail || err {
-                    emit_block(&mut out, &block_running, &block_lines);
-                    out.push_str(line);
-                    out.push('\n');
-                    failure_trail = true;
-                }
-                block_lines.clear();
-                block_running = None;
-                in_block = false;
+        match block.step(line, &mut out) {
+            SurefireStep::Consumed => continue,
+            SurefireStep::FailingClose {
+                running,
+                lines,
+                close,
+            } => {
+                block.commit_failing(&mut out, running.as_deref(), &lines, &close);
+                keep_continuation = false;
                 continue;
             }
-            block_lines.push(line.to_string());
-            continue;
-        }
-
-        if failure_trail {
-            if line.is_empty() {
-                out.push('\n');
-                failure_trail = false;
-                continue;
-            }
-            let t = line.trim_start();
-            if t.starts_with("at ") && is_framework_frame(t) {
-                continue;
-            }
-            out.push_str(line);
-            out.push('\n');
-            continue;
+            SurefireStep::Passthrough => {}
         }
 
         // Outside any Surefire block: compile-keep AND surefire-outside-keep merge.
@@ -437,9 +482,7 @@ pub fn filter_package(raw: &str) -> String {
         keep_continuation = false;
     }
 
-    if in_block {
-        flush_block_as_keep(&mut out, &block_running, &block_lines);
-    }
+    block.finish(&mut out);
     out
 }
 
