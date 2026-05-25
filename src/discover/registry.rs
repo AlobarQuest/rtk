@@ -450,7 +450,7 @@ lazy_static! {
     /// trailing whitespace prevents double spaces in cases like
     /// `git diff \<NL>HEAD~1`.
     static ref LINE_CONTINUATION_RE: Regex =
-        Regex::new(r"[ \t]*\\(?:\r\n|\n)[ \t]*").unwrap();
+        Regex::new(r"(?m)[ \t\x0B\x0C]*\\\r?\n[ \t\x0B\x0C]*").unwrap();
 }
 
 /// Replace every bash line continuation with a single space, mirroring
