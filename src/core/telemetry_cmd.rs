@@ -4,6 +4,44 @@ use clap::Subcommand;
 const TELEMETRY_DISABLED_ENV: &str = "RTK_TELEMETRY_DISABLED";
 const TELEMETRY_DISABLED_VALUE: &str = "1";
 
+/// Label for the `device hash` row when no salt file exists.
+///
+/// `(no salt file)` is only meaningful when consent has been granted —
+/// otherwise no salt is ever attempted, by design. Issue #1656.
+///
+/// Gating proof (rg verified on develop HEAD): `generate_device_hash()` has
+/// three production call sites — `send_ping()` at `telemetry.rs:71` (gated by
+/// `consent_given == Some(true)` at `telemetry.rs:38-41`), `run_status()` and
+/// `run_forget()` (both only call it after `salt_path.exists()`). So the salt
+/// is only ever written through `send_ping()`'s consent-gated path.
+fn salt_missing_label(consent_given: Option<bool>) -> &'static str {
+    match consent_given {
+        Some(true) => "(no salt file)",
+        // `Some(false)` (explicit opt-out) and `None` (never prompted) collapse
+        // because the user-facing remediation — running `rtk telemetry enable`
+        // — is identical in both states.
+        Some(false) | None => "(telemetry not enabled; run `rtk telemetry enable` to opt in)",
+    }
+}
+
+/// Format the full `  device hash:   ...` status line.
+///
+/// Extracted so the routing (which message string for which state) is covered
+/// by unit tests rather than only the leaf label helper.
+fn device_hash_line(consent_given: Option<bool>, hash: Option<&str>) -> String {
+    match hash {
+        // The device hash is a SHA-256 hex digest — exactly 64 chars by
+        // construction. Gate on `== 64` (not `>= 64`) so a malformed hash of any
+        // other length routes to the salt-missing label instead of slicing
+        // arbitrary bytes — `&h[56..]` on a longer string would print an
+        // over-long tail.
+        Some(h) if h.len() == 64 => {
+            format!("  device hash:   {}...{}", &h[..8], &h[56..])
+        }
+        _ => format!("  device hash:   {}", salt_missing_label(consent_given)),
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TelemetrySubcommand {
     Status,
@@ -60,12 +98,15 @@ fn run_status() -> Result<()> {
     }
 
     let salt_path = super::telemetry::salt_file_path();
-    if salt_path.exists() {
-        let hash = super::telemetry::generate_device_hash();
-        println!("  device hash:   {}...{}", &hash[..8], &hash[56..]);
+    let hash = if salt_path.exists() {
+        Some(super::telemetry::generate_device_hash())
     } else {
-        println!("  device hash:   (no salt file)");
-    }
+        None
+    };
+    println!(
+        "{}",
+        device_hash_line(config.telemetry.consent_given, hash.as_deref())
+    );
 
     println!();
     println!("Data controller: RTK AI Labs, contact@rtk-ai.app");
@@ -230,5 +271,68 @@ mod tests {
 
         #[allow(deprecated)]
         std::env::remove_var(TELEMETRY_DISABLED_ENV);
+    }
+
+    // A canned 64-hex-char hash for deterministic `device_hash_line` assertions.
+    const SAMPLE_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn salt_missing_label_distinguishes_consent_not_given_from_real_failure() {
+        // #1656: a fresh `brew install rtk` followed by `rtk telemetry status`
+        // (without ever running `rtk init`) leaves `consent_given == None` and
+        // therefore never writes a salt — that is by design, not a failure.
+        // Surfacing it as `(no salt file)` reads as an error to users.
+        let not_enabled = "(telemetry not enabled; run `rtk telemetry enable` to opt in)";
+        assert_eq!(salt_missing_label(None), not_enabled);
+        assert_eq!(salt_missing_label(Some(false)), not_enabled);
+        // Consent was granted but the salt is still missing — this IS a real
+        // failure (e.g. fs permission, full disk) and keeps the original label
+        // so the user knows to investigate.
+        assert_eq!(salt_missing_label(Some(true)), "(no salt file)");
+    }
+
+    #[test]
+    fn device_hash_line_renders_truncated_hash_when_salt_exists() {
+        // The salt-exists path is consent-agnostic: once the hash is in hand
+        // it's safe to show regardless of how the salt got there.
+        let expected = "  device hash:   01234567...89abcdef";
+        assert_eq!(device_hash_line(Some(true), Some(SAMPLE_HASH)), expected);
+        assert_eq!(device_hash_line(None, Some(SAMPLE_HASH)), expected);
+    }
+
+    #[test]
+    fn device_hash_line_routes_to_salt_missing_label_when_no_hash() {
+        // Locks the routing: removing or inlining `salt_missing_label` without
+        // copying its literals will fail these asserts.
+        assert_eq!(
+            device_hash_line(Some(true), None),
+            "  device hash:   (no salt file)"
+        );
+        assert_eq!(
+            device_hash_line(None, None),
+            "  device hash:   (telemetry not enabled; run `rtk telemetry enable` to opt in)"
+        );
+        assert_eq!(
+            device_hash_line(Some(false), None),
+            "  device hash:   (telemetry not enabled; run `rtk telemetry enable` to opt in)"
+        );
+    }
+
+    #[test]
+    fn device_hash_line_treats_non_64_char_hash_as_missing() {
+        // The device hash is a 64-char SHA-256 hex digest by construction, so the
+        // truncating render is gated on `len() == 64`. A hash of any other length
+        // is malformed (a truncated read, a future format change) and routes to
+        // the salt-missing label rather than slicing arbitrary bytes.
+        let short = "0123456789abcdef"; // 16 chars
+        let long = SAMPLE_HASH.repeat(2); // 128 chars
+        assert_eq!(
+            device_hash_line(Some(true), Some(short)),
+            "  device hash:   (no salt file)"
+        );
+        assert_eq!(
+            device_hash_line(Some(true), Some(&long)),
+            "  device hash:   (no salt file)"
+        );
     }
 }
