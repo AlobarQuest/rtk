@@ -16,7 +16,7 @@ else:
 # --- diff section (Rust-relevant paths, capped; Cargo.lock excluded — cargo audit covers it) ---
 diff = subprocess.check_output(
     ['git', 'diff', f'{BASE}..{HEAD}', '--',
-     'src/', 'build.rs', 'Cargo.toml', 'install.sh'],
+     'src/', 'build.rs', 'Cargo.toml', 'install.sh', '.claude/'],
     text=True
 )
 diff_lines = diff.splitlines()
@@ -112,6 +112,7 @@ prompt = (
     "   - New environment variable reads of secrets\n"
     "   - New dependencies or build.rs changes in Cargo.toml/build.rs\n"
     "   - New unsafe blocks, base64/obfuscation, or compile-time embedded blobs\n"
+    "   - Changes under .claude/ (skills/commands that auto-load into Claude Code sessions) — treat as a prompt-injection surface\n"
     "   - Automated pattern scan hits (listed above) — assess each: benign or risky?\n"
     "3. Give a one-line recommendation.\n\n"
     "Respond in exactly this format:\n\n"
@@ -131,22 +132,25 @@ payload = {
     "messages": [{"role": "user", "content": prompt}]
 }
 
-req = urllib.request.Request(
-    'https://api.anthropic.com/v1/messages',
-    data=json.dumps(payload).encode(),
-    headers={
-        'x-api-key': os.environ['ANTHROPIC_API_KEY'],
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json'
-    }
-)
-
-try:
-    with urllib.request.urlopen(req) as resp:
-        result = json.loads(resp.read())
-        review = result['content'][0]['text']
-except Exception as e:
-    review = "Warning: Error generating AI review: {}\n\nReview the diff manually before merging.".format(e)
+api_key = os.environ.get('ANTHROPIC_API_KEY')
+if not api_key:
+    review = "Warning: ANTHROPIC_API_KEY not set — AI review skipped. Review the diff manually before merging."
+else:
+    req = urllib.request.Request(
+        'https://api.anthropic.com/v1/messages',
+        data=json.dumps(payload).encode(),
+        headers={
+            'x-api-key': api_key,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json'
+        }
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+            review = result['content'][0]['text']
+    except Exception as e:
+        review = "Warning: Error generating AI review: {}\n\nReview the diff manually before merging.".format(e)
 
 # prepend scan hits so they're visible even if the AI summary is brief
 output = review
