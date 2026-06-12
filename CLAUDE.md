@@ -16,7 +16,7 @@ This is a fork with critical fixes for git argument parsing and modern JavaScrip
 
 **Verify correct installation:**
 ```bash
-rtk --version  # Should show "rtk 0.28.2" (or newer)
+rtk --version  # Should show the current version (0.42.x as of 2026-06)
 rtk gain       # Should show token savings stats (NOT "command not found")
 ```
 
@@ -44,6 +44,11 @@ cargo test <test_name>        # specific test
 cargo test <module_name>::    # module tests
 cargo test -- --nocapture     # with stdout
 bash scripts/test-all.sh      # smoke tests (installed binary required)
+```
+
+### File Summaries
+```bash
+rtk smart <file>              # heuristic 2-line technical summary of a file (local, no API; --model heuristic is the default)
 ```
 
 ### Linting & Quality
@@ -76,6 +81,10 @@ For the full architecture, component details, and module development patterns, s
 Module responsibilities are documented in each folder's `README.md` and each file's `//!` doc header. Browse `src/cmds/*/` to discover available filters.
 
 Supported ecosystems: git/gh/gt, cargo, go/golangci-lint, npm/pnpm/npx, ruff/pytest/pip/mypy, rspec/rubocop/rake, dotnet, playwright/vitest/jest, docker/kubectl/aws.
+
+Supported agent targets (`rtk init --agent <target>`): Claude Code (default), Cursor, Windsurf, Cline/Roo Code, Kilo Code, Google Antigravity — plus OpenCode (`--opencode`), Codex (`--codex`), and Gemini/Copilot hook processors.
+
+Filter levels: `rtk read` accepts `--level none|minimal|aggressive` (`-l`, default `minimal`). Global config lives in `~/.config/rtk/config.toml`; global TOML filter definitions in `~/.config/rtk/filters/` (project-local: `.rtk/filters/`, trust-gated).
 
 ### Proxy Mode
 
