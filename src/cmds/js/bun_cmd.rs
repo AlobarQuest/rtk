@@ -197,7 +197,7 @@ pub fn run_build(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("bun");
     cmd.arg("build").args(args);
     let display = format!("bun build {}", args.join(" "));
-    crate::cmds::rust::runner::run_err_cmd(cmd, display.trim_end(), verbose)
+    crate::core::runner::run_err_cmd(cmd, display.trim_end(), verbose)
 }
 
 /// Run `bun test` showing only failures. Args are passed as a vector, never via a shell.
@@ -205,7 +205,7 @@ pub fn run_test(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("bun");
     cmd.arg("test").args(args);
     let display = format!("bun test {}", args.join(" "));
-    crate::cmds::rust::runner::run_test_cmd(cmd, display.trim_end(), verbose)
+    crate::core::runner::run_test_cmd(cmd, display.trim_end(), verbose)
 }
 
 /// Run `bunx <tool>` with error-only filtering. Args are passed as a vector, never via a shell.
@@ -213,7 +213,7 @@ pub fn run_bunx(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("bunx");
     cmd.args(args);
     let display = format!("bunx {}", args.join(" "));
-    crate::cmds::rust::runner::run_err_cmd(cmd, display.trim_end(), verbose)
+    crate::core::runner::run_err_cmd(cmd, display.trim_end(), verbose)
 }
 
 /// Passthrough for `bun run` and other unfiltered subcommands.
