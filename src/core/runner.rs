@@ -459,6 +459,9 @@ fn extract_test_summary(output: &str, command: &str) -> String {
     let is_jest =
         command.contains("jest") || command.contains("npm test") || command.contains("yarn test");
     let is_go = command.contains("go test");
+    let is_bun = command.contains("bun test");
+    // Deno's test output is cargo-shaped ("test result:", "FAILED", "failures:").
+    let is_deno = command.contains("deno test");
 
     let mut failures = Vec::new();
     let mut in_failure = false;
@@ -504,6 +507,31 @@ fn extract_test_summary(output: &str, command: &str) -> String {
             }
             if line.contains("FAIL") {
                 failures.push(line.to_string());
+            }
+        }
+
+        if is_bun {
+            let trimmed = line.trim_start();
+            if line.contains(" pass") || line.contains(" fail") || trimmed.starts_with("Ran ") {
+                result.push(line.to_string());
+            }
+            if line.contains('✗') || line.contains("(fail)") {
+                failures.push(line.to_string());
+            }
+        }
+
+        if is_deno {
+            if line.contains("test result:") {
+                result.push(line.to_string());
+            }
+            if line.contains("FAILED") && !line.contains("test result") {
+                failures.push(line.to_string());
+            }
+            if line.starts_with("failures:") {
+                in_failure = true;
+            }
+            if in_failure && line.starts_with("    ") {
+                failure_lines.push(line.to_string());
             }
         }
     }
@@ -561,5 +589,22 @@ mod err_test_runner_tests {
         let filtered = filter_errors(output);
         assert!(filtered.contains("error"));
         assert!(!filtered.contains("info"));
+    }
+
+    #[test]
+    fn test_extract_bun_test_failures() {
+        let raw = "bun test v1.1.0\nsrc/math.test.ts:\n✗ adds numbers [1ms]\n 3 pass\n 1 fail\nRan 4 tests across 1 file.";
+        let out = extract_test_summary(raw, "bun test");
+        assert!(out.contains("[FAIL]"), "expected failure block, got: {out}");
+        assert!(out.contains("adds numbers"));
+        assert!(out.contains("1 fail"));
+    }
+
+    #[test]
+    fn test_extract_deno_test_failures() {
+        let raw = "running 2 tests\ntest add ... ok\ntest sub ... FAILED\nfailures:\n    sub\ntest result: FAILED. 1 passed; 1 failed; 0 ignored";
+        let out = extract_test_summary(raw, "deno test");
+        assert!(out.contains("[FAIL]"), "expected failure block, got: {out}");
+        assert!(out.contains("test result:"));
     }
 }
