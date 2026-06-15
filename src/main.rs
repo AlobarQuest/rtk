@@ -1342,7 +1342,7 @@ enum SbtCommands {
     Other(Vec<OsString>),
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum BunCommands {
     /// Install packages (filter progress bars)
     Install {
@@ -1384,7 +1384,7 @@ enum BunCommands {
     Other(Vec<OsString>),
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum DenoCommands {
     /// Run a script
     Run {
