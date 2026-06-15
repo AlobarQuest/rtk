@@ -524,6 +524,17 @@ fn read_composer_bin_dir(composer_json: &str) -> Option<PathBuf> {
     }
 }
 
+/// Join lines with newlines, or return "ok" when there is nothing left to show.
+///
+/// Shared by output filters that collapse fully to a success marker.
+pub fn join_or_ok(lines: &[&str]) -> String {
+    if lines.is_empty() {
+        "ok".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 /// Check if a tool exists on PATH (PATHEXT-aware on Windows).
 ///
 /// Replaces manual `Command::new("which").arg(tool)` checks that fail on Windows.

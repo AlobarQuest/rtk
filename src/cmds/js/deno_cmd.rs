@@ -1,7 +1,7 @@
 //! Filters deno output — lint, check, and task command output.
 
 use crate::core::tracking;
-use crate::core::utils::{exit_code_from_output, resolved_command, strip_ansi};
+use crate::core::utils::{exit_code_from_output, join_or_ok, resolved_command, strip_ansi};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
 
@@ -16,11 +16,7 @@ pub fn filter_deno_output(output: &str) -> String {
         })
         .collect();
 
-    if filtered.is_empty() {
-        "ok".to_string()
-    } else {
-        filtered.join("\n")
-    }
+    join_or_ok(&filtered)
 }
 
 /// Run a deno subcommand with filtered output and tee recovery.

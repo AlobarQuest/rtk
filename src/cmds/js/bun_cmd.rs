@@ -1,7 +1,7 @@
 //! Filters bun output — install logs, package lists, and pm commands.
 
 use crate::core::tracking;
-use crate::core::utils::{exit_code_from_output, resolved_command, strip_ansi, truncate};
+use crate::core::utils::{exit_code_from_output, join_or_ok, resolved_command, strip_ansi, truncate};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ struct BunPmPackage {
     version: Option<String>,
 }
 
-/// Validate package names to prevent command injection (parity with pnpm_cmd).
+/// Validate package names so they cannot be confused for flags or path traversal.
 fn is_valid_package_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 214 {
         return false;
@@ -26,7 +26,7 @@ fn is_valid_package_name(name: &str) -> bool {
 }
 
 /// Filter bun install/add/remove output — strip progress lines, version headers, empty lines.
-pub fn filter_bun_install(output: &str) -> String {
+pub fn filter_bun_pkg(output: &str) -> String {
     let cleaned = strip_ansi(output);
     let mut result = Vec::new();
 
@@ -68,11 +68,7 @@ pub fn filter_bun_install(output: &str) -> String {
         result.push(trimmed);
     }
 
-    if result.is_empty() {
-        "ok".to_string()
-    } else {
-        result.join("\n")
-    }
+    join_or_ok(&result)
 }
 
 /// Parse JSON output from `bun pm ls --json`.
@@ -107,12 +103,7 @@ pub fn filter_bun_pm_ls_json(raw: &str) -> Option<String> {
 pub fn filter_bun_pm_ls_text(raw: &str) -> String {
     let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
 
-    if lines.is_empty() {
-        return "ok".to_string();
-    }
-
-    let joined = lines.join("\n");
-    truncate(&joined, 500)
+    truncate(&join_or_ok(&lines), 500)
 }
 
 /// Run `bun install`, `bun add`, or `bun remove` with filtered output.
@@ -145,7 +136,7 @@ pub fn run_pkg(subcmd: &str, args: &[String], verbose: u8) -> Result<i32> {
     let combined = format!("{}{}", stdout, stderr);
 
     // Filter the combined stream so warnings on stderr survive a passing run.
-    let filtered = filter_bun_install(&combined);
+    let filtered = filter_bun_pkg(&combined);
     println!("{}", filtered);
 
     timer.track(
@@ -250,7 +241,7 @@ mod tests {
 + installed lodash@4.17.21
 3 packages installed in 1.2s
 "#;
-        let result = filter_bun_install(output);
+        let result = filter_bun_pkg(output);
         assert!(!result.contains("[1/5]"));
         assert!(!result.contains("bun install v1.1.0"));
         assert!(result.contains("express"));
@@ -276,7 +267,7 @@ mod tests {
 + installed lodash@4.17.21
 10 packages installed in 2.3s
 "#;
-        let output = filter_bun_install(input);
+        let output = filter_bun_pkg(input);
         let savings = 100.0 - (count_tokens(&output) as f64 / count_tokens(input) as f64 * 100.0);
         assert!(
             savings >= 60.0,
@@ -288,14 +279,14 @@ mod tests {
     #[test]
     fn test_filter_bun_install_empty_output() {
         let output = "\n\n\n";
-        let result = filter_bun_install(output);
+        let result = filter_bun_pkg(output);
         assert_eq!(result, "ok");
     }
 
     #[test]
     fn test_filter_bun_install_strips_ansi() {
         let output = "\x1b[32m[1/3] Resolving packages...\x1b[0m\n\x1b[32m[2/3] Fetching packages...\x1b[0m\n\x1b[32m[3/3] Linking packages...\x1b[0m\n+ installed express@4.18.2\n";
-        let result = filter_bun_install(output);
+        let result = filter_bun_pkg(output);
         assert!(!result.contains("[1/3]"));
         assert!(result.contains("express"));
     }
@@ -306,7 +297,7 @@ mod tests {
 [1/4] Resolving packages...
 error: PackageNotFound - "nonexistent-pkg" not found in registry
 "#;
-        let result = filter_bun_install(output);
+        let result = filter_bun_pkg(output);
         assert!(result.contains("error:"));
         assert!(result.contains("nonexistent-pkg"));
     }
@@ -314,7 +305,7 @@ error: PackageNotFound - "nonexistent-pkg" not found in registry
     #[test]
     fn test_filter_bun_install_handles_remove() {
         let output = "bun remove v1.1.0\n- removed express@4.18.2\n1 package removed in 0.5s\n";
-        let result = filter_bun_install(output);
+        let result = filter_bun_pkg(output);
         assert!(!result.contains("bun remove v1.1.0"));
         assert!(result.contains("removed express"));
     }
