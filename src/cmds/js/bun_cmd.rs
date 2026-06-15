@@ -137,7 +137,14 @@ pub fn run_pkg(subcmd: &str, args: &[String], verbose: u8) -> Result<i32> {
 
     // Filter the combined stream so warnings on stderr survive a passing run.
     let filtered = filter_bun_pkg(&combined);
-    println!("{}", filtered);
+    let exit_code = exit_code_from_output(&output, "bun");
+    crate::core::runner::print_with_hint(
+        &filtered,
+        &combined,
+        &combined,
+        &format!("bun_{}", subcmd),
+        exit_code,
+    );
 
     timer.track(
         &format!("bun {} {}", subcmd, args.join(" ")),
@@ -146,7 +153,7 @@ pub fn run_pkg(subcmd: &str, args: &[String], verbose: u8) -> Result<i32> {
         &filtered,
     );
 
-    Ok(exit_code_from_output(&output, "bun"))
+    Ok(exit_code)
 }
 
 pub fn run_pm_ls(args: &[String], verbose: u8) -> Result<i32> {
@@ -180,7 +187,8 @@ pub fn run_pm_ls(args: &[String], verbose: u8) -> Result<i32> {
         filter_bun_pm_ls_text(&combined)
     };
 
-    println!("{}", filtered);
+    let exit_code = exit_code_from_output(&output, "bun");
+    crate::core::runner::print_with_hint(&filtered, &combined, &combined, "bun_pm_ls", exit_code);
 
     timer.track(
         &format!("bun pm ls {}", args.join(" ")),
@@ -189,7 +197,7 @@ pub fn run_pm_ls(args: &[String], verbose: u8) -> Result<i32> {
         &filtered,
     );
 
-    Ok(exit_code_from_output(&output, "bun"))
+    Ok(exit_code)
 }
 
 /// Run `bun build` with error-only filtering. Args are passed as a vector, never via a shell.
