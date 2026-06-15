@@ -114,35 +114,45 @@ fn build_shell_command(command: &str) -> Command {
     }
 }
 
-/// Run a command and filter output to show only errors/warnings
-pub fn run_err(command: &str, verbose: u8) -> Result<i32> {
+/// Run a prebuilt command (no shell) and filter output to show only errors/warnings.
+/// `display` is used only for logging, tee keys, and tracking, never executed.
+pub fn run_err_cmd(cmd: Command, display: &str, verbose: u8) -> Result<i32> {
     if verbose > 0 {
-        eprintln!("Running: {}", command);
+        eprintln!("Running: {}", display);
     }
-    let cmd = build_shell_command(command);
     crate::core::runner::run_streamed(
         cmd,
         "err",
-        command,
+        display,
         Box::new(ErrorStreamFilter::new()),
         crate::core::runner::RunOptions::with_tee("err"),
     )
 }
 
-/// Run tests and show only failures
-pub fn run_test(command: &str, verbose: u8) -> Result<i32> {
+/// Run a prebuilt test command (no shell), showing only failures.
+/// `display` is used only for logging and tool detection, never executed.
+pub fn run_test_cmd(cmd: Command, display: &str, verbose: u8) -> Result<i32> {
     if verbose > 0 {
-        eprintln!("Running tests: {}", command);
+        eprintln!("Running tests: {}", display);
     }
-    let cmd = build_shell_command(command);
-    let command_owned = command.to_string();
+    let display_owned = display.to_string();
     crate::core::runner::run_filtered(
         cmd,
         "test",
-        command,
-        move |raw| extract_test_summary(raw, &command_owned),
+        display,
+        move |raw| extract_test_summary(raw, &display_owned),
         crate::core::runner::RunOptions::with_tee("test"),
     )
+}
+
+/// Run a command via the shell and filter output to show only errors/warnings.
+pub fn run_err(command: &str, verbose: u8) -> Result<i32> {
+    run_err_cmd(build_shell_command(command), command, verbose)
+}
+
+/// Run tests via the shell and show only failures.
+pub fn run_test(command: &str, verbose: u8) -> Result<i32> {
+    run_test_cmd(build_shell_command(command), command, verbose)
 }
 
 #[cfg(test)]

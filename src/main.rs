@@ -2417,14 +2417,8 @@ fn run_cli() -> Result<i32> {
                     .collect();
                 bun_cmd::run_passthrough(&os_args, cli.verbose)?
             }
-            BunCommands::Build { args } => {
-                let cmd = format!("bun build {}", args.join(" "));
-                runner::run_err(&cmd, cli.verbose)?
-            }
-            BunCommands::Test { args } => {
-                let cmd = format!("bun test {}", args.join(" "));
-                runner::run_test(&cmd, cli.verbose)?
-            }
+            BunCommands::Build { args } => bun_cmd::run_build(&args, cli.verbose)?,
+            BunCommands::Test { args } => bun_cmd::run_test(&args, cli.verbose)?,
             BunCommands::Pm { args } => {
                 if args.first().map(|s| s.as_str()) == Some("ls") {
                     bun_cmd::run_pm_ls(&args[1..], cli.verbose)?
@@ -2445,18 +2439,12 @@ fn run_cli() -> Result<i32> {
             match args[0].as_str() {
                 "tsc" | "typescript" => tsc_cmd::run(&args[1..], cli.verbose)?,
                 "eslint" => lint_cmd::run(&args[1..], cli.verbose)?,
-                _ => {
-                    let cmd = format!("bunx {}", args.join(" "));
-                    runner::run_err(&cmd, cli.verbose)?
-                }
+                _ => bun_cmd::run_bunx(&args, cli.verbose)?,
             }
         }
 
         Commands::Deno { command } => match command {
-            DenoCommands::Test { args } => {
-                let cmd = format!("deno test {}", args.join(" "));
-                runner::run_test(&cmd, cli.verbose)?
-            }
+            DenoCommands::Test { args } => deno_cmd::run_test(&args, cli.verbose)?,
             DenoCommands::Check { args } => deno_cmd::run_check(&args, cli.verbose)?,
             DenoCommands::Lint { args } => deno_cmd::run_lint(&args, cli.verbose)?,
             DenoCommands::Run { args } => {
@@ -2471,10 +2459,7 @@ fn run_cli() -> Result<i32> {
                     .collect();
                 deno_cmd::run_passthrough(&os_args, cli.verbose)?
             }
-            DenoCommands::Compile { args } => {
-                let cmd = format!("deno compile {}", args.join(" "));
-                runner::run_err(&cmd, cli.verbose)?
-            }
+            DenoCommands::Compile { args } => deno_cmd::run_compile(&args, cli.verbose)?,
             DenoCommands::Install { args } => {
                 let os_args: Vec<OsString> = std::iter::once(OsString::from("install"))
                     .chain(args.into_iter().map(OsString::from))

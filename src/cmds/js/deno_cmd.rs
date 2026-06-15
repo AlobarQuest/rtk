@@ -72,6 +72,22 @@ pub fn run_check(args: &[String], verbose: u8) -> Result<i32> {
     run_filtered_subcmd("check", args, verbose)
 }
 
+/// Run `deno compile` with error-only filtering. Args are passed as a vector, never via a shell.
+pub fn run_compile(args: &[String], verbose: u8) -> Result<i32> {
+    let mut cmd = resolved_command("deno");
+    cmd.arg("compile").args(args);
+    let display = format!("deno compile {}", args.join(" "));
+    crate::cmds::rust::runner::run_err_cmd(cmd, display.trim_end(), verbose)
+}
+
+/// Run `deno test` showing only failures. Args are passed as a vector, never via a shell.
+pub fn run_test(args: &[String], verbose: u8) -> Result<i32> {
+    let mut cmd = resolved_command("deno");
+    cmd.arg("test").args(args);
+    let display = format!("deno test {}", args.join(" "));
+    crate::cmds::rust::runner::run_test_cmd(cmd, display.trim_end(), verbose)
+}
+
 /// Passthrough for `deno run`, `deno task`, and other unfiltered subcommands.
 pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
     crate::core::runner::run_passthrough("deno", args, verbose)
