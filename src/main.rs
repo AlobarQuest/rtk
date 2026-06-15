@@ -1376,10 +1376,22 @@ enum BunCommands {
     },
     /// Package manager commands (pm ls, etc.)
     Pm {
+        #[command(subcommand)]
+        command: BunPmCommands,
+    },
+    /// Passthrough: runs any unsupported bun subcommand directly
+    #[command(external_subcommand)]
+    Other(Vec<OsString>),
+}
+
+#[derive(Debug, Subcommand)]
+enum BunPmCommands {
+    /// List installed packages (compact output)
+    Ls {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Passthrough: runs any unsupported bun subcommand directly
+    /// Passthrough: runs any other bun pm subcommand directly
     #[command(external_subcommand)]
     Other(Vec<OsString>),
 }
@@ -2419,16 +2431,14 @@ fn run_cli() -> Result<i32> {
             }
             BunCommands::Build { args } => bun_cmd::run_build(&args, cli.verbose)?,
             BunCommands::Test { args } => bun_cmd::run_test(&args, cli.verbose)?,
-            BunCommands::Pm { args } => {
-                if args.first().map(|s| s.as_str()) == Some("ls") {
-                    bun_cmd::run_pm_ls(&args[1..], cli.verbose)?
-                } else {
-                    let os_args: Vec<OsString> = std::iter::once(OsString::from("pm"))
-                        .chain(args.into_iter().map(OsString::from))
-                        .collect();
+            BunCommands::Pm { command } => match command {
+                BunPmCommands::Ls { args } => bun_cmd::run_pm_ls(&args, cli.verbose)?,
+                BunPmCommands::Other(args) => {
+                    let os_args: Vec<OsString> =
+                        std::iter::once(OsString::from("pm")).chain(args).collect();
                     bun_cmd::run_passthrough(&os_args, cli.verbose)?
                 }
-            }
+            },
             BunCommands::Other(args) => bun_cmd::run_passthrough(&args, cli.verbose)?,
         },
 
