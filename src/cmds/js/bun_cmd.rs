@@ -326,6 +326,23 @@ error: PackageNotFound - "nonexistent-pkg" not found in registry
     }
 
     #[test]
+    fn test_filter_bun_pm_ls_json_token_savings() {
+        // Real `bun pm ls --json` carries resolved URLs and integrity hashes per dep.
+        let input = r#"{
+            "express": {"version": "4.18.2", "resolved": "https://registry.npmjs.org/express/-/express-4.18.2.tgz", "integrity": "sha512-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+            "lodash": {"version": "4.17.21", "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz", "integrity": "sha512-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+            "axios": {"version": "1.6.0", "resolved": "https://registry.npmjs.org/axios/-/axios-1.6.0.tgz", "integrity": "sha512-cccccccccccccccccccccccccccccccccccccccccccc"}
+        }"#;
+        let output = filter_bun_pm_ls_json(input).expect("should parse");
+        let savings = 100.0 - (count_tokens(&output) as f64 / count_tokens(input) as f64 * 100.0);
+        assert!(
+            savings >= 60.0,
+            "Bun pm ls json filter: expected >=60% savings, got {:.1}%",
+            savings
+        );
+    }
+
+    #[test]
     fn test_filter_bun_pm_ls_json_empty() {
         let result = filter_bun_pm_ls_json("{}");
         assert!(result.is_none());
