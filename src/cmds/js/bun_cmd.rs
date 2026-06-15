@@ -142,15 +142,12 @@ pub fn run_pkg(subcmd: &str, args: &[String], verbose: u8) -> Result<i32> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
 
-    if !output.status.success() {
-        eprint!("{}", stderr);
-    }
-
-    let filtered = filter_bun_install(&stdout);
+    // Filter the combined stream so warnings on stderr survive a passing run.
+    let filtered = filter_bun_install(&combined);
     println!("{}", filtered);
 
-    let combined = format!("{}{}", stdout, stderr);
     timer.track(
         &format!("bun {} {}", subcmd, args.join(" ")),
         &format!("rtk bun {} {}", subcmd, args.join(" ")),
@@ -183,20 +180,17 @@ pub fn run_pm_ls(args: &[String], verbose: u8) -> Result<i32> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
 
-    if !output.status.success() {
-        eprint!("{}", stderr);
-    }
-
+    // JSON lives on stdout; the text fallback reads the combined stream so errors survive.
     let filtered = if let Some(json_result) = filter_bun_pm_ls_json(&stdout) {
         json_result
     } else {
-        filter_bun_pm_ls_text(&stdout)
+        filter_bun_pm_ls_text(&combined)
     };
 
     println!("{}", filtered);
 
-    let combined = format!("{}{}", stdout, stderr);
     timer.track(
         &format!("bun pm ls {}", args.join(" ")),
         &format!("rtk bun pm ls {}", args.join(" ")),
