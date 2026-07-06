@@ -1379,6 +1379,11 @@ enum BunCommands {
         #[command(subcommand)]
         command: BunPmCommands,
     },
+    /// Execute a package binary (space form of bunx)
+    X {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Passthrough: runs any unsupported bun subcommand directly
     #[command(external_subcommand)]
     Other(Vec<OsString>),
@@ -1436,6 +1441,19 @@ enum DenoCommands {
     /// Passthrough
     #[command(external_subcommand)]
     Other(Vec<OsString>),
+}
+
+/// Route `bunx <tool>` and `bun x <tool>` to the matching tool filter,
+/// falling back to the generic bunx runner for unrecognized tools.
+fn run_bunx_tool(args: &[String], verbose: u8) -> Result<i32> {
+    if args.is_empty() {
+        anyhow::bail!("bunx requires a command argument");
+    }
+    match args[0].as_str() {
+        "tsc" | "typescript" => tsc_cmd::run(&args[1..], verbose),
+        "eslint" => lint_cmd::run(&args[1..], verbose),
+        _ => bun_cmd::run_bunx(args, verbose),
+    }
 }
 
 fn run_fallback(parse_error: clap::Error) -> Result<i32> {
@@ -2439,19 +2457,11 @@ fn run_cli() -> Result<i32> {
                     bun_cmd::run_passthrough(&os_args, cli.verbose)?
                 }
             },
+            BunCommands::X { args } => run_bunx_tool(&args, cli.verbose)?,
             BunCommands::Other(args) => bun_cmd::run_passthrough(&args, cli.verbose)?,
         },
 
-        Commands::Bunx { args } => {
-            if args.is_empty() {
-                anyhow::bail!("bunx requires a command argument");
-            }
-            match args[0].as_str() {
-                "tsc" | "typescript" => tsc_cmd::run(&args[1..], cli.verbose)?,
-                "eslint" => lint_cmd::run(&args[1..], cli.verbose)?,
-                _ => bun_cmd::run_bunx(&args, cli.verbose)?,
-            }
-        }
+        Commands::Bunx { args } => run_bunx_tool(&args, cli.verbose)?,
 
         Commands::Deno { command } => match command {
             DenoCommands::Test { args } => deno_cmd::run_test(&args, cli.verbose)?,
@@ -3415,6 +3425,9 @@ mod tests {
             "pint",
             "phpt",
             "uv",
+            "bun",
+            "bunx",
+            "deno",
         ];
 
         let unclassified: Vec<String> = Cli::command()
@@ -4060,6 +4073,17 @@ mod tests {
                 command: BunCommands::Build { args },
             } => assert_eq!(args, vec!["--outdir", "dist"]),
             _ => panic!("Expected Bun Build command"),
+        }
+    }
+
+    #[test]
+    fn test_bun_x_parses_to_arg_vector() {
+        let cli = Cli::try_parse_from(["rtk", "bun", "x", "tsc", "--noEmit"]).unwrap();
+        match cli.command {
+            Commands::Bun {
+                command: BunCommands::X { args },
+            } => assert_eq!(args, vec!["tsc", "--noEmit"]),
+            _ => panic!("Expected Bun X command"),
         }
     }
 

@@ -3411,6 +3411,19 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_bun_x_space_form() {
+        assert_eq!(
+            rewrite_command_no_prefixes("bun x tsc --noEmit", &[]),
+            Some("rtk bun x tsc --noEmit".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_bun_unknown_subcommand_untouched() {
+        assert_eq!(rewrite_command_no_prefixes("bun xtask build", &[]), None);
+    }
+
+    #[test]
     fn test_classify_swift_test() {
         assert!(matches!(
             classify_command("swift test"),

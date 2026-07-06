@@ -673,7 +673,7 @@ pub const RULES: &[RtkRule] = &[
     },
     // Bun/Deno
     RtkRule {
-        pattern: r"^bun\s+(install|add|remove|test|build|run|pm)",
+        pattern: r"^bun\s+(install|add|remove|test|build|run|pm|x)\b",
         rtk_cmd: "rtk bun",
         rewrite_prefixes: &["bun"],
         category: "PackageManager",
