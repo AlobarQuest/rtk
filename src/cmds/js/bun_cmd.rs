@@ -96,6 +96,48 @@ pub fn filter_bun_pm_ls_json(raw: &str) -> Option<String> {
     Some(result)
 }
 
+/// Parse the tree form of `bun pm ls` output (`\u{251c}\u{2500}\u{2500} name@version` rows).
+/// This is what real bun 1.x prints even when --json is passed (the flag is
+/// silently ignored), so this is the path real runs take.
+fn filter_bun_pm_ls_tree(raw: &str) -> Option<String> {
+    let cleaned = strip_ansi(raw);
+    let mut entries: Vec<&str> = cleaned
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with('\u{251c}') || trimmed.starts_with('\u{2514}')
+        })
+        .map(|line| {
+            line.trim_start_matches(['\u{251c}', '\u{2514}', '\u{2502}', '\u{2500}', ' '])
+                .trim_end()
+        })
+        .filter(|entry| !entry.is_empty())
+        .collect();
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    entries.sort_unstable();
+    entries.dedup();
+
+    let mut result = format!("{} deps\n", entries.len());
+    result.push_str(&entries.join("\n"));
+    Some(result)
+}
+
+/// Pick the pm ls parser by what bun actually printed, not by the flags we
+/// passed: JSON if stdout is JSON, tree if it is a tree, raw text otherwise.
+fn filter_bun_pm_ls(stdout: &str, combined: &str) -> String {
+    if let Some(json_result) = filter_bun_pm_ls_json(stdout) {
+        return json_result;
+    }
+    if let Some(tree_result) = filter_bun_pm_ls_tree(stdout) {
+        return tree_result;
+    }
+    filter_bun_pm_ls_text(combined)
+}
+
 /// Text fallback for `bun pm ls`.
 pub fn filter_bun_pm_ls_text(raw: &str) -> String {
     let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -167,12 +209,9 @@ pub fn run_pm_ls(args: &[String], verbose: u8) -> Result<i32> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}{}", stdout, stderr);
 
-    // JSON lives on stdout; the text fallback reads the combined stream so errors survive.
-    let filtered = if let Some(json_result) = filter_bun_pm_ls_json(&stdout) {
-        json_result
-    } else {
-        filter_bun_pm_ls_text(&combined)
-    };
+    // Structured output lives on stdout; the text fallback reads the combined
+    // stream so errors survive.
+    let filtered = filter_bun_pm_ls(&stdout, &combined);
 
     let exit_code = exit_code_from_output(&output, "bun");
     crate::core::runner::print_with_hint(&filtered, &combined, &combined, "bun_pm_ls", exit_code);
@@ -347,6 +386,60 @@ error: PackageNotFound - "nonexistent-pkg" not found in registry
     fn test_filter_bun_pm_ls_json_invalid() {
         let result = filter_bun_pm_ls_json("not json");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_filter_bun_pm_ls_tree_real_output() {
+        // Real bun 1.3.6 output: bun silently ignores --json for pm ls and
+        // prints this tree, so the tree parser is the path real runs take.
+        let raw = include_str!("../../../tests/fixtures/bun_pm_ls_raw.txt");
+        let out = filter_bun_pm_ls_tree(raw).expect("tree output should parse");
+        assert!(out.starts_with("6 deps"), "{out}");
+        for dep in [
+            "@types/bun@1.3.14",
+            "@types/node@26.1.0",
+            "date-fns@4.4.0",
+            "lodash@4.18.1",
+            "typescript@6.0.3",
+            "zod@4.4.3",
+        ] {
+            assert!(out.contains(dep), "missing {dep} in {out}");
+        }
+        assert!(!out.contains('\u{251c}'), "tree glyphs must be stripped");
+        assert!(!out.contains("/home/user/project"), "{out}");
+    }
+
+    #[test]
+    fn test_filter_bun_pm_ls_selects_by_content_not_flag() {
+        // Selection keys on what bun PRINTED, not on the --json flag we
+        // passed: tree text must never hit the JSON parser's 500-char
+        // truncation fallback.
+        let raw = include_str!("../../../tests/fixtures/bun_pm_ls_raw.txt");
+        let out = filter_bun_pm_ls(raw, raw);
+        assert!(out.starts_with("6 deps"), "{out}");
+
+        let json = r#"{"express": {"version": "4.18.2"}}"#;
+        let out = filter_bun_pm_ls(json, json);
+        assert!(out.starts_with("1 deps"), "{out}");
+
+        let err = "error: No package.json was found for directory \"/home/user\"\nnote: Run \"bun init\" to initialize a project";
+        let out = filter_bun_pm_ls("", err);
+        assert!(out.contains("No package.json"), "{out}");
+    }
+
+    #[test]
+    fn test_filter_bun_pm_ls_tree_dedups_nested_all() {
+        // `bun pm ls --all` can list the same package under several parents.
+        let raw = "/home/user/project node_modules\n\u{251c}\u{2500}\u{2500} a@1.0.0\n\u{2502} \u{2514}\u{2500}\u{2500} shared@2.0.0\n\u{2514}\u{2500}\u{2500} b@1.0.0\n  \u{2514}\u{2500}\u{2500} shared@2.0.0";
+        let out = filter_bun_pm_ls_tree(raw).expect("should parse");
+        assert!(out.starts_with("3 deps"), "{out}");
+        assert_eq!(out.matches("shared@2.0.0").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn test_filter_bun_pm_ls_tree_rejects_non_tree() {
+        assert!(filter_bun_pm_ls_tree("error: something broke").is_none());
+        assert!(filter_bun_pm_ls_tree("").is_none());
     }
 
     #[test]
