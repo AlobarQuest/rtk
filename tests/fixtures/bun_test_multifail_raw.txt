@@ -1,0 +1,65 @@
+bun test v1.3.6 (d530ed99)
+
+math.test.ts:
+1 | import { test, expect } from "bun:test";
+2 | test("t1 passes", () => { expect(1 + 1).toBe(2); });
+3 | test("t2 fails", () => { expect(1 + 1).toBe(3); });
+                                           ^
+error: expect(received).toBe(expected)
+
+Expected: 3
+Received: 2
+
+      at <anonymous> (/home/user/project/math.test.ts:3:40)
+(fail) t2 fails [1.86ms]
+1 | import { test, expect } from "bun:test";
+2 | test("t1 passes", () => { expect(1 + 1).toBe(2); });
+3 | test("t2 fails", () => { expect(1 + 1).toBe(3); });
+4 | test("t3 passes", () => { expect("a".toUpperCase()).toBe("A"); });
+5 | test("t4 fails", () => { expect([1, 2, 3].length).toBe(4); });
+                                                      ^
+error: expect(received).toBe(expected)
+
+Expected: 4
+Received: 3
+
+      at <anonymous> (/home/user/project/math.test.ts:5:51)
+(fail) t4 fails [0.08ms]
+2 | test("t1 passes", () => { expect(1 + 1).toBe(2); });
+3 | test("t2 fails", () => { expect(1 + 1).toBe(3); });
+4 | test("t3 passes", () => { expect("a".toUpperCase()).toBe("A"); });
+5 | test("t4 fails", () => { expect([1, 2, 3].length).toBe(4); });
+6 | test("t5 passes", () => { expect(true).toBeTruthy(); });
+7 | test("t6 fails", () => { expect("hello").toContain("bye"); });
+                                             ^
+error: expect(received).toContain(expected)
+
+Expected to contain: "bye"
+Received: "hello"
+
+      at <anonymous> (/home/user/project/math.test.ts:7:42)
+(fail) t6 fails [0.21ms]
+4 | test("t3 passes", () => { expect("a".toUpperCase()).toBe("A"); });
+5 | test("t4 fails", () => { expect([1, 2, 3].length).toBe(4); });
+6 | test("t5 passes", () => { expect(true).toBeTruthy(); });
+7 | test("t6 fails", () => { expect("hello").toContain("bye"); });
+8 | test("t7 passes", () => { expect(null).toBeNull(); });
+9 | test("t8 fails", () => { expect({ a: 1 }).toEqual({ a: 2 }); });
+                                              ^
+error: expect(received).toEqual(expected)
+
+  {
+-   "a": 2,
++   "a": 1,
+  }
+
+- Expected  - 1
++ Received  + 1
+
+      at <anonymous> (/home/user/project/math.test.ts:9:43)
+(fail) t8 fails [0.97ms]
+
+ 6 pass
+ 4 fail
+ 10 expect() calls
+Ran 10 tests across 1 file. [62.00ms]

@@ -512,11 +512,26 @@ fn extract_test_summary(output: &str, command: &str) -> String {
 
         if is_bun {
             let trimmed = line.trim_start();
-            if line.contains(" pass") || line.contains(" fail") || trimmed.starts_with("Ran ") {
+            // Anchored count lines (" 6 pass", " 4 fail") and the "Ran N tests" footer.
+            // A loose `contains(" fail")` also matches bun's echoed source context when
+            // a test NAME contains "fails", flooding the summary with duplicate snippets.
+            if is_bun_count_line(trimmed) || trimmed.starts_with("Ran ") {
                 result.push(line.to_string());
             }
-            if line.contains('✗') || line.contains("(fail)") {
+            // Bun prints the diagnostic BEFORE the failure marker:
+            //   error: expect(received).toBe(expected)
+            //   Expected: 3
+            //   Received: 2
+            //         at <anonymous> (...)
+            //   (fail) t2 fails [1.86ms]
+            if trimmed.starts_with("(fail)") || line.contains('✗') {
                 failures.push(line.to_string());
+                in_failure = false;
+            } else if trimmed.starts_with("error:") {
+                in_failure = true;
+                failure_lines.push(line.to_string());
+            } else if in_failure && !trimmed.is_empty() && !trimmed.starts_with("at ") {
+                failure_lines.push(line.to_string());
             }
         }
 
@@ -579,6 +594,17 @@ fn extract_test_summary(output: &str, command: &str) -> String {
     output
 }
 
+/// True for bun's summary count lines: " 6 pass", " 4 fail", " 2 skip", " 1 todo".
+/// Anchored on the exact two-token shape so echoed source lines never match.
+fn is_bun_count_line(trimmed: &str) -> bool {
+    let mut parts = trimmed.split_whitespace();
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(count), Some("pass" | "fail" | "skip" | "todo"), None)
+            if count.chars().all(|c| c.is_ascii_digit())
+    )
+}
+
 #[cfg(test)]
 mod err_test_runner_tests {
     use super::*;
@@ -606,5 +632,111 @@ mod err_test_runner_tests {
         let out = extract_test_summary(raw, "deno test");
         assert!(out.contains("[FAIL]"), "expected failure block, got: {out}");
         assert!(out.contains("test result:"));
+    }
+
+    fn count_tokens(s: &str) -> usize {
+        s.split_whitespace().count()
+    }
+
+    #[test]
+    fn test_bun_multifail_golden() {
+        let raw = include_str!("../../tests/fixtures/bun_test_multifail_raw.txt");
+        let out = extract_test_summary(raw, "bun test");
+        let expected = r#"[FAIL] FAILURES:
+  (fail) t2 fails [1.86ms]
+  (fail) t4 fails [0.08ms]
+  (fail) t6 fails [0.21ms]
+  (fail) t8 fails [0.97ms]
+  error: expect(received).toBe(expected)
+  Expected: 3
+  Received: 2
+  error: expect(received).toBe(expected)
+  Expected: 4
+  Received: 3
+  error: expect(received).toContain(expected)
+  Expected to contain: "bye"
+  Received: "hello"
+  error: expect(received).toEqual(expected)
+  {
+  -   "a": 2,
+  +   "a": 1,
+  }
+  - Expected  - 1
+  + Received  + 1
+
+SUMMARY:
+   6 pass
+   4 fail
+  Ran 10 tests across 1 file. [62.00ms]
+"#;
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn test_bun_multifail_keeps_diagnostics_drops_noise() {
+        let raw = include_str!("../../tests/fixtures/bun_test_multifail_raw.txt");
+        let out = extract_test_summary(raw, "bun test");
+        // The one thing an agent needs: expected vs received, per failure.
+        assert!(
+            out.contains("error: expect(received).toBe(expected)"),
+            "{out}"
+        );
+        assert!(out.contains("Expected: 3"), "{out}");
+        assert!(out.contains("Received: 2"), "{out}");
+        assert!(out.contains("Expected to contain: \"bye\""), "{out}");
+        assert!(out.contains("(fail) t2 fails"), "{out}");
+        assert!(out.contains("(fail) t8 fails"), "{out}");
+        // Echoed source context must not leak into the summary.
+        assert!(!out.contains("test(\"t1 passes\""), "{out}");
+        assert!(!out.contains("test(\"t2 fails\""), "{out}");
+        // Stack frames are noise once the failing test is named.
+        assert!(!out.contains("at <anonymous>"), "{out}");
+        assert!(out.contains("4 fail"), "{out}");
+        assert!(out.contains("Ran 10 tests"), "{out}");
+    }
+
+    #[test]
+    fn test_bun_multifail_savings() {
+        let raw = include_str!("../../tests/fixtures/bun_test_multifail_raw.txt");
+        let out = extract_test_summary(raw, "bun test");
+        let savings = 100.0 - (count_tokens(&out) as f64 / count_tokens(raw) as f64 * 100.0);
+        assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
+    }
+
+    #[test]
+    fn test_bun_all_pass_summary_only() {
+        let raw = include_str!("../../tests/fixtures/bun_test_pass_raw.txt");
+        let out = extract_test_summary(raw, "bun test");
+        assert!(!out.contains("[FAIL]"), "{out}");
+        assert!(out.contains("3 pass"), "{out}");
+        assert!(out.contains("0 fail"), "{out}");
+        assert!(out.contains("Ran 3 tests"), "{out}");
+    }
+
+    #[test]
+    fn test_bun_thrown_error_skip_todo() {
+        let raw = include_str!("../../tests/fixtures/bun_test_throw_skip_raw.txt");
+        let out = extract_test_summary(raw, "bun test");
+        assert!(out.contains("error: boom: connection refused"), "{out}");
+        assert!(out.contains("(fail) throws"), "{out}");
+        assert!(out.contains("1 skip"), "{out}");
+        assert!(out.contains("1 todo"), "{out}");
+        assert!(!out.contains("at <anonymous>"), "{out}");
+    }
+
+    #[test]
+    fn test_bun_count_line_anchoring() {
+        assert!(is_bun_count_line("6 pass"));
+        assert!(is_bun_count_line("0 fail"));
+        assert!(is_bun_count_line("1 skip"));
+        assert!(is_bun_count_line("1 todo"));
+        // Echoed source naming a test "fails"/"passes" must not match.
+        assert!(!is_bun_count_line(
+            "3 | test(\"t2 fails\", () => { expect(1 + 1).toBe(3); });"
+        ));
+        assert!(!is_bun_count_line("pass"));
+        assert!(!is_bun_count_line("6 passing"));
+        assert!(!is_bun_count_line("x fail"));
+        assert!(!is_bun_count_line("10 expect() calls"));
     }
 }

@@ -1,0 +1,17 @@
+bun test v1.3.6 (d530ed99)
+
+edge.test.ts:
+1 | import { test, expect } from "bun:test";
+2 | test("works", () => { expect(2 * 2).toBe(4); });
+3 | test("throws", () => { throw new Error("boom: connection refused"); });
+                                                                     ^
+error: boom: connection refused
+      at <anonymous> (/home/user/project/edge.test.ts:3:66)
+(fail) throws [0.20ms]
+
+ 1 pass
+ 1 skip
+ 1 todo
+ 1 fail
+ 1 expect() calls
+Ran 4 tests across 1 file. [6.00ms]
