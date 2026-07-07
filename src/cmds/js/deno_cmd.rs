@@ -1,8 +1,7 @@
 //! Filters deno output — lint, check, and task command output.
 
-use crate::core::tracking;
-use crate::core::utils::{exit_code_from_output, join_or_ok, resolved_command, strip_ansi};
-use anyhow::{Context, Result};
+use crate::core::utils::{join_or_ok, resolved_command, strip_ansi};
+use anyhow::Result;
 use std::ffi::OsString;
 
 /// Filter deno output: strip ANSI codes, download lines, and empty lines.
@@ -19,45 +18,26 @@ pub fn filter_deno_output(output: &str) -> String {
     join_or_ok(&filtered)
 }
 
-/// Run a deno subcommand with filtered output and tee recovery.
+/// Run a deno subcommand through the shared core runner, which applies the
+/// filter, tee recovery, tracking, and the never_worse output guard.
 fn run_filtered_subcmd(subcmd: &str, args: &[String], verbose: u8) -> Result<i32> {
-    let timer = tracking::TimedExecution::start();
-
     let mut cmd = resolved_command("deno");
     cmd.arg(subcmd);
-    for arg in args {
-        cmd.arg(arg);
-    }
+    cmd.args(args);
 
     if verbose > 0 {
         eprintln!("Running: deno {} {}", subcmd, args.join(" "));
     }
 
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to run deno {}. Is Deno installed?", subcmd))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
-
-    let exit_code = exit_code_from_output(&output, "deno");
-    let filtered = filter_deno_output(&combined);
-
-    if let Some(hint) = crate::core::tee::tee_and_hint(&combined, &format!("deno_{}", subcmd), exit_code) {
-        println!("{}\n{}", filtered, hint);
-    } else {
-        println!("{}", filtered);
-    }
-
-    timer.track(
-        &format!("deno {} {}", subcmd, args.join(" ")),
-        &format!("rtk deno {} {}", subcmd, args.join(" ")),
-        &combined,
-        &filtered,
-    );
-
-    Ok(exit_code)
+    let display = format!("{} {}", subcmd, args.join(" "));
+    let tee_label = format!("deno_{}", subcmd);
+    crate::core::runner::run_filtered(
+        cmd,
+        "deno",
+        display.trim_end(),
+        filter_deno_output,
+        crate::core::runner::RunOptions::with_tee(&tee_label),
+    )
 }
 
 pub fn run_lint(args: &[String], verbose: u8) -> Result<i32> {
