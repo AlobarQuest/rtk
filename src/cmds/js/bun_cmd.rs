@@ -13,16 +13,13 @@ struct BunPmPackage {
     version: Option<String>,
 }
 
-/// Validate package names so they cannot be confused for flags or path traversal.
-fn is_valid_package_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 214 {
-        return false;
-    }
-    if name.contains("..") {
-        return false;
-    }
-    name.chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '@' | '/' | '-' | '_' | '.'))
+/// Build the argv for `bun <subcmd> <args>`. Specs pass through verbatim:
+/// args reach bun as an argv vector (never a shell), so there is nothing to
+/// escape or validate, and bun enforces its own spec syntax.
+fn pkg_argv(subcmd: &str, args: &[String]) -> Vec<String> {
+    std::iter::once(subcmd.to_string())
+        .chain(args.iter().cloned())
+        .collect()
 }
 
 /// Filter bun install/add/remove output — strip progress lines, version headers, empty lines.
@@ -110,18 +107,8 @@ pub fn filter_bun_pm_ls_text(raw: &str) -> String {
 pub fn run_pkg(subcmd: &str, args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
-    // Validate package names in args (skip flags starting with -)
-    for arg in args {
-        if !arg.starts_with('-') && !is_valid_package_name(arg) {
-            anyhow::bail!("Invalid package name: {}", arg);
-        }
-    }
-
     let mut cmd = resolved_command("bun");
-    cmd.arg(subcmd);
-    for arg in args {
-        cmd.arg(arg);
-    }
+    cmd.args(pkg_argv(subcmd, args));
 
     if verbose > 0 {
         eprintln!("Running: bun {} {}", subcmd, args.join(" "));
@@ -373,12 +360,27 @@ error: PackageNotFound - "nonexistent-pkg" not found in registry
     }
 
     #[test]
-    fn test_is_valid_package_name() {
-        assert!(is_valid_package_name("express"));
-        assert!(is_valid_package_name("@types/node"));
-        assert!(is_valid_package_name("lodash.merge"));
-        assert!(!is_valid_package_name(""));
-        assert!(!is_valid_package_name("../etc/passwd"));
-        assert!(!is_valid_package_name("pkg;rm -rf /"));
+    fn test_pkg_argv_passes_specs_verbatim() {
+        // Every spec bun itself accepts must reach bun untouched. rtk rejecting
+        // chars like ^ ~ : # broke semver ranges and protocol specifiers.
+        let specs = [
+            "express",
+            "@types/node",
+            "lodash@^4.17.21",
+            "pkg@~1.2.3",
+            "@scope/pkg@>=1.0.0 <2.0.0",
+            "npm:react@^18",
+            "github:user/repo#branch",
+            "git+https://github.com/user/repo.git",
+            "workspace:*",
+            "file:../sibling-pkg",
+            // Shell metacharacters are inert: args reach bun as an argv
+            // vector, never through a shell, so nothing needs rejecting.
+            "pkg;rm -rf /",
+        ];
+        for spec in specs {
+            let argv = pkg_argv("add", &[spec.to_string()]);
+            assert_eq!(argv, vec!["add".to_string(), spec.to_string()]);
+        }
     }
 }
