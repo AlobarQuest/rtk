@@ -81,7 +81,12 @@ pub fn run_test(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("deno");
     cmd.arg("test").args(args);
     let display = format!("deno test {}", args.join(" "));
-    crate::core::runner::run_test_cmd(cmd, display.trim_end(), verbose)
+    crate::core::runner::run_test_cmd(
+        cmd,
+        display.trim_end(),
+        crate::core::runner::TestEcosystem::Deno,
+        verbose,
+    )
 }
 
 /// Passthrough for `deno run`, `deno task`, and other unfiltered subcommands.

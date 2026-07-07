@@ -239,7 +239,12 @@ pub fn run_test(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("bun");
     cmd.arg("test").args(args);
     let display = format!("bun test {}", args.join(" "));
-    crate::core::runner::run_test_cmd(cmd, display.trim_end(), verbose)
+    crate::core::runner::run_test_cmd(
+        cmd,
+        display.trim_end(),
+        crate::core::runner::TestEcosystem::Bun,
+        verbose,
+    )
 }
 
 /// Run `bunx <tool>` with error-only filtering. Args are passed as a vector, never via a shell.

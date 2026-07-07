@@ -401,18 +401,57 @@ pub fn run_err_cmd(cmd: Command, display: &str, verbose: u8) -> Result<i32> {
     )
 }
 
+/// Test-output ecosystem, chosen once at the boundary. Modules that know
+/// their runner statically pass the variant directly; shell-string entry
+/// points convert once via `detect`. Matching on the enum makes substring
+/// co-firing ("cargo test" contains "go test") unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestEcosystem {
+    Cargo,
+    Pytest,
+    Jest,
+    Go,
+    Bun,
+    Deno,
+    Unknown,
+}
+
+impl TestEcosystem {
+    /// Detect from a display or shell string. First match wins; Cargo is
+    /// checked before Go because "cargo test" contains "go test".
+    pub fn detect(command: &str) -> Self {
+        if command.contains("cargo test") {
+            Self::Cargo
+        } else if command.contains("pytest") {
+            Self::Pytest
+        } else if command.contains("jest")
+            || command.contains("npm test")
+            || command.contains("yarn test")
+        {
+            Self::Jest
+        } else if command.contains("bun test") {
+            Self::Bun
+        } else if command.contains("deno test") {
+            Self::Deno
+        } else if command.contains("go test") {
+            Self::Go
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
 /// Run a prebuilt test command (no shell), showing only failures.
-/// `display` is used only for logging and tool detection, never executed.
-pub fn run_test_cmd(cmd: Command, display: &str, verbose: u8) -> Result<i32> {
+/// `display` is used only for logging and tracking, never executed.
+pub fn run_test_cmd(cmd: Command, display: &str, eco: TestEcosystem, verbose: u8) -> Result<i32> {
     if verbose > 0 {
         eprintln!("Running tests: {}", display);
     }
-    let display_owned = display.to_string();
     run_filtered(
         cmd,
         "test",
         display,
-        move |raw| extract_test_summary(raw, &display_owned),
+        move |raw| extract_test_summary(raw, eco),
         RunOptions::with_tee("test"),
     )
 }
@@ -450,104 +489,126 @@ fn filter_errors(output: &str) -> String {
     result.join("\n")
 }
 
-fn extract_test_summary(output: &str, command: &str) -> String {
+fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
+    // Test runners colorize even when piped (deno does), so anchor on clean text.
+    let cleaned = crate::core::utils::strip_ansi(output);
+    let lines: Vec<&str> = cleaned.lines().collect();
+
     let mut result = Vec::new();
-    let lines: Vec<&str> = output.lines().collect();
-
-    let is_cargo = command.contains("cargo test");
-    let is_pytest = command.contains("pytest");
-    let is_jest =
-        command.contains("jest") || command.contains("npm test") || command.contains("yarn test");
-    let is_go = command.contains("go test");
-    let is_bun = command.contains("bun test");
-    // Deno's test output is cargo-shaped ("test result:", "FAILED", "failures:").
-    let is_deno = command.contains("deno test");
-
     let mut failures = Vec::new();
-    let mut in_failure = false;
     let mut failure_lines = Vec::new();
+    let mut in_failure = false;
+    let mut in_failures_list = false;
 
     for line in lines.iter() {
-        if is_cargo {
-            if line.contains("test result:") {
-                result.push(line.to_string());
+        match eco {
+            TestEcosystem::Cargo => {
+                if line.contains("test result:") {
+                    result.push(line.to_string());
+                }
+                if line.contains("FAILED") && !line.contains("test result") {
+                    failures.push(line.to_string());
+                }
+                if line.starts_with("failures:") {
+                    in_failure = true;
+                }
+                if in_failure && line.starts_with("    ") {
+                    failure_lines.push(line.to_string());
+                }
             }
-            if line.contains("FAILED") && !line.contains("test result") {
-                failures.push(line.to_string());
-            }
-            if line.starts_with("failures:") {
-                in_failure = true;
-            }
-            if in_failure && line.starts_with("    ") {
-                failure_lines.push(line.to_string());
-            }
-        }
 
-        if is_pytest {
-            if line.contains(" passed") || line.contains(" failed") || line.contains(" error") {
-                result.push(line.to_string());
+            TestEcosystem::Pytest => {
+                if line.contains(" passed") || line.contains(" failed") || line.contains(" error") {
+                    result.push(line.to_string());
+                }
+                if line.contains("FAILED") {
+                    failures.push(line.to_string());
+                }
             }
-            if line.contains("FAILED") {
-                failures.push(line.to_string());
-            }
-        }
 
-        if is_jest {
-            if line.contains("Tests:") || line.contains("Test Suites:") {
-                result.push(line.to_string());
+            TestEcosystem::Jest => {
+                if line.contains("Tests:") || line.contains("Test Suites:") {
+                    result.push(line.to_string());
+                }
+                if line.contains("✕") || line.contains("FAIL") {
+                    failures.push(line.to_string());
+                }
             }
-            if line.contains("✕") || line.contains("FAIL") {
-                failures.push(line.to_string());
-            }
-        }
 
-        if is_go {
-            if line.starts_with("ok") || line.starts_with("FAIL") || line.starts_with("---") {
-                result.push(line.to_string());
+            TestEcosystem::Go => {
+                if line.starts_with("ok") || line.starts_with("FAIL") || line.starts_with("---") {
+                    result.push(line.to_string());
+                }
+                if line.contains("FAIL") {
+                    failures.push(line.to_string());
+                }
             }
-            if line.contains("FAIL") {
-                failures.push(line.to_string());
-            }
-        }
 
-        if is_bun {
-            let trimmed = line.trim_start();
-            // Anchored count lines (" 6 pass", " 4 fail") and the "Ran N tests" footer.
-            // A loose `contains(" fail")` also matches bun's echoed source context when
-            // a test NAME contains "fails", flooding the summary with duplicate snippets.
-            if is_bun_count_line(trimmed) || trimmed.starts_with("Ran ") {
-                result.push(line.to_string());
+            TestEcosystem::Bun => {
+                let trimmed = line.trim_start();
+                // Anchored count lines (" 6 pass", " 4 fail") and the "Ran N tests" footer.
+                // A loose `contains(" fail")` also matches bun's echoed source context when
+                // a test NAME contains "fails", flooding the summary with duplicate snippets.
+                if is_bun_count_line(trimmed) || trimmed.starts_with("Ran ") {
+                    result.push(line.to_string());
+                }
+                // Bun prints the diagnostic BEFORE the failure marker:
+                //   error: expect(received).toBe(expected)
+                //   Expected: 3
+                //   Received: 2
+                //         at <anonymous> (...)
+                //   (fail) t2 fails [1.86ms]
+                if trimmed.starts_with("(fail)") || line.contains('✗') {
+                    failures.push(line.to_string());
+                    in_failure = false;
+                } else if trimmed.starts_with("error:") {
+                    in_failure = true;
+                    failure_lines.push(line.to_string());
+                } else if in_failure && !trimmed.is_empty() && !trimmed.starts_with("at ") {
+                    failure_lines.push(line.to_string());
+                }
             }
-            // Bun prints the diagnostic BEFORE the failure marker:
-            //   error: expect(received).toBe(expected)
-            //   Expected: 3
-            //   Received: 2
-            //         at <anonymous> (...)
-            //   (fail) t2 fails [1.86ms]
-            if trimmed.starts_with("(fail)") || line.contains('✗') {
-                failures.push(line.to_string());
-                in_failure = false;
-            } else if trimmed.starts_with("error:") {
-                in_failure = true;
-                failure_lines.push(line.to_string());
-            } else if in_failure && !trimmed.is_empty() && !trimmed.starts_with("at ") {
-                failure_lines.push(line.to_string());
-            }
-        }
 
-        if is_deno {
-            if line.contains("test result:") {
-                result.push(line.to_string());
+            TestEcosystem::Deno => {
+                // Full trim: ANSI background padding leaves " FAILURES " with
+                // trailing whitespace after stripping.
+                let trimmed = line.trim();
+                // Current deno (2.x): "FAILED | 3 passed | 2 failed (17ms)" footer,
+                // " FAILURES " section listing "name => file:line:col".
+                // Legacy deno mimicked cargo ("test result:", "failures:").
+                if trimmed.starts_with("FAILED |")
+                    || trimmed.starts_with("ok |")
+                    || line.contains("test result:")
+                {
+                    result.push(line.to_string());
+                    in_failures_list = false;
+                } else if trimmed == "FAILURES" || line.starts_with("failures:") {
+                    in_failures_list = true;
+                } else if in_failures_list && !trimmed.is_empty() {
+                    failures.push(line.to_string());
+                }
+                // Diagnostics live in the ERRORS section: an "error:" line, then
+                // [Diff] and +/- lines, then a stack that ends the block.
+                // "error: Test failed" is deno's generic footer, not a diagnostic.
+                if trimmed.starts_with("error:") && trimmed != "error: Test failed" {
+                    in_failure = true;
+                    failure_lines.push(line.to_string());
+                } else if in_failure {
+                    if trimmed.starts_with("at ") {
+                        in_failure = false;
+                    } else if !trimmed.is_empty()
+                        && trimmed != "^"
+                        && !trimmed.starts_with("throw ")
+                    {
+                        // "throw new AssertionError(...)" is deno-std's echoed
+                        // internal throw site; the failing test's location is
+                        // already in the FAILURES marker.
+                        failure_lines.push(line.to_string());
+                    }
+                }
             }
-            if line.contains("FAILED") && !line.contains("test result") {
-                failures.push(line.to_string());
-            }
-            if line.starts_with("failures:") {
-                in_failure = true;
-            }
-            if in_failure && line.starts_with("    ") {
-                failure_lines.push(line.to_string());
-            }
+
+            TestEcosystem::Unknown => {}
         }
     }
 
@@ -556,7 +617,7 @@ fn extract_test_summary(output: &str, command: &str) -> String {
     if !failures.is_empty() {
         output.push_str("[FAIL] FAILURES:\n");
         for f in failures.iter().take(MAX_RUNNER_FAILURES) {
-            output.push_str(&format!("  {}\n", f));
+            output.push_str(&format!("  {}\n", f.trim()));
         }
         if failures.len() > MAX_RUNNER_FAILURES {
             output.push_str(&format!(
@@ -620,7 +681,7 @@ mod err_test_runner_tests {
     #[test]
     fn test_extract_bun_test_failures() {
         let raw = "bun test v1.1.0\nsrc/math.test.ts:\n✗ adds numbers [1ms]\n 3 pass\n 1 fail\nRan 4 tests across 1 file.";
-        let out = extract_test_summary(raw, "bun test");
+        let out = extract_test_summary(raw, TestEcosystem::Bun);
         assert!(out.contains("[FAIL]"), "expected failure block, got: {out}");
         assert!(out.contains("adds numbers"));
         assert!(out.contains("1 fail"));
@@ -629,7 +690,7 @@ mod err_test_runner_tests {
     #[test]
     fn test_extract_deno_test_failures() {
         let raw = "running 2 tests\ntest add ... ok\ntest sub ... FAILED\nfailures:\n    sub\ntest result: FAILED. 1 passed; 1 failed; 0 ignored";
-        let out = extract_test_summary(raw, "deno test");
+        let out = extract_test_summary(raw, TestEcosystem::Deno);
         assert!(out.contains("[FAIL]"), "expected failure block, got: {out}");
         assert!(out.contains("test result:"));
     }
@@ -641,7 +702,7 @@ mod err_test_runner_tests {
     #[test]
     fn test_bun_multifail_golden() {
         let raw = include_str!("../../tests/fixtures/bun_test_multifail_raw.txt");
-        let out = extract_test_summary(raw, "bun test");
+        let out = extract_test_summary(raw, TestEcosystem::Bun);
         let expected = r#"[FAIL] FAILURES:
   (fail) t2 fails [1.86ms]
   (fail) t4 fails [0.08ms]
@@ -675,7 +736,7 @@ SUMMARY:
     #[test]
     fn test_bun_multifail_keeps_diagnostics_drops_noise() {
         let raw = include_str!("../../tests/fixtures/bun_test_multifail_raw.txt");
-        let out = extract_test_summary(raw, "bun test");
+        let out = extract_test_summary(raw, TestEcosystem::Bun);
         // The one thing an agent needs: expected vs received, per failure.
         assert!(
             out.contains("error: expect(received).toBe(expected)"),
@@ -698,7 +759,7 @@ SUMMARY:
     #[test]
     fn test_bun_multifail_savings() {
         let raw = include_str!("../../tests/fixtures/bun_test_multifail_raw.txt");
-        let out = extract_test_summary(raw, "bun test");
+        let out = extract_test_summary(raw, TestEcosystem::Bun);
         let savings = 100.0 - (count_tokens(&out) as f64 / count_tokens(raw) as f64 * 100.0);
         assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
     }
@@ -706,7 +767,7 @@ SUMMARY:
     #[test]
     fn test_bun_all_pass_summary_only() {
         let raw = include_str!("../../tests/fixtures/bun_test_pass_raw.txt");
-        let out = extract_test_summary(raw, "bun test");
+        let out = extract_test_summary(raw, TestEcosystem::Bun);
         assert!(!out.contains("[FAIL]"), "{out}");
         assert!(out.contains("3 pass"), "{out}");
         assert!(out.contains("0 fail"), "{out}");
@@ -716,12 +777,81 @@ SUMMARY:
     #[test]
     fn test_bun_thrown_error_skip_todo() {
         let raw = include_str!("../../tests/fixtures/bun_test_throw_skip_raw.txt");
-        let out = extract_test_summary(raw, "bun test");
+        let out = extract_test_summary(raw, TestEcosystem::Bun);
         assert!(out.contains("error: boom: connection refused"), "{out}");
         assert!(out.contains("(fail) throws"), "{out}");
         assert!(out.contains("1 skip"), "{out}");
         assert!(out.contains("1 todo"), "{out}");
         assert!(!out.contains("at <anonymous>"), "{out}");
+    }
+
+    #[test]
+    fn test_ecosystem_detect_first_match_wins() {
+        // "cargo test" contains "go test" as a substring; the enum makes
+        // that co-firing unrepresentable.
+        assert_eq!(
+            TestEcosystem::detect("cargo test --all"),
+            TestEcosystem::Cargo
+        );
+        assert_eq!(TestEcosystem::detect("go test ./..."), TestEcosystem::Go);
+        assert_eq!(TestEcosystem::detect("bun test"), TestEcosystem::Bun);
+        assert_eq!(
+            TestEcosystem::detect("deno test --allow-read"),
+            TestEcosystem::Deno
+        );
+        assert_eq!(TestEcosystem::detect("pytest -x"), TestEcosystem::Pytest);
+        assert_eq!(TestEcosystem::detect("npm test"), TestEcosystem::Jest);
+        assert_eq!(TestEcosystem::detect("make check"), TestEcosystem::Unknown);
+    }
+
+    #[test]
+    fn test_deno_multifail_golden() {
+        // Real deno 2.9.1 output: ANSI-colored, " FAILURES " section header,
+        // "FAILED | 3 passed | 2 failed" footer. No "test result:" lines.
+        let raw = include_str!("../../tests/fixtures/deno_test_multifail_raw.txt");
+        let out = extract_test_summary(raw, TestEcosystem::Deno);
+        let expected = r#"[FAIL] FAILURES:
+  subs fails => ./math_test.ts:3:6
+  len fails => ./math_test.ts:5:6
+  includes fails => ./more_test.ts:3:6
+  object fails => ./more_test.ts:5:6
+  error: AssertionError: Values are not equal.
+  [Diff] Actual / Expected
+  -   2
+  +   1
+  error: AssertionError: Values are not equal.
+  [Diff] Actual / Expected
+  -   3
+  +   4
+  error: AssertionError: Expected actual: "hello world" to contain: "bye".
+  error: AssertionError: Values are not equal.
+  [Diff] Actual / Expected
+  {
+  a: 1,
+  -     b: 2,
+  +     b: 3,
+  }
+
+SUMMARY:
+  FAILED | 9 passed | 4 failed (64ms)
+"#;
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn test_deno_multifail_savings() {
+        let raw = include_str!("../../tests/fixtures/deno_test_multifail_raw.txt");
+        let out = extract_test_summary(raw, TestEcosystem::Deno);
+        let savings = 100.0 - (count_tokens(&out) as f64 / count_tokens(raw) as f64 * 100.0);
+        assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
+    }
+
+    #[test]
+    fn test_deno_all_pass_summary_only() {
+        let raw = include_str!("../../tests/fixtures/deno_test_pass_raw.txt");
+        let out = extract_test_summary(raw, TestEcosystem::Deno);
+        assert!(!out.contains("[FAIL]"), "{out}");
+        assert!(out.contains("ok | 3 passed | 0 failed"), "{out}");
     }
 
     #[test]

@@ -23,5 +23,10 @@ pub fn run_err(command: &str, verbose: u8) -> Result<i32> {
 
 /// Run tests via the shell and show only failures.
 pub fn run_test(command: &str, verbose: u8) -> Result<i32> {
-    run_test_cmd(build_shell_command(command), command, verbose)
+    run_test_cmd(
+        build_shell_command(command),
+        command,
+        crate::core::runner::TestEcosystem::detect(command),
+        verbose,
+    )
 }
