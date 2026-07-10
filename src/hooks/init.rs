@@ -7089,6 +7089,10 @@ mod tests {
                 content.contains("rtk rewrite"),
                 "extension must delegate to rtk rewrite"
             );
+            assert!(
+                !content.contains("import {"),
+                "extension must not load the Pi package at runtime"
+            );
         });
     }
 
