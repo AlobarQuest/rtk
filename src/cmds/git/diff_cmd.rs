@@ -17,11 +17,14 @@ pub fn run(file1: &Path, file2: &Path, verbose: u8) -> Result<i32> {
 
     let content1 = fs::read_to_string(file1)?;
     let content2 = fs::read_to_string(file2)?;
-    let raw = format!("{}\n---\n{}", content1, content2);
+    let lines1: Vec<&str> = content1.lines().collect();
+    let lines2: Vec<&str> = content2.lines().collect();
+    let diff = compute_diff(&lines1, &lines2);
+    let raw = format_classic_diff(&diff);
 
-    let (rtk, exit_code) = render_file_diff(file1, file2, &content1, &content2);
+    let (rtk, exit_code) = render_diff(file1, file2, &diff);
 
-    let shown = never_worse(&raw, &rtk);
+    let shown = select_file_diff_output(&diff, &raw, &rtk);
     print!("{}", shown);
     timer.track(
         &format!("diff {} {}", file1.display(), file2.display()),
@@ -34,11 +37,15 @@ pub fn run(file1: &Path, file2: &Path, verbose: u8) -> Result<i32> {
 
 /// Renders the condensed file comparison and returns it with the
 /// diff-convention exit code (0 = identical, 1 = differences found).
+#[cfg(test)]
 fn render_file_diff(file1: &Path, file2: &Path, content1: &str, content2: &str) -> (String, i32) {
     let lines1: Vec<&str> = content1.lines().collect();
     let lines2: Vec<&str> = content2.lines().collect();
     let diff = compute_diff(&lines1, &lines2);
+    render_diff(file1, file2, &diff)
+}
 
+fn render_diff(file1: &Path, file2: &Path, diff: &DiffResult) -> (String, i32) {
     if diff.changes.is_empty() {
         return ("[ok] Files are identical\n".to_string(), 0);
     }
@@ -97,6 +104,28 @@ fn format_diff_changes(diff: &DiffResult) -> String {
         }
     }
     out
+}
+
+fn format_classic_diff(diff: &DiffResult) -> String {
+    let mut out = String::new();
+    for change in &diff.changes {
+        match change {
+            DiffChange::Added(_, content) => out.push_str(&format!("> {}\n", content)),
+            DiffChange::Removed(_, content) => out.push_str(&format!("< {}\n", content)),
+            DiffChange::Modified(_, old, new) => {
+                out.push_str(&format!("< {}\n> {}\n", old, new));
+            }
+        }
+    }
+    out
+}
+
+fn select_file_diff_output<'a>(diff: &DiffResult, raw: &'a str, rendered: &'a str) -> &'a str {
+    if diff.changes.is_empty() {
+        rendered
+    } else {
+        never_worse(raw, rendered)
+    }
 }
 
 fn compute_diff(lines1: &[&str], lines2: &[&str]) -> DiffResult {
@@ -355,6 +384,42 @@ mod tests {
         let (out, code) = render_file_diff(Path::new("t1.txt"), Path::new("t2.txt"), "x\n", "y\n");
         assert!(out.contains("+1 added, -1 removed"));
         assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_never_worse_fallback_is_a_classic_diff() {
+        let diff = compute_diff(&["alpha beta"], &["alpha zzzz"]);
+        let fallback = format_classic_diff(&diff);
+        let (rendered, code) = render_diff(Path::new("before"), Path::new("after"), &diff);
+        let shown = select_file_diff_output(&diff, &fallback, &rendered);
+
+        assert_eq!(code, 1);
+        assert!(shown.contains("< alpha beta"));
+        assert!(shown.contains("> alpha zzzz"));
+        assert!(!shown.contains("\n---\n"));
+    }
+
+    #[test]
+    fn test_identical_files_keep_the_success_message() {
+        let diff = compute_diff(&["same"], &["same"]);
+        let rendered = "[ok] Files are identical\n";
+
+        assert_eq!(select_file_diff_output(&diff, "", rendered), rendered);
+    }
+
+    #[test]
+    fn test_classic_diff_covers_modified_line_boundary_cases() {
+        for (old, new) in [
+            ("alpha beta gamma delta", "alpha beta XXXXX delta"),
+            ("alpha beta gamma", "alpha beta"),
+            ("alpha beta gamma delta", "XXXXX beta gamma delta"),
+        ] {
+            let diff = compute_diff(&[old], &[new]);
+            let fallback = format_classic_diff(&diff);
+
+            assert!(fallback.contains(&format!("< {old}")));
+            assert!(fallback.contains(&format!("> {new}")));
+        }
     }
 
     // --- condense_unified_diff ---
