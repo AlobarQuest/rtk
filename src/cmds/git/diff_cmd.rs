@@ -108,16 +108,132 @@ fn format_diff_changes(diff: &DiffResult) -> String {
 
 fn format_classic_diff(diff: &DiffResult) -> String {
     let mut out = String::new();
-    for change in &diff.changes {
-        match change {
-            DiffChange::Added(_, content) => out.push_str(&format!("> {}\n", content)),
-            DiffChange::Removed(_, content) => out.push_str(&format!("< {}\n", content)),
-            DiffChange::Modified(_, old, new) => {
-                out.push_str(&format!("< {}\n> {}\n", old, new));
+    let mut index = 0;
+
+    while index < diff.changes.len() {
+        match &diff.changes[index] {
+            DiffChange::Modified(start, _, _) => {
+                let start = *start;
+                let mut end = start;
+                let mut old_lines = Vec::new();
+                let mut new_lines = Vec::new();
+
+                while let Some(DiffChange::Modified(line, old, new)) = diff.changes.get(index) {
+                    if *line != end {
+                        break;
+                    }
+                    old_lines.push(old);
+                    new_lines.push(new);
+                    end += 1;
+                    index += 1;
+                }
+
+                out.push_str(&format!(
+                    "{}c{}\n",
+                    format_line_range(start, end - 1),
+                    format_line_range(start, end - 1)
+                ));
+                for line in old_lines {
+                    out.push_str(&format!("< {}\n", line));
+                }
+                out.push_str("---\n");
+                for line in new_lines {
+                    out.push_str(&format!("> {}\n", line));
+                }
+            }
+            DiffChange::Removed(start, _) if matches!(
+                diff.changes.get(index + 1),
+                Some(DiffChange::Added(line, _)) if line == start
+            ) => {
+                let start = *start;
+                let mut end = start;
+                let mut old_lines = Vec::new();
+                let mut new_lines = Vec::new();
+
+                while let (
+                    Some(DiffChange::Removed(old_line, old)),
+                    Some(DiffChange::Added(new_line, new)),
+                ) = (diff.changes.get(index), diff.changes.get(index + 1))
+                {
+                    if *old_line != end || *new_line != end {
+                        break;
+                    }
+                    old_lines.push(old);
+                    new_lines.push(new);
+                    end += 1;
+                    index += 2;
+                }
+
+                out.push_str(&format!(
+                    "{}c{}\n",
+                    format_line_range(start, end - 1),
+                    format_line_range(start, end - 1)
+                ));
+                for line in old_lines {
+                    out.push_str(&format!("< {}\n", line));
+                }
+                out.push_str("---\n");
+                for line in new_lines {
+                    out.push_str(&format!("> {}\n", line));
+                }
+            }
+            DiffChange::Added(start, _) => {
+                let start = *start;
+                let mut end = start;
+                let mut new_lines = Vec::new();
+
+                while let Some(DiffChange::Added(line, new)) = diff.changes.get(index) {
+                    if *line != end {
+                        break;
+                    }
+                    new_lines.push(new);
+                    end += 1;
+                    index += 1;
+                }
+
+                out.push_str(&format!(
+                    "{}a{}\n",
+                    start - 1,
+                    format_line_range(start, end - 1)
+                ));
+                for line in new_lines {
+                    out.push_str(&format!("> {}\n", line));
+                }
+            }
+            DiffChange::Removed(start, _) => {
+                let start = *start;
+                let mut end = start;
+                let mut old_lines = Vec::new();
+
+                while let Some(DiffChange::Removed(line, old)) = diff.changes.get(index) {
+                    if *line != end {
+                        break;
+                    }
+                    old_lines.push(old);
+                    end += 1;
+                    index += 1;
+                }
+
+                out.push_str(&format!(
+                    "{}d{}\n",
+                    format_line_range(start, end - 1),
+                    start - 1
+                ));
+                for line in old_lines {
+                    out.push_str(&format!("< {}\n", line));
+                }
             }
         }
     }
     out
+}
+
+fn format_line_range(start: usize, end: usize) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start},{end}")
+    }
 }
 
 fn select_file_diff_output<'a>(diff: &DiffResult, raw: &'a str, rendered: &'a str) -> &'a str {
@@ -394,9 +510,10 @@ mod tests {
         let shown = select_file_diff_output(&diff, &fallback, &rendered);
 
         assert_eq!(code, 1);
+        assert!(shown.contains("1c1"));
         assert!(shown.contains("< alpha beta"));
+        assert!(shown.contains("\n---\n"));
         assert!(shown.contains("> alpha zzzz"));
-        assert!(!shown.contains("\n---\n"));
     }
 
     #[test]
