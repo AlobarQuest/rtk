@@ -89,14 +89,22 @@ struct Failure {
     diff_total: usize,
 }
 
+// run-tests.php prints the DIFF block only when the caller passes --show-diff or
+// --show-all (or selects a single test). Every other --show-* switch (--show-slow,
+// --show-mem, --show-out, …) leaves failures diff-less, so they must not suppress
+// the --show-diff we inject.
+fn args_already_show_diff(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--show-diff" || a == "--show-all")
+}
+
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("php");
     cmd.arg("run-tests.php");
-    // run-tests.php only emits the DIFF block for a failure when asked (or when
-    // exactly one test is selected). The diff is what makes a failure actionable,
-    // and the filter caps it at MAX_DIFF_LINES_PER_FAILURE regardless.
-    let has_show_flag = args.iter().any(|a| a.starts_with("--show-"));
-    if !has_show_flag {
+    // The diff is what makes a failure actionable, and the filter caps it at
+    // MAX_DIFF_LINES_PER_FAILURE regardless, so request it unless the caller
+    // already did.
+    let shows_diff = args_already_show_diff(args);
+    if !shows_diff {
         cmd.arg("--show-diff");
     }
     for a in args {
@@ -104,7 +112,8 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     }
 
     if verbose > 0 {
-        eprintln!("Running: php run-tests.php --show-diff {}", args.join(" "));
+        let injected = if shows_diff { "" } else { "--show-diff " };
+        eprintln!("Running: php run-tests.php {injected}{}", args.join(" "));
     }
 
     runner::run_filtered(
@@ -386,6 +395,18 @@ fn build_summary(p: &Parsed) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_show_diff_injection_ignores_unrelated_show_flags() {
+        let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        // Unrelated --show-* flags don't produce diffs, so they must not suppress
+        // our injected --show-diff.
+        assert!(!args_already_show_diff(&s(&["--show-slow", "1000", "ext/standard/"])));
+        assert!(!args_already_show_diff(&s(&["ext/standard/"])));
+        // The two flags that do produce diffs suppress the injection.
+        assert!(args_already_show_diff(&s(&["--show-diff"])));
+        assert!(args_already_show_diff(&s(&["--show-all", "-j8"])));
+    }
 
     #[test]
     fn test_all_pass() {
