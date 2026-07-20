@@ -92,12 +92,19 @@ struct Failure {
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("php");
     cmd.arg("run-tests.php");
+    // run-tests.php only emits the DIFF block for a failure when asked (or when
+    // exactly one test is selected). The diff is what makes a failure actionable,
+    // and the filter caps it at MAX_DIFF_LINES_PER_FAILURE regardless.
+    let has_show_flag = args.iter().any(|a| a.starts_with("--show-"));
+    if !has_show_flag {
+        cmd.arg("--show-diff");
+    }
     for a in args {
         cmd.arg(a);
     }
 
     if verbose > 0 {
-        eprintln!("Running: php run-tests.php {}", args.join(" "));
+        eprintln!("Running: php run-tests.php --show-diff {}", args.join(" "));
     }
 
     runner::run_filtered(
@@ -105,13 +112,22 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         "phpt",
         &args.join(" "),
         filter_phpt_output,
-        runner::RunOptions::stdout_only().tee("phpt"),
+        runner::RunOptions::with_tee("phpt"),
     )
 }
 
 pub(crate) fn filter_phpt_output(raw: &str) -> String {
-    let stripped = strip_ansi(raw);
+    // Serial runs (no -j) redraw the progress line, so a status arrives as
+    // "TEST 1/2 [x.phpt]\rFAIL desc [x.phpt]". Each CR segment is its own
+    // rendered line; splitting on it is what lets the status anchor match.
+    let stripped = strip_ansi(raw).replace('\r', "\n");
     let parsed = parse(&stripped);
+    // A startup failure (no run-tests.php in cwd, php missing) produces nothing
+    // parseable, and its diagnostic is on stderr. Summarising that as "no tests
+    // ran" would drop the only line explaining why.
+    if !parsed.looks_like_run_tests() {
+        return stripped.trim_end().to_string();
+    }
     build_summary(&parsed)
 }
 
@@ -123,6 +139,14 @@ struct Parsed {
     total_tests: Option<usize>,
     time_seconds: Option<f64>,
     failures: Vec<Failure>,
+}
+
+impl Parsed {
+    fn looks_like_run_tests(&self) -> bool {
+        self.summary_counts.is_some()
+            || self.scanned_counts.total() > 0
+            || !self.env.version.is_empty()
+    }
 }
 
 fn parse(stripped: &str) -> Parsed {
@@ -542,6 +566,40 @@ No tests matched selector.
 ";
         let out = filter_phpt_output(input);
         assert!(out.contains("no tests ran"), "got: {}", out);
+    }
+
+    #[test]
+    fn test_serial_run_progress_carriage_returns() {
+        // Without -j, run-tests.php redraws the progress line: the status token
+        // lands after a CR, not after the test bracket.
+        let input = "\
+=====================================================================
+PHP_VERSION : 8.6.0-dev
+PHP_SAPI    : cli
+PHP_OS      : Linux - Linux box 6.18.0 x86_64
+=====================================================================
+TEST 1/2 [bad.phpt]\rFAIL failing sample [bad.phpt] \nTEST 2/2 [good.phpt]\rPASS passing sample [good.phpt] \n\
+=====================================================================
+Number of tests :     2                 2
+Tests failed    :     1 ( 50.0%) ( 50.0%)
+Tests passed    :     1 ( 50.0%) ( 50.0%)
+Time taken      : 0.025 seconds
+";
+        let out = filter_phpt_output(input);
+        assert!(out.starts_with("phpt: 1 passed, 1 failed"), "got: {}", out);
+        assert!(out.contains("FAILURES (1):"), "got: {}", out);
+        assert!(out.contains("bad.phpt -- failing sample"), "got: {}", out);
+        assert!(!out.contains("unavailable"), "got: {}", out);
+    }
+
+    #[test]
+    fn test_unparseable_output_passes_through() {
+        // php itself failed before run-tests.php produced anything (wrong cwd).
+        let input = "Could not open input file: run-tests.php\n";
+        assert_eq!(
+            filter_phpt_output(input),
+            "Could not open input file: run-tests.php"
+        );
     }
 
     #[test]
