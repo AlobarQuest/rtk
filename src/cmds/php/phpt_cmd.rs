@@ -188,12 +188,7 @@ fn parse(stripped: &str) -> Parsed {
         if p.env.os.is_empty() {
             if let Some(rest) = line.strip_prefix("PHP_OS") {
                 let val = after_colon(rest);
-                p.env.os = val
-                    .split(" - ")
-                    .next()
-                    .unwrap_or(&val)
-                    .trim()
-                    .to_string();
+                p.env.os = val.split(" - ").next().unwrap_or(&val).trim().to_string();
             }
         }
 
@@ -259,7 +254,10 @@ fn after_colon(s: &str) -> String {
 }
 
 fn build_summary(p: &Parsed) -> String {
-    let counts = p.summary_counts.clone().unwrap_or_else(|| p.scanned_counts.clone());
+    let counts = p
+        .summary_counts
+        .clone()
+        .unwrap_or_else(|| p.scanned_counts.clone());
 
     if counts.total() == 0 {
         return "phpt: no tests ran".to_string();
@@ -482,7 +480,11 @@ Time taken      :   0.500 seconds
         assert!(out.contains("FAILURES (25):"), "got: {}", out);
         assert!(out.contains("t1.phpt"), "got: {}", out);
         assert!(out.contains("t20.phpt"), "got: {}", out);
-        assert!(!out.contains("t21.phpt"), "truncated failures leaked: {}", out);
+        assert!(
+            !out.contains("t21.phpt"),
+            "truncated failures leaked: {}",
+            out
+        );
         assert!(out.contains("+5 more failures"), "got: {}", out);
     }
 
@@ -680,7 +682,11 @@ Tests passed    :    1
 =====================================================================
 ";
         let out = filter_phpt_output(input);
-        assert!(out.contains("OS Linux\n") || out.ends_with("OS Linux"), "got: {}", out);
+        assert!(
+            out.contains("OS Linux\n") || out.ends_with("OS Linux"),
+            "got: {}",
+            out
+        );
         assert!(!out.contains("PREEMPT_DYNAMIC"), "got: {}", out);
     }
 
@@ -747,8 +753,8 @@ Tests passed    :    1
     }
 
     #[test]
-    fn test_snapshot_mixed_run() {
-        // Full end-to-end snapshot of a representative run: pass, skip, xfail,
+    fn test_mixed_run() {
+        // Full end-to-end fixture of a representative run: pass, skip, xfail,
         // and a failure with a diff. Guards the exact output format.
         let input = "\
 =====================================================================
@@ -779,6 +785,16 @@ Tests passed    :    1
 Time taken      :   2.500 seconds
 =====================================================================
 ";
-        insta::assert_snapshot!(filter_phpt_output(input));
+        let expected = "\
+phpt: 1 passed, 1 failed, 1 skipped, 1 xfailed  (4 total, 2.5s)
+PHP 8.4.20  SAPI cli  OS Linux
+
+FAILURES (1):
+  Zend/tests/d.phpt -- Bug #123
+    001- int(1)
+    001+ int(2)";
+
+        let out = filter_phpt_output(input);
+        assert_eq!(out, expected, "got: {}", out);
     }
 }
