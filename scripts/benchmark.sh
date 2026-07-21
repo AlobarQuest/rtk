@@ -346,7 +346,12 @@ bench "wc" "wc Cargo.toml src/main.rs" "$RTK wc Cargo.toml src/main.rs"
 # ===================
 section "curl"
 if command -v curl &> /dev/null; then
-  bench "curl json" "curl -s https://mockhttp.org/json/1" "$RTK curl https://mockhttp.org/json/1"
+  CURL_JSON_FIXTURE=$(mktemp)
+  cat > "$CURL_JSON_FIXTURE" << 'JSONEOF'
+{"message":"Hello from RTK benchmark","status":"success","code":200}
+JSONEOF
+  bench "curl json" "curl -s file://$CURL_JSON_FIXTURE" "$RTK curl file://$CURL_JSON_FIXTURE"
+  rm -f "$CURL_JSON_FIXTURE"
   bench "curl text" "curl -s https://mockhttp.org/robots.txt" "$RTK curl https://mockhttp.org/robots.txt"
 fi
 
@@ -355,8 +360,8 @@ fi
 # ===================
 if command -v wget &> /dev/null; then
   section "wget"
-  bench "wget" "wget -qO- https://mockhttp.org/json/1" "$RTK wget https://mockhttp.org/json/1"
-  rm -f 1 2>/dev/null
+  bench "wget" "wget -qO- https://mockhttp.org/json" "$RTK wget https://mockhttp.org/json"
+  rm -f json 2>/dev/null
 fi
 
 # ===================

@@ -96,13 +96,14 @@ impl BlockHandler for CargoBuildHandler {
         !(line.trim().is_empty() && block.len() > 3)
     }
 
-    fn format_summary(&self, exit_code: i32, _raw: &str) -> Option<String> {
+    fn format_summary(&self, exit_code: i32, raw: &str) -> Option<String> {
         if self.error_count == 0 && self.warnings == 0 && exit_code == 0 {
-            return Some(cargo_build_success_line(
+            let summary = cargo_build_success_line(
                 self.compiled,
                 self.finished_line.as_deref(),
                 self.label,
-            ));
+            );
+            return Some(crate::core::guard::never_worse(raw, &summary).to_string());
         }
         // The streamed path only runs for non-json build/check; error blocks are
         // emitted live, so the summary carries no rendered diagnostics.
@@ -988,7 +989,8 @@ fn filter_cargo_build_labeled(output: &str, label: &'static str, exit_code: i32)
     let (errors, warnings) = merge_diag_counts(handler.error_count, handler.warnings, &json);
 
     if errors == 0 && warnings == 0 && exit_code == 0 {
-        return cargo_build_success_line(handler.compiled, handler.finished_line.as_deref(), label);
+        let summary = cargo_build_success_line(handler.compiled, handler.finished_line.as_deref(), label);
+        return crate::core::guard::never_worse(output, &summary).to_string();
     }
 
     let mut result =
@@ -1555,6 +1557,13 @@ mod tests {
         let result = filter_cargo_build(output);
         assert!(result.contains("cargo build"));
         assert!(result.contains("3 crates compiled"));
+    }
+
+    #[test]
+    fn test_filter_cargo_build_success_uses_raw_when_summary_is_larger() {
+        let output = "    Finished dev [unoptimized + debuginfo] target(s) in 0.01s\n";
+        let result = filter_cargo_build(output);
+        assert_eq!(result, output);
     }
 
     #[test]
@@ -2312,6 +2321,14 @@ error: test run failed
         assert!(result.contains("3 crates compiled"), "got: {}", result);
         assert!(result.contains("Finished"), "got: {}", result);
         assert!(!result.contains("Compiling"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_cargo_build_stream_success_uses_raw_when_summary_is_larger() {
+        let input = "    Finished dev [unoptimized + debuginfo] target(s) in 0.01s\n";
+        let mut f = BlockStreamFilter::new(CargoBuildHandler::with_label("build"));
+        let result = run_block_filter(&mut f, input, 0);
+        assert_eq!(result, input);
     }
 
     #[test]
