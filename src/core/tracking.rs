@@ -1226,7 +1226,7 @@ fn categorize_command(rtk_cmd: &str) -> String {
         "rspec" | "rubocop" | "rake" => "ruby",
         "dotnet" => "dotnet",
         "ls" | "tree" | "grep" | "find" | "wc" | "read" | "env" | "json" | "log" | "smart"
-        | "diff" | "deps" | "summary" | "format" => "system",
+        | "diff" | "deps" | "summary" | "format" | "ctest" => "system",
         _ => "other",
     }
     .to_string()
