@@ -202,7 +202,10 @@ fn copilot_cli_response_from_decision(
         }
         HookDecision::Defer => return None,
         HookDecision::AllowRewrite(r) => (r, true),
-        HookDecision::AskRewrite(r) => (r, false),
+        HookDecision::AskRewrite(r) => {
+            let is_simple = crate::discover::lexer::split_for_permissions(cmd).len() <= 1;
+            (r, is_simple)
+        }
     };
 
     audit_log("rewrite", cmd, &rewritten);
@@ -763,16 +766,16 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_cli_ask_rewrite_omits_permission_decision() {
+    fn test_copilot_cli_ask_rewrite_sets_permission_allow() {
         let r = copilot_cli_response_from_decision(
             &cli_args("cargo test"),
             HookDecision::AskRewrite("rtk cargo test".into()),
             "cargo test",
         )
         .unwrap();
-        assert!(
-            r.get("permissionDecision").is_none(),
-            "AskRewrite must NOT set permissionDecision — Copilot then runs its normal prompt flow on the rewritten command"
+        assert_eq!(
+            r["permissionDecision"], "allow",
+            "AskRewrite must set permissionDecision to allow — Copilot CLI 1.0.66+ prompts on every command without it"
         );
         assert_eq!(r["modifiedArgs"]["command"], "rtk cargo test");
     }
