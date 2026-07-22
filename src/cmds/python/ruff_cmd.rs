@@ -40,11 +40,16 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 
     let mut cmd = resolved_command("ruff");
 
+    // Both spellings: injecting a second --output-format makes ruff reject the call.
+    let user_set_output_format = args
+        .iter()
+        .any(|a| a == "--output-format" || a.starts_with("--output-format="));
+
     if is_check {
-        if !args.contains(&"--output-format".to_string()) {
-            cmd.arg("check").arg("--output-format=json");
-        } else {
+        if user_set_output_format {
             cmd.arg("check");
+        } else {
+            cmd.arg("check").arg("--output-format=json");
         }
 
         let start_idx = if !args.is_empty() && args[0] == "check" {
@@ -78,7 +83,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         "ruff",
         &args.join(" "),
         move |stdout| {
-            if is_check && !stdout.trim().is_empty() {
+            if is_check && !user_set_output_format && !stdout.trim().is_empty() {
                 filter_ruff_check_json(stdout)
             } else if is_format {
                 filter_ruff_format(stdout)
