@@ -51,14 +51,24 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         eprintln!("Running: pytest --tb=short -q {}", args.join(" "));
     }
 
-    runner::run_filtered(
+    runner::run_filtered_with_exit(
         cmd,
         "pytest",
         &args.join(" "),
-        filter_pytest_output,
+        |raw, exit_code| {
+            let filtered = filter_pytest_output(raw);
+            // Any other failure parsed as empty means the run broke before reporting.
+            if exit_code != 0 && exit_code != PYTEST_EXIT_NO_TESTS && filtered == PYTEST_NO_TESTS {
+                return raw.trim().to_string();
+            }
+            filtered
+        },
         runner::RunOptions::stdout_only().tee("pytest"),
     )
 }
+
+const PYTEST_NO_TESTS: &str = "Pytest: No tests collected";
+const PYTEST_EXIT_NO_TESTS: i32 = 5;
 
 pub(crate) fn filter_pytest_output(output: &str) -> String {
     let mut state = ParseState::Header;
@@ -181,7 +191,7 @@ fn build_pytest_summary(
     } = counts;
 
     if passed == 0 && failed == 0 && skipped == 0 && xfailed == 0 && xpassed == 0 {
-        return "Pytest: No tests collected".to_string();
+        return PYTEST_NO_TESTS.to_string();
     }
 
     let extras_present = skipped > 0 || xfailed > 0 || xpassed > 0 || !xfail_lines.is_empty();
