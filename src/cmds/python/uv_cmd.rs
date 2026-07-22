@@ -42,6 +42,8 @@ const MAX_TRACEBACK_FRAMES: usize = CAP_WARNINGS;
 const MAX_ERROR_CONTINUATION_LINES: usize = CAP_WARNINGS;
 const MAX_FALLBACK_TAIL_LINES: usize = CAP_WARNINGS;
 const MAX_PROGRAM_LINE_CHARS: usize = 500;
+const TEE_SLUG_STDOUT: &str = "uv-run-stdout";
+const TEE_SLUG_STDERR: &str = "uv-run-stderr";
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
@@ -149,8 +151,11 @@ fn extract_diagnostics(clean: &str) -> String {
 }
 
 fn filter_successful_run(stdout: &str, stderr: &str) -> String {
-    let payload = program_output(stdout);
-    let diagnostics = program_output(stderr);
+    // Distinct slugs: both streams can need a tee in the same run, and tee
+    // filenames are second-resolution, so a shared slug would make the second
+    // write clobber the first and leave one hint pointing at the other's bytes.
+    let payload = program_output(stdout, TEE_SLUG_STDOUT);
+    let diagnostics = program_output(stderr, TEE_SLUG_STDERR);
 
     match (payload.is_empty(), diagnostics.is_empty()) {
         (true, true) => "ok".to_string(),
@@ -160,8 +165,8 @@ fn filter_successful_run(stdout: &str, stderr: &str) -> String {
     }
 }
 
-fn program_output(stdout: &str) -> String {
-    let clean = strip_ansi(stdout);
+fn program_output(text: &str, tee_slug: &str) -> String {
+    let clean = strip_ansi(text);
     let lines: Vec<&str> = clean.lines().collect();
     let last_content = lines.iter().rposition(|line| !line.trim().is_empty());
 
@@ -178,7 +183,7 @@ fn program_output(stdout: &str) -> String {
     if capped.len() <= CAP_INVENTORY {
         let out = capped.join("\n");
         if line_was_cut {
-            if let Some(hint) = crate::core::tee::force_tee_hint(&clean, "uv-run") {
+            if let Some(hint) = crate::core::tee::force_tee_hint(&clean, tee_slug) {
                 return format!("{out}\n{hint}");
             }
         }
@@ -194,7 +199,19 @@ fn program_output(stdout: &str) -> String {
     out.push_str(&format!("\n... ({omitted} lines omitted)\n"));
     out.push_str(&capped[capped.len() - tail..].join("\n"));
 
-    if let Some(hint) = crate::core::tee::force_tee_tail_hint(&clean, "uv-run", head + 1) {
+    // A cut in the head region sits before the tail offset, so `tail -n +N` skips it.
+    let head_line_was_cut = capped[..head]
+        .iter()
+        .zip(&lines[..head])
+        .any(|(cut, full)| cut != full);
+
+    let hint = if head_line_was_cut {
+        crate::core::tee::force_tee_hint(&clean, tee_slug)
+    } else {
+        crate::core::tee::force_tee_tail_hint(&clean, tee_slug, head + 1)
+    };
+
+    if let Some(hint) = hint {
         out.push_str(&format!("\n{hint}"));
     }
 
@@ -370,10 +387,19 @@ mod tests {
     }
 
     #[test]
+    fn test_stdout_and_stderr_tee_slugs_are_distinct() {
+        // Tee filenames are `{epoch_secs}_{slug}.log`. Both streams can need a
+        // tee within the same second, so a shared slug would make the stderr
+        // write clobber the stdout one and leave the stdout hint resolving to
+        // stderr's bytes - the omitted stdout lines become unrecoverable.
+        assert_ne!(super::TEE_SLUG_STDOUT, super::TEE_SLUG_STDERR);
+    }
+
+    #[test]
     fn test_program_output_truncates_over_line_cap_keeping_both_ends() {
         let stdout: String = (0..120).map(|i| format!("line{i}\n")).collect();
 
-        let result = super::program_output(&stdout);
+        let result = super::program_output(&stdout, super::TEE_SLUG_STDOUT);
 
         assert!(result.contains("line0"), "head must survive");
         assert!(result.contains("line119"), "tail must survive");
@@ -382,10 +408,32 @@ mod tests {
     }
 
     #[test]
+    fn test_program_output_head_cut_switches_away_from_the_tail_hint() {
+        // 60 lines with a long line 4: the tail hint would start past it.
+        let stdout: String = (0..60)
+            .map(|i| {
+                if i == 3 {
+                    format!("{}\n", "x".repeat(900))
+                } else {
+                    format!("line{i}\n")
+                }
+            })
+            .collect();
+
+        let result = super::program_output(&stdout, super::TEE_SLUG_STDOUT);
+
+        assert!(result.contains("lines omitted"));
+        assert!(
+            !result.contains("see remaining"),
+            "a head-region cut must not be reported with a tail offset that skips it, got: {result}"
+        );
+    }
+
+    #[test]
     fn test_program_output_caps_a_single_huge_line() {
         let stdout = format!("{}\n", "x".repeat(50_000));
 
-        let result = super::program_output(&stdout);
+        let result = super::program_output(&stdout, super::TEE_SLUG_STDOUT);
 
         assert!(
             result.len() < 2_000,
@@ -399,7 +447,7 @@ mod tests {
     fn test_program_output_exact_cap_is_untouched() {
         let stdout: String = (0..CAP_INVENTORY).map(|i| format!("line{i}\n")).collect();
 
-        let result = super::program_output(&stdout);
+        let result = super::program_output(&stdout, super::TEE_SLUG_STDOUT);
 
         assert!(!result.contains("lines omitted"));
         assert_eq!(result.lines().count(), CAP_INVENTORY);
@@ -409,7 +457,7 @@ mod tests {
     fn test_program_output_handles_multibyte_without_panic() {
         let stdout: String = (0..80).map(|i| format!("日本語 🎉 line{i}\n")).collect();
 
-        let result = super::program_output(&stdout);
+        let result = super::program_output(&stdout, super::TEE_SLUG_STDOUT);
 
         assert!(result.contains("日本語"));
         assert!(result.contains("lines omitted"));
