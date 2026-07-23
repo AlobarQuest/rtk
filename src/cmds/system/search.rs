@@ -120,13 +120,27 @@ fn grep_slug(idx: usize, path: &str) -> String {
     format!("grep_{}_{}", idx, tail)
 }
 
-/// Format a file's matches as `path<sep>line<sep>content`. Tee blocks use the
-/// real (un-compacted) `path` so recovered lines stay openable.
-fn match_block(path: &str, entries: &[(usize, bool, String)]) -> String {
+/// Tee recovery block, mirroring the primary output's `show_file`/`show_line`
+/// so recovered overflow is a faithful continuation. Uses the real `path`.
+fn match_block(
+    path: &str,
+    entries: &[(usize, bool, String)],
+    show_file: bool,
+    show_line: bool,
+) -> String {
     let mut s = String::new();
     for (line_num, is_match, content) in entries {
         let sep = if *is_match { ':' } else { '-' };
-        s.push_str(&format!("{}{}{}{}{}\n", path, sep, line_num, sep, content));
+        if show_file {
+            s.push_str(path);
+            s.push(sep);
+        }
+        if show_line {
+            s.push_str(&line_num.to_string());
+            s.push(sep);
+        }
+        s.push_str(content);
+        s.push('\n');
     }
     s
 }
@@ -397,10 +411,7 @@ fn show_file(paths: &[String], extra_args: &[String]) -> bool {
 }
 
 fn show_line(extra_args: &[String]) -> bool {
-    // Faithful to grep: line numbers appear only when the agent asks for them
-    // (`-n`/`--line-number`). Adding them by default corrupts downstream parses
-    // (e.g. `grep X | awk -F: '{print $1}'`) and breaks RTK's transparency.
-    // `-N`/`--no-line-number` still force them off when combined with `-n`.
+    // Faithful to grep: line numbers only when asked (-n), off by default.
     (has_short_flag(extra_args, 'n')
         || extra_args.iter().any(|f| f == "--line-number"))
         && !has_short_flag(extra_args, 'N')
@@ -647,7 +658,7 @@ pub fn run(
     for (idx, (file, entries)) in files.into_iter().enumerate() {
         if shown >= max_results {
             skipped_files += 1;
-            skipped_block.push_str(&match_block(file, entries));
+            skipped_block.push_str(&match_block(file, entries, show_file, show_line));
             continue;
         }
 
@@ -681,9 +692,9 @@ pub fn run(
         if remaining == 0 {
             continue;
         }
-        // Tee the file's full matches (real path) so the tail hint recovers them
-        // openably, skipping the lines already shown.
-        let full_block = match_block(file, entries);
+        // Tee the file's full matches so the tail hint recovers them, skipping
+        // the lines already shown.
+        let full_block = match_block(file, entries, show_file, show_line);
         match crate::core::tee::force_tee_tail_hint(&full_block, &grep_slug(idx, file), file_shown + 1)
         {
             Some(hint) => {
