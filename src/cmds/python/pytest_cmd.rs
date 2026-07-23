@@ -1,8 +1,9 @@
 //! Filters pytest output to show only failures and the summary line.
 
+use crate::core::config;
 use crate::core::runner;
 use crate::core::truncate::CAP_WARNINGS;
-use crate::core::utils::{resolved_command, tool_exists, truncate};
+use crate::core::utils::{resolved_command, strip_ansi, tool_exists, truncate};
 use anyhow::Result;
 
 const MAX_XFAIL: usize = CAP_WARNINGS;
@@ -56,10 +57,11 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         "pytest",
         &args.join(" "),
         |raw, exit_code| {
-            let filtered = filter_pytest_output(raw);
+            let clean = strip_ansi(raw);
+            let filtered = filter_pytest_output(&clean);
             // Any other failure parsed as empty means the run broke before reporting.
             if exit_code != 0 && exit_code != PYTEST_EXIT_NO_TESTS && filtered == PYTEST_NO_TESTS {
-                return raw.trim().to_string();
+                return truncate(clean.trim(), config::limits().passthrough_max_chars);
             }
             filtered
         },
