@@ -178,7 +178,7 @@ fn program_output(text: &str, tee_slug: &str) -> String {
         .iter()
         .map(|line| truncate(line, MAX_PROGRAM_LINE_CHARS))
         .collect();
-    let line_was_cut = capped.iter().zip(lines).any(|(cut, full)| cut != full);
+    let line_was_cut = capped.iter().zip(lines).any(|(cut, full)| cut.len() != full.len());
 
     if capped.len() <= CAP_INVENTORY {
         let out = capped.join("\n");
