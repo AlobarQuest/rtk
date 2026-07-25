@@ -127,7 +127,7 @@ fn get_rewritten(cmd: &str) -> Option<String> {
 
 enum HookDecision {
     AllowRewrite(String),
-    AskRewrite(String),
+    AskRewrite { rewritten: String, explicit: bool },
     Defer,
     Deny,
 }
@@ -141,7 +141,10 @@ fn decide_from_verdict(cmd: &str, verdict: PermissionVerdict) -> HookDecision {
     }
     match get_rewritten(cmd) {
         Some(r) if verdict == PermissionVerdict::Allow => HookDecision::AllowRewrite(r),
-        Some(r) => HookDecision::AskRewrite(r),
+        Some(r) => HookDecision::AskRewrite {
+            rewritten: r,
+            explicit: verdict == PermissionVerdict::Ask,
+        },
         None => HookDecision::Defer,
     }
 }
@@ -158,7 +161,7 @@ fn handle_vscode(cmd: &str) -> Result<()> {
         }
         HookDecision::Defer => return Ok(()),
         HookDecision::AllowRewrite(r) => ("allow", r),
-        HookDecision::AskRewrite(r) => ("ask", r),
+        HookDecision::AskRewrite { rewritten: r, .. } => ("ask", r),
     };
 
     audit_log("rewrite", cmd, &rewritten);
@@ -202,9 +205,12 @@ fn copilot_cli_response_from_decision(
         }
         HookDecision::Defer => return None,
         HookDecision::AllowRewrite(r) => (r, true),
-        HookDecision::AskRewrite(r) => {
+        HookDecision::AskRewrite {
+            rewritten: r,
+            explicit,
+        } => {
             let is_simple = crate::discover::lexer::split_for_permissions(cmd).len() <= 1;
-            (r, is_simple)
+            (r, !explicit && is_simple)
         }
     };
 
@@ -261,7 +267,7 @@ pub fn run_gemini() -> Result<()> {
             audit_log("rewrite", cmd, rewritten);
             print_gemini("allow", Some(rewritten));
         }
-        HookDecision::AskRewrite(ref rewritten) => {
+        HookDecision::AskRewrite { ref rewritten, .. } => {
             audit_log("ask", cmd, rewritten);
             print_gemini("ask_user", Some(rewritten));
         }
@@ -366,7 +372,7 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
             }
         }
         HookDecision::AllowRewrite(r) => (r, true),
-        HookDecision::AskRewrite(r) => (r, false),
+        HookDecision::AskRewrite { rewritten: r, .. } => (r, false),
     };
 
     let updated_input = {
@@ -490,7 +496,7 @@ pub fn run_cursor() -> Result<()> {
             audit_log("rewrite", &cmd, &rewritten);
             cursor_allow(&rewritten)
         }
-        HookDecision::AskRewrite(rewritten) => {
+        HookDecision::AskRewrite { rewritten, .. } => {
             audit_log("ask", &cmd, &rewritten);
             cursor_ask(&rewritten)
         }
@@ -553,7 +559,7 @@ fn run_cursor_inner_with_rules(
     let verdict = permissions::check_command_with_rules(&cmd, deny_rules, ask_rules, allow_rules);
     match decide_from_verdict(&cmd, verdict) {
         HookDecision::AllowRewrite(rewritten) => cursor_allow(&rewritten),
-        HookDecision::AskRewrite(rewritten) => cursor_ask(&rewritten),
+        HookDecision::AskRewrite { rewritten, .. } => cursor_ask(&rewritten),
         _ => "{}".to_string(),
     }
 }
@@ -599,7 +605,7 @@ fn droid_response_from_decision(v: &Value, cmd: &str, decision: HookDecision) ->
             return None;
         }
         HookDecision::Defer => return None,
-        HookDecision::AllowRewrite(r) | HookDecision::AskRewrite(r) => r,
+        HookDecision::AllowRewrite(r) | HookDecision::AskRewrite { rewritten: r, .. } => r,
     };
 
     audit_log("rewrite", cmd, &rewritten);
@@ -766,16 +772,37 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_cli_ask_rewrite_sets_permission_allow() {
+    fn test_copilot_cli_default_ask_rewrite_sets_permission_allow() {
         let r = copilot_cli_response_from_decision(
             &cli_args("cargo test"),
-            HookDecision::AskRewrite("rtk cargo test".into()),
+            HookDecision::AskRewrite {
+                rewritten: "rtk cargo test".into(),
+                explicit: false,
+            },
             "cargo test",
         )
         .unwrap();
         assert_eq!(
             r["permissionDecision"], "allow",
-            "AskRewrite must set permissionDecision to allow — Copilot CLI 1.0.66+ prompts on every command without it"
+            "Default AskRewrite must set permissionDecision to allow — Copilot CLI 1.0.66+ prompts on every command without it"
+        );
+        assert_eq!(r["modifiedArgs"]["command"], "rtk cargo test");
+    }
+
+    #[test]
+    fn test_copilot_cli_explicit_ask_rewrite_omits_permission_decision() {
+        let r = copilot_cli_response_from_decision(
+            &cli_args("cargo test"),
+            HookDecision::AskRewrite {
+                rewritten: "rtk cargo test".into(),
+                explicit: true,
+            },
+            "cargo test",
+        )
+        .unwrap();
+        assert!(
+            r.get("permissionDecision").is_none(),
+            "Explicit AskRewrite must NOT auto-allow — user deliberately configured ask for this command"
         );
         assert_eq!(r["modifiedArgs"]["command"], "rtk cargo test");
     }
@@ -853,7 +880,10 @@ mod tests {
         });
         let r = copilot_cli_response_from_decision(
             &args,
-            HookDecision::AskRewrite("rtk cargo install ripgrep".into()),
+            HookDecision::AskRewrite {
+                rewritten: "rtk cargo install ripgrep".into(),
+                explicit: false,
+            },
             "cargo install ripgrep",
         )
         .unwrap();
@@ -1416,7 +1446,7 @@ mod tests {
     fn test_decide_ask_for_default_verdict() {
         assert!(matches!(
             decide_with_rules("git status", &[], &[], &[]),
-            HookDecision::AskRewrite(_)
+            HookDecision::AskRewrite { .. }
         ));
     }
 
@@ -1474,7 +1504,7 @@ mod tests {
                 r#"{"decision":"deny","reason":"Blocked by RTK permission rule"}"#.to_string()
             }
             HookDecision::AllowRewrite(r) => gemini_json("allow", Some(&r)),
-            HookDecision::AskRewrite(r) => gemini_json("ask_user", Some(&r)),
+            HookDecision::AskRewrite { rewritten: r, .. } => gemini_json("ask_user", Some(&r)),
             HookDecision::Defer => gemini_json("ask_user", None),
         }
     }
