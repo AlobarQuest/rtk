@@ -31,7 +31,13 @@ fn read_stdin_limited() -> Result<String> {
 enum HookFormat {
     /// VS Code Copilot Chat / Claude Code: `tool_name` + `tool_input.command`, supports `updatedInput`.
     VsCode { command: String },
-    /// GitHub Copilot CLI: camelCase `toolName` + `toolArgs` (JSON string), supports `modifiedArgs` for transparent rewrite.
+    /// GitHub Copilot CLI's native schema: camelCase `toolName` + `toolArgs` (JSON string),
+    /// supports `modifiedArgs` for transparent rewrite. `rtk init --copilot` no longer
+    /// registers this schema (Copilot CLI honors the PascalCase `VsCode` schema on its
+    /// own — registering both caused a redundant second hook invocation per tool call,
+    /// see git history). Kept for installs that haven't re-run `rtk init --copilot` since
+    /// upgrading, and as the schema JetBrains/IntelliJ's Copilot plugin uses under a
+    /// different `toolName` value (`run_in_terminal`, not `bash` — see #2443/#3093).
     /// Carries the full parsed `toolArgs` object so we can rewrite `command` while preserving
     /// host-supplied metadata (description, initial_wait, mode, …) the tool requires.
     CopilotCli { command: String, args: Value },
@@ -93,8 +99,12 @@ fn detect_format(v: &Value) -> HookFormat {
         return HookFormat::PassThrough;
     }
 
-    // Copilot CLI: camelCase keys, toolArgs is a JSON-encoded string.
+    // Copilot's native camelCase schema: toolName + toolArgs (JSON-encoded string).
     // The shell tool is "bash" on Unix and "powershell" on Windows.
+    // Only reachable today via a not-yet-upgraded install's leftover camelCase
+    // preToolUse registration (see the CopilotCli variant doc) or a host that
+    // registers this schema itself, like JetBrains/IntelliJ's Copilot plugin
+    // (toolName "run_in_terminal", tracked separately in #2443/#3093).
     if let Some(tool_name) = v.get("toolName").and_then(|t| t.as_str()) {
         if matches!(tool_name, "bash" | "powershell" | "run_in_terminal") {
             if let Some(tool_args_str) = v.get("toolArgs").and_then(|t| t.as_str()) {
