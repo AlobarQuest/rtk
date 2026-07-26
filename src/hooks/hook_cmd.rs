@@ -71,9 +71,15 @@ pub fn run_copilot() -> Result<()> {
 }
 
 fn detect_format(v: &Value) -> HookFormat {
-    // VS Code Copilot Chat / Claude Code: snake_case keys
+    // VS Code Copilot Chat / Claude Code: snake_case keys.
+    // "run_in_terminal" is VS Code Copilot Chat's actual terminal tool name
+    // (confirmed via live payload capture) — without it, detect_format falls
+    // through to PassThrough and the hook never fires for VS Code Copilot Chat.
     if let Some(tool_name) = v.get("tool_name").and_then(|t| t.as_str()) {
-        if matches!(tool_name, "runTerminalCommand" | "Bash" | "bash") {
+        if matches!(
+            tool_name,
+            "runTerminalCommand" | "run_in_terminal" | "Bash" | "bash"
+        ) {
             if let Some(cmd) = v
                 .pointer("/tool_input/command")
                 .and_then(|c| c.as_str())
@@ -761,6 +767,16 @@ mod tests {
     fn test_detect_vscode_run_terminal_command() {
         assert!(matches!(
             detect_format(&vscode_input("runTerminalCommand", "cargo test")),
+            HookFormat::VsCode { .. }
+        ));
+    }
+
+    #[test]
+    fn test_detect_vscode_run_in_terminal() {
+        // VS Code Copilot Chat's actual terminal tool name, confirmed via
+        // live payload capture — distinct from "runTerminalCommand".
+        assert!(matches!(
+            detect_format(&vscode_input("run_in_terminal", "cargo test")),
             HookFormat::VsCode { .. }
         ));
     }
