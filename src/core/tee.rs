@@ -183,6 +183,7 @@ fn needs_shell_quoting(path: &str) -> bool {
             || matches!(
                 c,
                 '\'' | '"'
+                    | '\\'
                     | '$'
                     | '`'
                     | '!'
@@ -510,6 +511,15 @@ mod tests {
         assert_eq!(
             display_shell_path(&path),
             "\"/tmp/rtk/Application Support/123_go_test.log\""
+        );
+    }
+
+    #[test]
+    fn test_display_shell_path_quotes_backslashes() {
+        let path = PathBuf::from(r"/tmp/rtk/tee/path\segment.log");
+        assert_eq!(
+            display_shell_path(&path),
+            r#""/tmp/rtk/tee/path\\segment.log""#
         );
     }
 
