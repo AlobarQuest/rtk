@@ -30,6 +30,10 @@ fn read_stdin_limited() -> Result<String> {
 /// Format detected from the preToolUse JSON input.
 enum HookFormat {
     /// VS Code Copilot Chat / Claude Code: `tool_name` + `tool_input.command`, supports `updatedInput`.
+    /// If using the PreToolUse pascal case form, Copilot CLI also remaps its native `bash`/`powershell`
+    /// runtime tool to `tool_name: "Bash"` for this schema and honors its `updatedInput`, live-verified
+    /// on Linux+Windows 11 with Copilot CLI 1.0.73+ by rewriting a marker command end-to-end
+    /// see <https://github.com/rtk-ai/rtk/pull/3179#issuecomment-5088268495>.
     VsCode { command: String },
     /// GitHub Copilot CLI's native schema: camelCase `toolName` + `toolArgs` (JSON string),
     /// supports `modifiedArgs` for transparent rewrite. `rtk init --copilot` no longer
@@ -38,6 +42,10 @@ enum HookFormat {
     /// see git history). Kept for installs that haven't re-run `rtk init --copilot` since
     /// upgrading, and as the schema JetBrains/IntelliJ's Copilot plugin uses under a
     /// different `toolName` value (`run_in_terminal`, not `bash` — see #2443/#3093).
+    /// On Windows, Copilot CLI reports this schema's `toolName` as the unmapped runtime
+    /// name `"powershell"` (#3178/#3179) — but since the `VsCode` schema above already
+    /// works standalone there, that arm is legacy-only: relevant for un-upgraded installs,
+    /// not exercised by a fresh `rtk init --copilot` on any platform.
     /// Carries the full parsed `toolArgs` object so we can rewrite `command` while preserving
     /// host-supplied metadata (description, initial_wait, mode, …) the tool requires.
     CopilotCli { command: String, args: Value },
@@ -81,6 +89,9 @@ fn detect_format(v: &Value) -> HookFormat {
     // "run_in_terminal" is VS Code Copilot Chat's actual terminal tool name
     // (confirmed via live payload capture) — without it, detect_format falls
     // through to PassThrough and the hook never fires for VS Code Copilot Chat.
+    // No separate Windows/"powershell" case is needed: Copilot CLI remaps both
+    // `bash` and `powershell` to `tool_name: "Bash"` for this schema — already
+    // handled below, live-confirmed (see the VsCode variant doc).
     if let Some(tool_name) = v.get("tool_name").and_then(|t| t.as_str()) {
         if matches!(
             tool_name,
@@ -99,12 +110,12 @@ fn detect_format(v: &Value) -> HookFormat {
         return HookFormat::PassThrough;
     }
 
-    // Copilot's native camelCase schema: toolName + toolArgs (JSON-encoded string).
+    // Copilot CLI's native camelCase schema: toolName + toolArgs (JSON-encoded string).
     // The shell tool is "bash" on Unix and "powershell" on Windows.
     // Only reachable today via a not-yet-upgraded install's leftover camelCase
     // preToolUse registration (see the CopilotCli variant doc) or a host that
     // registers this schema itself, like JetBrains/IntelliJ's Copilot plugin
-    // (toolName "run_in_terminal", tracked separately in #2443/#3093).
+    // (toolName "run_in_terminal").
     if let Some(tool_name) = v.get("toolName").and_then(|t| t.as_str()) {
         if matches!(tool_name, "bash" | "powershell" | "run_in_terminal") {
             if let Some(tool_args_str) = v.get("toolArgs").and_then(|t| t.as_str()) {
@@ -243,7 +254,7 @@ fn copilot_ide_response_from_decision(decision: HookDecision, cmd: &str) -> Opti
             audit_log("deny", cmd, "");
             "Blocked by RTK permission rule".to_string()
         }
-        HookDecision::AllowRewrite(rewritten) | HookDecision::AskRewrite { rewritten, .. } => {
+        HookDecision::AllowRewrite(rewritten) | HookDecision::AskRewrite(rewritten) => {
             audit_log("rewrite", cmd, &rewritten);
             format!("RTK token optimization: re-run this command as `{rewritten}` instead.")
         }
@@ -986,10 +997,7 @@ mod tests {
     #[test]
     fn test_copilot_ide_rewrite_returns_deny_with_suggestion() {
         let response = copilot_ide_response_from_decision(
-            HookDecision::AskRewrite {
-                rewritten: "rtk git status".into(),
-                explicit: false,
-            },
+            HookDecision::AskRewrite("rtk git status".into()),
             "git status",
         )
         .unwrap();
