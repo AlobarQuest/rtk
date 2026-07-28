@@ -1,8 +1,8 @@
 #![cfg(unix)]
-//! For un-capped searches `rtk grep X` must be byte-identical to `grep -n X`:
-//! line number always, filename only when grep itself prints one. Covers content
-//! and regex edge cases (colons, digits, shell metachars, unicode, colon-in-path)
-//! that must never be misparsed.
+//! For un-capped searches `rtk grep X` must be byte-identical to `grep X`:
+//! the line number only when `-n` asks for it, the filename only when grep
+//! itself prints one. Covers content and regex edge cases (colons, digits,
+//! shell metachars, unicode, colon-in-path) that must never be misparsed.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -42,7 +42,7 @@ fn write(dir: &std::path::Path, name: &str, body: &str) -> String {
 }
 
 #[test]
-fn single_multi_recursive_and_h_match_grep_n() {
+fn single_multi_recursive_and_h_match_grep() {
     let d = tempfile::tempdir().unwrap();
     let f1 = write(d.path(), "f1.txt", "apple\nzebra apple\nbanana\n");
     let f2 = write(d.path(), "f2.txt", "apricot\n");
@@ -54,7 +54,7 @@ fn single_multi_recursive_and_h_match_grep_n() {
 }
 
 #[test]
-fn no_match_matches_grep_n() {
+fn no_match_matches_grep() {
     let d = tempfile::tempdir().unwrap();
     let f = write(d.path(), "f.txt", "hello\n");
     assert_eq_grep(&["zzz_no_match_xyz", &f]); // empty stdout, exit 1
@@ -75,7 +75,7 @@ fn nasty_content_is_not_misparsed() {
 }
 
 #[test]
-fn regex_metacharacters_match_grep_n() {
+fn regex_metacharacters_match_grep() {
     let d = tempfile::tempdir().unwrap();
     let f = write(d.path(), "r.txt", "a.b\naxb\nfoo.bar\n[x]\n");
     assert_eq_grep(&["a.b", &f]); // . is any-char
@@ -85,7 +85,7 @@ fn regex_metacharacters_match_grep_n() {
 }
 
 #[test]
-fn context_flags_match_grep_n() {
+fn context_flags_match_grep() {
     let d = tempfile::tempdir().unwrap();
     let f = write(d.path(), "c.txt", "x\nMATCH\ny\nz\n");
     assert_eq_grep(&["-A1", "MATCH", &f]);
@@ -94,7 +94,7 @@ fn context_flags_match_grep_n() {
 }
 
 #[test]
-fn context_group_separator_matches_grep_n() {
+fn context_group_separator_matches_grep() {
     let d = tempfile::tempdir().unwrap();
     let f = write(
         d.path(),
@@ -140,7 +140,7 @@ fn issue_1436_anchor_scope_and_trailing_colon() {
 }
 
 #[test]
-fn colon_in_filename_matches_grep_n() {
+fn colon_in_filename_matches_grep() {
     let d = tempfile::tempdir().unwrap();
     let f1 = write(d.path(), "weird:name.txt", "hit\n");
     let f2 = write(d.path(), "other.txt", "hit\n");
@@ -148,7 +148,7 @@ fn colon_in_filename_matches_grep_n() {
 }
 
 #[test]
-fn case_insensitive_and_invert_match_grep_n() {
+fn case_insensitive_and_invert_match_grep() {
     let d = tempfile::tempdir().unwrap();
     let f = write(d.path(), "i.txt", "Apple\nbanana\nAPPLE\n");
     assert_eq_grep(&["-i", "apple", &f]);
@@ -156,7 +156,7 @@ fn case_insensitive_and_invert_match_grep_n() {
 }
 
 #[test]
-fn piped_stdin_matches_grep_n() {
+fn piped_stdin_matches_grep() {
     let input = "apple\nzebra\napple pie\n";
     let feed = |cmd: &mut Command| {
         let mut c = cmd
