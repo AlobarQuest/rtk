@@ -5,6 +5,17 @@ All notable changes to rtk (Rust Token Killer) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.44.1](https://github.com/rtk-ai/rtk/compare/v0.44.0...v0.44.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* **cicd:** git app token for next release ([48d45d3](https://github.com/rtk-ai/rtk/commit/48d45d366627d405397d974808392f7294266e84))
+* **cicd:** git app token for next release ([cdfb14c](https://github.com/rtk-ai/rtk/commit/cdfb14c0f036bc5c6d36a9dc794e536b4f8eca5f))
+* **hook:** detect Copilot CLI shell tool on Windows ([7da2674](https://github.com/rtk-ai/rtk/commit/7da2674073394194754a228d346189a74869e6ba))
+* **hook:** detect Copilot CLI shell tool on Windows ([10ca886](https://github.com/rtk-ai/rtk/commit/10ca886c92f8423f60c3fcbfd7a75e26f396845f)), closes [#3178](https://github.com/rtk-ai/rtk/issues/3178)
+* **search:** display nb line only if requested ([a8b9eb3](https://github.com/rtk-ai/rtk/commit/a8b9eb39011cd64aa715861c2d11820ee55fb221))
+
 ## [0.44.0](https://github.com/rtk-ai/rtk/compare/v0.43.0...v0.44.0) (2026-07-26)
 
 
