@@ -1,8 +1,10 @@
 #![cfg(unix)]
-//! For un-capped searches `rtk grep X` must be byte-identical to `grep X`:
-//! the line number only when `-n` asks for it, the filename only when grep
-//! itself prints one. Covers content and regex edge cases (colons, digits,
-//! shell metachars, unicode, colon-in-path) that must never be misparsed.
+//! For un-capped searches `rtk grep X` must be byte-identical to `grep X`.
+//! Every scenario runs twice, with and without `-n`, so both the presence and
+//! the absence of the line number are pinned: grep prints one only when asked,
+//! and the filename only when it would itself. Covers content and regex edge
+//! cases (colons, digits, shell metachars, unicode, colon-in-path) that must
+//! never be misparsed.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -35,6 +37,13 @@ fn assert_eq_grep(args: &[&str]) {
     assert_eq!(rc, gc, "exit code mismatch for {args:?}");
 }
 
+fn assert_eq_grep_with_and_without_n(args: &[&str]) {
+    assert_eq_grep(args);
+    let mut with_n = vec!["-n"];
+    with_n.extend_from_slice(args);
+    assert_eq_grep(&with_n);
+}
+
 fn write(dir: &std::path::Path, name: &str, body: &str) -> String {
     let p = dir.join(name);
     std::fs::write(&p, body).expect("write");
@@ -46,18 +55,17 @@ fn single_multi_recursive_and_h_match_grep() {
     let d = tempfile::tempdir().unwrap();
     let f1 = write(d.path(), "f1.txt", "apple\nzebra apple\nbanana\n");
     let f2 = write(d.path(), "f2.txt", "apricot\n");
-    assert_eq_grep(&["apple", &f1]); // single: content only, no position
-    assert_eq_grep(&["a", &f1, &f2]); // multi: filename only, no position
-    assert_eq_grep(&["-H", "apple", &f1]); // -H forces filename on a single file
-    assert_eq_grep(&["-n", "apple", &f1]);
-    assert_eq_grep(&["-r", "a", d.path().to_str().unwrap()]); // recursive
+    assert_eq_grep_with_and_without_n(&["apple", &f1]); // single: no filename
+    assert_eq_grep_with_and_without_n(&["a", &f1, &f2]); // multi: filename
+    assert_eq_grep_with_and_without_n(&["-H", "apple", &f1]); // -H forces filename
+    assert_eq_grep_with_and_without_n(&["-r", "a", d.path().to_str().unwrap()]);
 }
 
 #[test]
 fn no_match_matches_grep() {
     let d = tempfile::tempdir().unwrap();
     let f = write(d.path(), "f.txt", "hello\n");
-    assert_eq_grep(&["zzz_no_match_xyz", &f]); // empty stdout, exit 1
+    assert_eq_grep_with_and_without_n(&["zzz_no_match_xyz", &f]); // empty stdout, exit 1
 }
 
 #[test]
@@ -68,29 +76,29 @@ fn nasty_content_is_not_misparsed() {
         "n.txt",
         "12:34 looks like a line number\na::b::c ClassRegistry::init('x')\nport :8080: here\n$(rm -rf /) `whoami` && echo\n中文 テスト مرحبا\n",
     );
-    assert_eq_grep(&[":", &f]);
-    assert_eq_grep(&["ClassRegistry", &f]);
-    assert_eq_grep(&["中文", &f]);
-    assert_eq_grep(&["whoami", &f]);
+    assert_eq_grep_with_and_without_n(&[":", &f]);
+    assert_eq_grep_with_and_without_n(&["ClassRegistry", &f]);
+    assert_eq_grep_with_and_without_n(&["中文", &f]);
+    assert_eq_grep_with_and_without_n(&["whoami", &f]);
 }
 
 #[test]
 fn regex_metacharacters_match_grep() {
     let d = tempfile::tempdir().unwrap();
     let f = write(d.path(), "r.txt", "a.b\naxb\nfoo.bar\n[x]\n");
-    assert_eq_grep(&["a.b", &f]); // . is any-char
-    assert_eq_grep(&["-F", "a.b", &f]); // fixed-string
-    assert_eq_grep(&["^foo", &f]); // anchor
-    assert_eq_grep(&["-E", "ax?b", &f]); // ERE
+    assert_eq_grep_with_and_without_n(&["a.b", &f]); // . is any-char
+    assert_eq_grep_with_and_without_n(&["-F", "a.b", &f]); // fixed-string
+    assert_eq_grep_with_and_without_n(&["^foo", &f]); // anchor
+    assert_eq_grep_with_and_without_n(&["-E", "ax?b", &f]); // ERE
 }
 
 #[test]
 fn context_flags_match_grep() {
     let d = tempfile::tempdir().unwrap();
     let f = write(d.path(), "c.txt", "x\nMATCH\ny\nz\n");
-    assert_eq_grep(&["-A1", "MATCH", &f]);
-    assert_eq_grep(&["-B1", "MATCH", &f]);
-    assert_eq_grep(&["-C1", "MATCH", &f]);
+    assert_eq_grep_with_and_without_n(&["-A1", "MATCH", &f]);
+    assert_eq_grep_with_and_without_n(&["-B1", "MATCH", &f]);
+    assert_eq_grep_with_and_without_n(&["-C1", "MATCH", &f]);
 }
 
 #[test]
@@ -101,7 +109,7 @@ fn context_group_separator_matches_grep() {
         "sep.txt",
         "match A\nfill1\nfill2\nfill3\nmatch B\n",
     );
-    assert_eq_grep(&["-A1", "match", &f]);
+    assert_eq_grep_with_and_without_n(&["-A1", "match", &f]);
 }
 
 // #1436: a single-file `-n` search with `::` content and a BRE pattern with
@@ -115,11 +123,11 @@ fn issue_1436_colons_and_literal_parens() {
         "shell.php",
         "use Util\\ClassRegistry;\nclass Foo {\n    public function run() {\n        $this->m = ClassRegistry::init('Collections.QueueProcess');\n        try {\n            deleteRow($id);\n            $this->delete();\n        } catch (\\Exception $e) {\n        } finally {}\n    }\n    private function delete() {}\n}\n",
     );
-    assert_eq_grep(&[
+    assert_eq_grep_with_and_without_n(&[
         "private function delete\\|try\\|catch\\|finally\\|delete()",
         &f,
     ]);
-    assert_eq_grep(&["init", &f]); // ClassRegistry::init must stay one intact line
+    assert_eq_grep_with_and_without_n(&["init", &f]); // ClassRegistry::init must stay one intact line
 }
 
 // #1436 (comments): a leading `^` anchor must stay scoped to the given file
@@ -134,9 +142,9 @@ fn issue_1436_anchor_scope_and_trailing_colon() {
         "t.py",
         "x = 1\nif crypto >= MAX_CRYPTO:\nclass Foo:\n",
     );
-    assert_eq_grep(&["^pub", &f]); // anchored pattern must not escape the path
-    assert_eq_grep(&["MAX_CRYPTO", &py]); // trailing-colon line kept intact
-    assert_eq_grep(&["class", &py]);
+    assert_eq_grep_with_and_without_n(&["^pub", &f]); // anchored pattern must not escape the path
+    assert_eq_grep_with_and_without_n(&["MAX_CRYPTO", &py]); // trailing-colon line kept intact
+    assert_eq_grep_with_and_without_n(&["class", &py]);
 }
 
 #[test]
@@ -144,15 +152,15 @@ fn colon_in_filename_matches_grep() {
     let d = tempfile::tempdir().unwrap();
     let f1 = write(d.path(), "weird:name.txt", "hit\n");
     let f2 = write(d.path(), "other.txt", "hit\n");
-    assert_eq_grep(&["hit", &f1, &f2]); // colon in a path must not fool the parser
+    assert_eq_grep_with_and_without_n(&["hit", &f1, &f2]); // colon in a path must not fool the parser
 }
 
 #[test]
 fn case_insensitive_and_invert_match_grep() {
     let d = tempfile::tempdir().unwrap();
     let f = write(d.path(), "i.txt", "Apple\nbanana\nAPPLE\n");
-    assert_eq_grep(&["-i", "apple", &f]);
-    assert_eq_grep(&["-v", "apple", &f]);
+    assert_eq_grep_with_and_without_n(&["-i", "apple", &f]);
+    assert_eq_grep_with_and_without_n(&["-v", "apple", &f]);
 }
 
 #[test]
@@ -168,7 +176,11 @@ fn piped_stdin_matches_grep() {
         c.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
         String::from_utf8_lossy(&c.wait_with_output().unwrap().stdout).into_owned()
     };
-    let rtk = feed(Command::new(env!("CARGO_BIN_EXE_rtk")).args(["grep", "apple"]));
-    let grep = feed(Command::new("grep").args(["apple"]));
-    assert_eq!(rtk, grep, "piped stdin must equal plain grep");
+    for args in [vec!["apple"], vec!["-n", "apple"]] {
+        let mut rtk_args = vec!["grep"];
+        rtk_args.extend_from_slice(&args);
+        let rtk = feed(Command::new(env!("CARGO_BIN_EXE_rtk")).args(&rtk_args));
+        let grep = feed(Command::new("grep").args(&args));
+        assert_eq!(rtk, grep, "piped stdin mismatch for {args:?}");
+    }
 }
