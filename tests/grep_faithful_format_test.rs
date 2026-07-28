@@ -49,7 +49,7 @@ fn single_multi_recursive_and_h_match_grep() {
     assert_eq_grep(&["apple", &f1]); // single: content only, no position
     assert_eq_grep(&["a", &f1, &f2]); // multi: filename only, no position
     assert_eq_grep(&["-H", "apple", &f1]); // -H forces filename on a single file
-    assert_eq_grep(&["-n", "apple", &f1]); // -n adds the line number
+    assert_eq_grep(&["-n", "apple", &f1]);
     assert_eq_grep(&["-r", "a", d.path().to_str().unwrap()]); // recursive
 }
 

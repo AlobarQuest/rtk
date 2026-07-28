@@ -120,14 +120,8 @@ fn grep_slug(idx: usize, path: &str) -> String {
     format!("grep_{}_{}", idx, tail)
 }
 
-/// Format a file's matches as `path<sep>line<sep>content`, always fully
-/// qualified with the real (un-compacted) `path` and the line number.
-///
-/// Deliberately does NOT mirror the display's `show_file`/`show_line`: this is
-/// the tee recovery block, internal state rather than command output, and its
-/// job is to make every dropped match openable. A plain `rtk grep pat file`
-/// prints bare content (faithful to grep), but the matches RTK truncated are
-/// only recoverable if the tee still says where they are.
+/// Format a file's matches as `path<sep>line<sep>content`. Tee blocks use the
+/// real (un-compacted) `path` so recovered lines stay openable.
 fn match_block(path: &str, entries: &[(usize, bool, String)]) -> String {
     let mut s = String::new();
     for (line_num, is_match, content) in entries {
@@ -403,10 +397,6 @@ fn show_file(paths: &[String], extra_args: &[String]) -> bool {
 }
 
 fn show_line(extra_args: &[String]) -> bool {
-    // Faithful to grep: line numbers appear only when the agent asks for them
-    // (`-n`/`--line-number`). Adding them by default corrupts downstream parses
-    // (e.g. `grep X | awk -F: '{print $1}'`) and breaks RTK's transparency.
-    // `-N`/`--no-line-number` still force them off when combined with `-n`.
     (has_short_flag(extra_args, 'n')
         || extra_args.iter().any(|f| f == "--line-number"))
         && !has_short_flag(extra_args, 'N')
@@ -1431,9 +1421,8 @@ mod tests {
         args.iter().map(|s| s.to_string()).collect()
     }
 
-    /// The display is opt-in, exactly like real grep: no `-n`, no line numbers.
     #[test]
-    fn show_line_requires_an_explicit_request() {
+    fn show_line_is_off_without_an_explicit_request() {
         assert!(!show_line(&flags(&[])));
         assert!(!show_line(&flags(&["-i"])));
         assert!(!show_line(&flags(&["-r"])));
@@ -1444,20 +1433,16 @@ mod tests {
     fn show_line_honours_n_in_every_spelling() {
         assert!(show_line(&flags(&["-n"])));
         assert!(show_line(&flags(&["--line-number"])));
-        assert!(show_line(&flags(&["-rn"]))); // inside a short cluster
+        assert!(show_line(&flags(&["-rn"])));
         assert!(show_line(&flags(&["-in"])));
     }
 
-    /// `-N`/`--no-line-number` are rg spellings; grep rejects them upstream.
     #[test]
-    fn show_line_respects_explicit_negation() {
+    fn show_line_is_off_when_explicitly_negated() {
         assert!(!show_line(&flags(&["-N"])));
         assert!(!show_line(&flags(&["--no-line-number"])));
     }
 
-    /// The tee block is recovery state, not command output: it stays fully
-    /// qualified even when the display drops the path and the line number,
-    /// otherwise the matches RTK truncated become unlocatable.
     #[test]
     fn match_block_stays_fully_qualified() {
         let entries = vec![
@@ -1471,8 +1456,6 @@ mod tests {
         );
     }
 
-    /// A plain single-file grep displays bare content, but its overflow must
-    /// still be recoverable to a `file:line` the agent can open.
     #[test]
     fn match_block_keeps_position_when_display_drops_it() {
         assert!(!show_line(&flags(&[])));
