@@ -353,13 +353,14 @@ fn sanitize_log_field(s: &str) -> String {
 fn audit_log_inner(action: &str, original: &str, rewritten: &str) -> Option<()> {
     let home = dirs::home_dir()?;
     let dir = home.join(".local").join("share").join("rtk");
-    std::fs::create_dir_all(&dir).ok()?;
+    crate::core::utils::create_private_dir(&dir).ok()?;
     let path = dir.join("hook-audit.log");
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
         .ok()?;
+    crate::core::utils::restrict_file(&path);
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
     writeln!(
         file,

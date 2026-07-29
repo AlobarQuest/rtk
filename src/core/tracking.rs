@@ -249,7 +249,7 @@ impl Tracker {
     pub fn new() -> Result<Self> {
         let db_path = get_db_path()?;
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::core::utils::create_private_dir(parent)?;
         }
 
         let conn = Connection::open(&db_path)?;
@@ -322,6 +322,8 @@ impl Tracker {
             "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
             [],
         )?;
+
+        restrict_db_files(&db_path);
 
         Ok(Self { conn })
     }
@@ -1217,6 +1219,17 @@ fn categorize_command(rtk_cmd: &str) -> String {
     .to_string()
 }
 
+/// SQLite appends `-wal`/`-shm` to the whole filename, so these are siblings
+/// rather than extension swaps.
+fn restrict_db_files(db_path: &std::path::Path) {
+    crate::core::utils::restrict_file(db_path);
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        crate::core::utils::restrict_file(std::path::Path::new(&sidecar));
+    }
+}
+
 fn get_db_path() -> Result<PathBuf> {
     // Priority 1: Environment variable RTK_DB_PATH
     if let Ok(custom_path) = std::env::var("RTK_DB_PATH") {
@@ -1685,5 +1698,27 @@ mod tests {
             failures.total, 0,
             "parse_failures table should be empty after reset"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_restrict_db_files_covers_wal_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("history.db");
+        let wal = tmp.path().join("history.db-wal");
+        let shm = tmp.path().join("history.db-shm");
+        for p in [&db, &wal, &shm] {
+            std::fs::write(p, b"x").expect("write");
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        }
+
+        restrict_db_files(&db);
+
+        for p in [&db, &wal, &shm] {
+            let mode = std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "expected 0600 on {}", p.display());
+        }
     }
 }

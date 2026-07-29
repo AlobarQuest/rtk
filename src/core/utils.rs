@@ -244,6 +244,31 @@ pub fn fallback_tail(output: &str, label: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
+/// Create a directory owner-only (0700 on Unix). A pre-existing directory keeps
+/// its mode — users point `RTK_DB_PATH`/`RTK_TEE_DIR` at locations they chose.
+pub fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let existed = path.is_dir();
+    fs::create_dir_all(path)?;
+    if !existed {
+        set_owner_only(path, 0o700);
+    }
+    Ok(())
+}
+
+/// Restrict an existing file to owner-only access (0600 on Unix).
+pub fn restrict_file(path: &std::path::Path) {
+    set_owner_only(path, 0o600);
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn set_owner_only(_path: &std::path::Path, _mode: u32) {}
+
 /// Build a Command for Ruby tools, auto-detecting bundle exec.
 /// Uses `bundle exec <tool>` when a Gemfile exists (transitive deps like rake
 /// won't appear in the Gemfile but still need bundler for version isolation).
@@ -952,5 +977,63 @@ mod tests {
     fn test_count_tokens_multiple_spaces() {
         assert_eq!(count_tokens("hello    world"), 2);
         assert_eq!(count_tokens("  hello   world  "), 2);
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_create_private_dir_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("rtk").join("tee");
+        create_private_dir(&nested).unwrap();
+        assert_eq!(mode_of(&nested), 0o700);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_create_private_dir_leaves_existing_dir_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("shared");
+        fs::create_dir_all(&dir).unwrap();
+        set_owner_only(&dir, 0o755);
+
+        create_private_dir(&dir).unwrap();
+        assert_eq!(
+            mode_of(&dir),
+            0o755,
+            "pre-existing dir must not be re-chmod'ed"
+        );
+    }
+
+    #[test]
+    fn test_create_private_dir_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("a").join("b");
+        create_private_dir(&dir).unwrap();
+        create_private_dir(&dir).expect("second call must succeed");
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_restrict_file_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("history.db");
+        fs::write(&file, b"x").unwrap();
+        set_owner_only(&file, 0o644);
+
+        restrict_file(&file);
+        assert_eq!(mode_of(&file), 0o600);
+    }
+
+    #[test]
+    fn test_restrict_file_ignores_missing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        restrict_file(&tmp.path().join("absent.db-wal"));
     }
 }

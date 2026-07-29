@@ -102,6 +102,15 @@ fn should_tee(
     tee_dir
 }
 
+/// Creates the parent as its own step, otherwise `create_dir_all` leaves the
+/// data root at the umask as an intermediate.
+fn create_tee_dir(tee_dir: &std::path::Path) -> Option<()> {
+    if let Some(parent) = tee_dir.parent() {
+        let _ = crate::core::utils::create_private_dir(parent);
+    }
+    crate::core::utils::create_private_dir(tee_dir).ok()
+}
+
 /// Write raw output to a tee file in the given directory.
 /// Returns file path on success.
 fn write_tee_file(
@@ -111,7 +120,7 @@ fn write_tee_file(
     max_file_size: usize,
     max_files: usize,
 ) -> Option<PathBuf> {
-    std::fs::create_dir_all(tee_dir).ok()?;
+    create_tee_dir(tee_dir)?;
 
     let slug = sanitize_slug(command_slug);
     let epoch = std::time::SystemTime::now()
@@ -139,6 +148,7 @@ fn write_tee_file(
     };
 
     std::fs::write(&filepath, content).ok()?;
+    crate::core::utils::restrict_file(&filepath);
 
     // Rotate old files
     cleanup_old_files(tee_dir, max_files);
@@ -257,7 +267,7 @@ fn force_tee_path(content: &str, command_slug: &str) -> Option<PathBuf> {
     }
 
     let tee_dir = get_tee_dir(&config)?;
-    let tee_dir = std::fs::create_dir_all(&tee_dir).ok().and(Some(tee_dir))?;
+    let tee_dir = create_tee_dir(&tee_dir).and(Some(tee_dir))?;
 
     write_tee_file(
         content,
@@ -406,6 +416,27 @@ mod tests {
         assert!(path.exists());
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("error: test failed"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_write_tee_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tee_dir = tmpdir.path().join("tee");
+        let path = write_tee_file(
+            "secret output\n",
+            "grep",
+            &tee_dir,
+            DEFAULT_MAX_FILE_SIZE,
+            20,
+        )
+        .expect("tee file written");
+
+        let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "tee file must be owner-only");
+        assert_eq!(mode(&tee_dir), 0o700, "tee dir must be owner-only");
     }
 
     #[test]
