@@ -252,6 +252,13 @@ impl Tracker {
             crate::core::utils::create_private_dir(parent)?;
         }
 
+        // Create the file ourselves so SQLite derives the -wal/-shm modes from
+        // an already-private DB instead of the umask.
+        let _ = crate::core::utils::open_private(
+            std::fs::OpenOptions::new().write(true).create(true),
+            &db_path,
+        );
+
         let conn = Connection::open(&db_path)?;
         // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
         // Non-fatal: NFS/read-only filesystems may not support WAL.
@@ -1220,14 +1227,24 @@ fn categorize_command(rtk_cmd: &str) -> String {
 }
 
 /// SQLite appends `-wal`/`-shm` to the whole filename, so these are siblings
-/// rather than extension swaps.
+/// rather than extension swaps. Concatenate on `OsString`, not `PathBuf::push`,
+/// which would append a component and silently target `history.db/-wal`.
 fn restrict_db_files(db_path: &std::path::Path) {
     crate::core::utils::restrict_file(db_path);
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar = db_path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        crate::core::utils::restrict_file(std::path::Path::new(&sidecar));
+    for sidecar in db_sidecars(db_path) {
+        crate::core::utils::restrict_file(&sidecar);
     }
+}
+
+fn db_sidecars(db_path: &std::path::Path) -> Vec<PathBuf> {
+    ["-wal", "-shm"]
+        .iter()
+        .map(|suffix| {
+            let mut name = db_path.as_os_str().to_os_string();
+            name.push(suffix);
+            PathBuf::from(name)
+        })
+        .collect()
 }
 
 fn get_db_path() -> Result<PathBuf> {
@@ -1697,6 +1714,19 @@ mod tests {
         assert_eq!(
             failures.total, 0,
             "parse_failures table should be empty after reset"
+        );
+    }
+
+    #[test]
+    fn test_db_sidecars_are_siblings_not_children() {
+        let got = db_sidecars(std::path::Path::new("/data/rtk/history.db"));
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/data/rtk/history.db-wal"),
+                PathBuf::from("/data/rtk/history.db-shm"),
+            ],
+            "PathBuf::push would yield history.db/-wal and silently harden nothing"
         );
     }
 

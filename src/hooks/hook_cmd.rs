@@ -355,12 +355,11 @@ fn audit_log_inner(action: &str, original: &str, rewritten: &str) -> Option<()> 
     let dir = home.join(".local").join("share").join("rtk");
     crate::core::utils::create_private_dir(&dir).ok()?;
     let path = dir.join("hook-audit.log");
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .ok()?;
-    crate::core::utils::restrict_file(&path);
+    let mut file = crate::core::utils::open_private(
+        std::fs::OpenOptions::new().create(true).append(true),
+        &path,
+    )
+    .ok()?;
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
     writeln!(
         file,

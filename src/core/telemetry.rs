@@ -177,9 +177,14 @@ fn get_or_create_salt() -> String {
             if let Some(parent) = salt_path.parent() {
                 let _ = crate::core::utils::create_private_dir(parent);
             }
-            if let Ok(mut f) = std::fs::File::create(&salt_path) {
+            if let Ok(mut f) = crate::core::utils::open_private(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true),
+                &salt_path,
+            ) {
                 let _ = f.write_all(salt.as_bytes());
-                crate::core::utils::restrict_file(&salt_path);
             }
             salt
         })

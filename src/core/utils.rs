@@ -256,6 +256,23 @@ pub fn restrict_file(path: &std::path::Path) {
     set_owner_only(path, 0o600);
 }
 
+/// Open a file owner-only (0600 on Unix), applied at creation so content is
+/// never briefly readable under a permissive umask. `mode` is ignored for a
+/// file that already exists, so an older one is still tightened afterwards.
+pub fn open_private(
+    opts: &mut fs::OpenOptions,
+    path: &std::path::Path,
+) -> std::io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    set_owner_only(path, 0o600);
+    Ok(file)
+}
+
 #[cfg(unix)]
 fn set_owner_only(path: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;

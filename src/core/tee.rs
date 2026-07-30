@@ -147,8 +147,16 @@ fn write_tee_file(
         raw.to_string()
     };
 
-    std::fs::write(&filepath, content).ok()?;
-    crate::core::utils::restrict_file(&filepath);
+    let mut file = crate::core::utils::open_private(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true),
+        &filepath,
+    )
+    .ok()?;
+    use std::io::Write;
+    file.write_all(content.as_bytes()).ok()?;
 
     // Rotate old files
     cleanup_old_files(tee_dir, max_files);
@@ -437,6 +445,27 @@ mod tests {
         let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600, "tee file must be owner-only");
         assert_eq!(mode(&tee_dir), 0o700, "tee dir must be owner-only");
+    }
+
+    // umask is process-global, so this must not run alongside another test that
+    // depends on it. Restored before the assertion can unwind.
+    #[test]
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn test_write_tee_file_owner_only_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // nosemgrep: unsafe-block
+        let previous = unsafe { libc::umask(0o000) };
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tee_dir = tmpdir.path().join("tee");
+        let written = write_tee_file("secret\n", "grep", &tee_dir, DEFAULT_MAX_FILE_SIZE, 20);
+        // nosemgrep: unsafe-block
+        unsafe { libc::umask(previous) };
+
+        let path = written.expect("tee file written");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "umask 000 must not widen the tee file");
     }
 
     #[test]
