@@ -244,14 +244,10 @@ pub fn fallback_tail(output: &str, label: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-/// Create a directory owner-only (0700 on Unix). A pre-existing directory keeps
-/// its mode — users point `RTK_DB_PATH`/`RTK_TEE_DIR` at locations they chose.
+/// Create a directory owner-only (0700 on Unix), tightening one that already exists.
 pub fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
-    let existed = path.is_dir();
     fs::create_dir_all(path)?;
-    if !existed {
-        set_owner_only(path, 0o700);
-    }
+    set_owner_only(path, 0o700);
     Ok(())
 }
 
@@ -996,18 +992,14 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_create_private_dir_leaves_existing_dir_alone() {
+    fn test_create_private_dir_tightens_existing_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("shared");
+        let dir = tmp.path().join("legacy");
         fs::create_dir_all(&dir).unwrap();
         set_owner_only(&dir, 0o755);
 
         create_private_dir(&dir).unwrap();
-        assert_eq!(
-            mode_of(&dir),
-            0o755,
-            "pre-existing dir must not be re-chmod'ed"
-        );
+        assert_eq!(mode_of(&dir), 0o700);
     }
 
     #[test]
