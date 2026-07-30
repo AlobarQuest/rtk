@@ -738,6 +738,26 @@ fn ansi_c_quote_defeats_lexer(cmd: &str) -> bool {
     false
 }
 
+fn quotes_balanced(cmd: &str) -> bool {
+    let bytes = cmd.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if !in_single => {
+                i += 2;
+                continue;
+            }
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            _ => {}
+        }
+        i += 1;
+    }
+    !in_single && !in_double
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineRole {
     Passive,
@@ -810,6 +830,12 @@ fn rewrite_multiline_block(
 
     let raw_breaks = cmd.chars().filter(|c| matches!(c, '\n' | '\r')).count();
     if raw_breaks != newline_offsets.len() {
+        // Every newline swallowed by quote state with quotes balanced at EOF
+        // is one logical command (a multi-line commit message), not a hidden
+        // extra line; rewrite it whole, as develop always did (#3319 fuzz).
+        if newline_offsets.is_empty() && quotes_balanced(cmd) {
+            return rewrite_single(cmd, excluded, transparent_prefixes);
+        }
         return None;
     }
 
@@ -1485,11 +1511,23 @@ mod tests {
         }
 
         #[test]
-        fn test_newline_inside_quotes_passes_through() {
-            // A swallowed newline means the block can't be split safely —
-            // the quoted body must never be treated as a command line of its own.
+        fn test_newline_inside_quotes_rewrites_as_one_command() {
+            // The quoted body is never treated as a command line of its own;
+            // the whole thing is one logical command and gets one prefix.
             assert_eq!(
                 rewrite_command_no_prefixes("git commit -m \"subject\ngit status in body\"", &[]),
+                Some("rtk git commit -m \"subject\ngit status in body\"".into())
+            );
+            assert_eq!(
+                rewrite_command_no_prefixes("git commit -m 'multi\nline\nmessage'", &[]),
+                Some("rtk git commit -m 'multi\nline\nmessage'".into())
+            );
+        }
+
+        #[test]
+        fn test_unbalanced_swallowed_newline_passes_through() {
+            assert_eq!(
+                rewrite_command_no_prefixes("git commit -m \"subject\ngit status", &[]),
                 None
             );
         }
