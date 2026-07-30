@@ -1020,6 +1020,12 @@ fn rewrite_segment_inner(
     if context == RewriteContext::Normal
         && (cmd_part.starts_with("head -") || cmd_part.starts_with("tail "))
     {
+        // head/tail rewrite to `rtk read`, so honour exclude_commands here too —
+        // this branch returns before the checks below and used to ignore the list.
+        let stripped = ENV_PREFIX.replace(cmd_part, "");
+        if is_excluded(stripped.trim(), excluded) {
+            return None;
+        }
         return rewrite_line_range(cmd_part).map(|r| format!("{}{}", r, redirect_suffix));
     }
 
@@ -2247,6 +2253,33 @@ mod tests {
     }
 
     // --- P0.2: head -N rewrite ---
+
+    #[test]
+    fn test_head_tail_honour_exclude_commands() {
+        // head/tail rewrite to `rtk read`; excluding them must suppress that.
+        let excluded = vec!["head".to_string(), "tail".to_string()];
+        assert_eq!(
+            rewrite_command_no_prefixes("head -20 src/main.rs", &excluded),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("tail -20 src/main.rs", &excluded),
+            None
+        );
+        // ...and must not affect unrelated commands.
+        assert_eq!(
+            rewrite_command_no_prefixes("git status", &excluded),
+            Some("rtk git status".into())
+        );
+    }
+
+    #[test]
+    fn test_head_tail_rewrite_when_not_excluded() {
+        assert_eq!(
+            rewrite_command_no_prefixes("head -20 src/main.rs", &["cat".to_string()]),
+            Some("rtk read src/main.rs --max-lines 20".into())
+        );
+    }
 
     #[test]
     fn test_rewrite_head_numeric_flag() {
