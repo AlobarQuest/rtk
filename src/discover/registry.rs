@@ -633,129 +633,150 @@ const BLOCK_KEYWORDS: &[&str] = &[
     "select", "function", "coproc", "{", "}", "(", ")",
 ];
 
+/// Shared quote-state byte walker used by all line scanners. Yields
+/// `(offset, byte, in_single_before, in_double_before)`, skipping backslash
+/// escape pairs outside single quotes and toggling quote state — the same
+/// model the lexer applies.
+struct QuoteScan<'a> {
+    bytes: &'a [u8],
+    i: usize,
+    in_single: bool,
+    in_double: bool,
+}
+
+impl<'a> QuoteScan<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            bytes: s.as_bytes(),
+            i: 0,
+            in_single: false,
+            in_double: false,
+        }
+    }
+
+    fn balanced(&self) -> bool {
+        !self.in_single && !self.in_double
+    }
+}
+
+impl Iterator for QuoteScan<'_> {
+    type Item = (usize, u8, bool, bool);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.i < self.bytes.len() {
+            let i = self.i;
+            let b = self.bytes[i];
+            if b == b'\\' && !self.in_single {
+                self.i += 2;
+                continue;
+            }
+            let item = (i, b, self.in_single, self.in_double);
+            match b {
+                b'\'' if !self.in_double => self.in_single = !self.in_single,
+                b'"' if !self.in_single => self.in_double = !self.in_double,
+                _ => {}
+            }
+            self.i += 1;
+            return Some(item);
+        }
+        None
+    }
+}
+
 /// Byte offset where an unquoted `#` at the start of a word begins a trailing
 /// comment, if any. The lexer has no comment state, so the independence checks
 /// must ignore comment text themselves: `git log | # keep pipeline` continues
 /// the pipeline across the newline even though the line ends in comment text.
 fn comment_start(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if !in_single => {
-                i += 2;
-                continue;
-            }
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            // `#` starts a comment at any word start, incl. after an operator
-            // byte — but not after `{`: `${#var}` is an expansion (#3188 review).
-            b'#' if !in_single
-                && !in_double
-                && (i == 0
-                    || bytes[i - 1].is_ascii_whitespace()
-                    || matches!(bytes[i - 1], b'|' | b'&' | b';' | b'(' | b')')) =>
-            {
-                return Some(i)
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+    // `#` starts a comment at any word start, incl. after an operator
+    // byte — but not after `{`: `${#var}` is an expansion (#3188 review).
+    QuoteScan::new(line).find_map(|(i, b, in_single, in_double)| {
+        (b == b'#'
+            && !in_single
+            && !in_double
+            && (i == 0
+                || bytes[i - 1].is_ascii_whitespace()
+                || matches!(bytes[i - 1], b'|' | b'&' | b';' | b'(' | b')')))
+        .then_some(i)
+    })
 }
 
 /// Unquoted `(`/`)` or `{`/`}` that don't balance within the line: an array
 /// literal (`arr=(one`), function body (`foo() {`), or group spans lines, so
 /// the lines around it are not independent commands.
 fn line_has_unbalanced_grouping(code: &str) -> bool {
-    let bytes = code.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
     let mut paren = 0i32;
     let mut brace = 0i32;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if !in_single => {
-                i += 2;
-                continue;
-            }
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'(' if !in_single && !in_double => paren += 1,
-            b')' if !in_single && !in_double => paren -= 1,
-            b'{' if !in_single && !in_double => brace += 1,
-            b'}' if !in_single && !in_double => brace -= 1,
+    for (_, b, in_single, in_double) in QuoteScan::new(code) {
+        if in_single || in_double {
+            continue;
+        }
+        match b {
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            b'{' => brace += 1,
+            b'}' => brace -= 1,
             _ => {}
         }
         if paren < 0 || brace < 0 {
             return true;
         }
-        i += 1;
     }
     paren != 0 || brace != 0
+}
+
+/// Unquoted `[[` / `]]` words that don't balance within the line: bash allows
+/// a conditional expression to span lines (`[[ -f a &&` / `-f b ]]`), so the
+/// surrounding lines are not independent commands.
+fn line_has_unbalanced_test_brackets(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    let mut depth = 0i32;
+    for (i, b, in_single, in_double) in QuoteScan::new(code) {
+        if in_single || in_double || !matches!(b, b'[' | b']') {
+            continue;
+        }
+        let word_start = i == 0 || bytes[i - 1].is_ascii_whitespace();
+        let word_end = bytes.get(i + 2).is_none_or(|c| c.is_ascii_whitespace());
+        if bytes.get(i + 1) == Some(&b) && word_start && word_end {
+            depth += if b == b'[' { 1 } else { -1 };
+            if depth < 0 {
+                return true;
+            }
+        }
+    }
+    depth != 0
 }
 
 // Only `\'` inside `$'…'` diverges: bash keeps the string open, the lexer
 // closes it — an extra split point the newline-count check can't see (#3188).
 fn ansi_c_quote_defeats_lexer(cmd: &str) -> bool {
     let bytes = cmd.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if !in_single => {
-                i += 2;
-                continue;
+    let mut ansi_span = false;
+    let mut backslash_run = 0u32;
+    for (i, b, in_single, in_double) in QuoteScan::new(cmd) {
+        if b == b'\'' && !in_double {
+            if !in_single {
+                ansi_span = i > 0 && bytes[i - 1] == b'$';
+                backslash_run = 0;
+            } else if ansi_span && backslash_run % 2 == 1 {
+                return true;
             }
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'$' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'\'') => {
-                i += 2;
-                while i < bytes.len() {
-                    match bytes[i] {
-                        b'\\' => {
-                            if bytes.get(i + 1) == Some(&b'\'') {
-                                return true;
-                            }
-                            i += 2;
-                            continue;
-                        }
-                        b'\'' => break,
-                        _ => {}
-                    }
-                    i += 1;
-                }
+        } else if in_single {
+            if b == b'\\' {
+                backslash_run += 1;
+            } else {
+                backslash_run = 0;
             }
-            _ => {}
         }
-        i += 1;
     }
     false
 }
 
 fn quotes_balanced(cmd: &str) -> bool {
-    let bytes = cmd.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if !in_single => {
-                i += 2;
-                continue;
-            }
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            _ => {}
-        }
-        i += 1;
-    }
-    !in_single && !in_double
+    let mut scan = QuoteScan::new(cmd);
+    scan.by_ref().for_each(drop);
+    scan.balanced()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -781,6 +802,7 @@ fn classify_line(line: &str) -> LineRole {
         || code.starts_with("((")
         || code.ends_with("))")
         || line_has_unbalanced_grouping(code)
+        || line_has_unbalanced_test_brackets(code)
     {
         return LineRole::Unsafe;
     }
@@ -801,7 +823,9 @@ fn classify_line(line: &str) -> LineRole {
 /// Split points are the newline tokens the quote-aware lexer emits, so a
 /// newline inside a quoted string (e.g. a multi-line commit message) never
 /// becomes a boundary. Lines continued by a trailing `&&`/`||`/`|`/`|&` are
-/// joined and rewritten as one logical command through the single-line path;
+/// joined and rewritten as one logical command through the single-line path —
+/// joining is not byte-preserving: separators inside a joined unit collapse
+/// to single spaces (see `test_blank_line_inside_continuation_joins`);
 /// any line [`classify_line`] marks unsafe passes the whole block through.
 /// Blank lines and comment lines are preserved verbatim, as is indentation
 /// and the original separator bytes (`\n` vs `\r\n`).
@@ -828,6 +852,8 @@ fn rewrite_multiline_block(
         return None;
     }
 
+    // The lexer emits one newline token per `\r` and per `\n` (CRLF = two
+    // tokens), so the parity check must count both bytes individually.
     let raw_breaks = cmd.chars().filter(|c| matches!(c, '\n' | '\r')).count();
     if raw_breaks != newline_offsets.len() {
         // Every newline swallowed by quote state with quotes balanced at EOF
@@ -888,6 +914,8 @@ fn rewrite_multiline_block(
             end = next;
         }
 
+        // A joined unit is rebuilt through the single-line path: interior
+        // newlines and blank lines collapse to single spaces, not preserved.
         let unit = if end == i {
             seg
         } else {
@@ -1734,6 +1762,26 @@ mod tests {
             assert_eq!(
                 rewrite_command_no_prefixes("git log |# keep pipeline\ngrep -f patterns.txt", &[]),
                 None
+            );
+        }
+
+        #[test]
+        fn test_conditional_expression_spanning_lines_passes_through() {
+            assert_eq!(
+                rewrite_command_no_prefixes("[[ -f a &&\n-f b ]]\ngit status", &[]),
+                None
+            );
+            assert_eq!(
+                rewrite_command_no_prefixes("git status\n[[\n-f a ]]", &[]),
+                None
+            );
+        }
+
+        #[test]
+        fn test_balanced_conditional_line_still_rewrites() {
+            assert_eq!(
+                rewrite_command_no_prefixes("[[ -x foo ]] &&\ngit status", &[]),
+                Some("[[ -x foo ]] && rtk git status".into())
             );
         }
 
