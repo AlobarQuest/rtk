@@ -5,6 +5,19 @@ All notable changes to rtk (Rust Token Killer) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.44.2](https://github.com/rtk-ai/rtk/compare/v0.44.1...v0.44.2) (2026-08-01)
+
+
+### Bug Fixes
+
+* **security:** address followup review comments on private-file hardening ([e0ffd40](https://github.com/rtk-ai/rtk/commit/e0ffd40ef7c450489aca4a50c0ab1358e4375691))
+* **security:** address followup review comments on private-file hardening ([2ba02f4](https://github.com/rtk-ai/rtk/commit/2ba02f4b6a4cdadd8ca887b32f81e526a1c53757))
+* **security:** create data files owner-only instead of chmod after write ([a1bbcaf](https://github.com/rtk-ai/rtk/commit/a1bbcaf3eb7731b1025d541a961fcba4f06d078c))
+* **security:** store history db, tee logs and audit log owner-only ([57b7900](https://github.com/rtk-ai/rtk/commit/57b79008d492bf6e070f7a56e3e25a699c4227a6))
+* **security:** store history db, tee logs and audit log owner-only ([9cf7a6d](https://github.com/rtk-ai/rtk/commit/9cf7a6da27a99d65ed3f96a6978ef06abeb16108))
+* **security:** tighten data dirs that already exist ([18925c2](https://github.com/rtk-ai/rtk/commit/18925c28346e4f76396ba3bb2fccdda96b14e3ec))
+* **tee:** quote recovery hint paths with spaces ([8a24ce2](https://github.com/rtk-ai/rtk/commit/8a24ce2e2828117f69ffc31134ed12f36d33fac4))
+
 ## [0.44.1](https://github.com/rtk-ai/rtk/compare/v0.44.0...v0.44.1) (2026-07-28)
 
 
