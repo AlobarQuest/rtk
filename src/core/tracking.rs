@@ -254,10 +254,16 @@ impl Tracker {
 
         // Create the file ourselves so SQLite derives the -wal/-shm modes from
         // an already-private DB instead of the umask.
-        let _ = crate::core::utils::open_private(
+        crate::core::utils::open_private(
             std::fs::OpenOptions::new().write(true).create(true),
             &db_path,
-        );
+        )
+        .with_context(|| {
+            format!(
+                "Failed to pre-create private DB file: {}",
+                db_path.display()
+            )
+        })?;
 
         let conn = Connection::open(&db_path)?;
         // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
@@ -1247,7 +1253,7 @@ fn db_sidecars(db_path: &std::path::Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn get_db_path() -> Result<PathBuf> {
+pub(crate) fn get_db_path() -> Result<PathBuf> {
     // Priority 1: Environment variable RTK_DB_PATH
     if let Ok(custom_path) = std::env::var("RTK_DB_PATH") {
         return Ok(PathBuf::from(custom_path));
