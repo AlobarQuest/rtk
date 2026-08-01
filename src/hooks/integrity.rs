@@ -274,15 +274,20 @@ fn report_hook_status(verbose: u8) -> Result<()> {
 /// Report a data directory other local users can reach. RTK tightens it to 0700
 /// on every run, but that chmod fails silently when the directory belongs to
 /// another user — `rtk verify` is where that surfaces, never the command path.
+///
+/// Checks the parent of the actual resolved DB path (honoring `RTK_DB_PATH` and
+/// `config.tracking.database_path` overrides), not just the default location.
 #[cfg(unix)]
 fn report_data_dir_privacy() {
-    use super::super::core::constants::RTK_DATA_DIR;
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(dir) = dirs::data_local_dir().map(|d| d.join(RTK_DATA_DIR)) else {
+    let Ok(db_path) = crate::core::tracking::get_db_path() else {
         return;
     };
-    let Ok(meta) = std::fs::metadata(&dir) else {
+    let Some(dir) = db_path.parent() else {
+        return;
+    };
+    let Ok(meta) = std::fs::metadata(dir) else {
         return;
     };
 
