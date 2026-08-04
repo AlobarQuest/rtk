@@ -352,6 +352,62 @@ pub fn run_gemini() -> Result<()> {
     Ok(())
 }
 
+// ── Vibe hook ─────────────────────────────────────────────────
+
+/// Run the Mistral Vibe CLI pre_tool hook.
+///
+/// Vibe hook contract (https://docs.mistral.ai/vibe/code/cli/hooks):
+/// - stdin: JSON with `tool_name`, `tool_input`, `hook_event_name`, etc.
+/// - Passthrough: exit 0 with empty stdout.
+/// - Rewrite: emit `{"hook_specific_output": {"tool_input": {"command": "..."}}}`.
+/// - Deny: emit `{"decision": "deny", "reason": "..."}`.
+pub fn run_vibe() -> Result<()> {
+    let input = read_stdin_limited()?;
+
+    let json: Value = serde_json::from_str(&input).context("Failed to parse hook input as JSON")?;
+
+    let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+
+    if tool_name != "bash" {
+        return Ok(());
+    }
+
+    let cmd = json
+        .pointer("/tool_input/command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if cmd.is_empty() {
+        return Ok(());
+    }
+
+    match decide_hook_action(cmd, permissions::Host::Vibe) {
+        HookDecision::Deny => {
+            let _ = writeln!(
+                io::stdout(),
+                r#"{{"decision":"deny","reason":"Blocked by RTK permission rule"}}"#
+            );
+        }
+        HookDecision::AllowRewrite(ref rewritten) | HookDecision::AskRewrite(ref rewritten) => {
+            audit_log("rewrite", cmd, rewritten);
+            let _ = writeln!(io::stdout(), "{}", vibe_rewrite_json(rewritten));
+        }
+        HookDecision::Defer => {}
+    }
+
+    Ok(())
+}
+
+fn vibe_rewrite_json(rewritten: &str) -> String {
+    serde_json::json!({
+        "hook_specific_output": {
+            "tool_input": { "command": rewritten }
+        },
+        "system_message": format!("rtk: rewrote to `{}`", rewritten),
+    })
+    .to_string()
+}
+
 fn print_allow() {
     let _ = writeln!(io::stdout(), r#"{{"decision":"allow"}}"#);
 }
