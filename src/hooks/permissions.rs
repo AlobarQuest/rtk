@@ -45,6 +45,11 @@ pub fn check_command_for(cmd: &str, host: Host) -> PermissionVerdict {
         Host::Cursor => load_cursor_rules(),
         Host::Gemini => load_gemini_rules(),
         Host::Droid => load_droid_rules(),
+        // Vibe stores hooks in ~/.vibe/hooks.toml and has no denylist / allowlist
+        // surface at the time of writing. Empty rules mean check_command_with_rules
+        // returns Default (treated as Ask by callers), and the Deny arm in
+        // hook_cmd::run_vibe is dead code kept as defensive scaffolding for when
+        // Vibe ships native permission config we can honor here.
         Host::Vibe => (Vec::new(), Vec::new(), Vec::new()),
     };
     check_command_with_rules(cmd, &deny_rules, &ask_rules, &allow_rules)

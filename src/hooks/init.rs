@@ -4486,7 +4486,7 @@ fn run_vibe_mode_at(
     }
 
     let hooks_path = vibe_dir.join(VIBE_HOOKS_FILE);
-    patch_vibe_hooks_toml(&hooks_path, patch_mode, ctx)?;
+    let hook_outcome = patch_vibe_hooks_toml(&hooks_path, patch_mode, ctx)?;
 
     if !hook_only {
         let prompts_dir = vibe_dir.join(VIBE_PROMPTS_SUBDIR);
@@ -4501,8 +4501,13 @@ fn run_vibe_mode_at(
 
     if dry_run {
         print_dry_run_footer();
-    } else {
-        println!("\nMistral Vibe CLI hook installed (global).\n");
+    } else if hook_outcome != VibeHookPatchOutcome::Skipped {
+        let summary_verb = match hook_outcome {
+            VibeHookPatchOutcome::Installed => "installed",
+            VibeHookPatchOutcome::AlreadyPresent => "already present",
+            VibeHookPatchOutcome::Skipped => unreachable!(),
+        };
+        println!("\nMistral Vibe CLI hook {summary_verb} (global).\n");
         println!("  Hook registry: {}", hooks_path.display());
         if !hook_only {
             println!(
@@ -4518,11 +4523,24 @@ fn run_vibe_mode_at(
     Ok(())
 }
 
+/// Outcome of `patch_vibe_hooks_toml`. Distinguishes installed / already-present /
+/// skipped so the caller can decide whether the "installed" summary is truthful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VibeHookPatchOutcome {
+    Installed,
+    AlreadyPresent,
+    Skipped,
+}
+
 /// Append the RTK `[[hooks]]` entry to `~/.vibe/hooks.toml` if not already present.
 ///
 /// Uses append-based patching (string level) rather than parse-serialize round-trip
 /// to preserve any user comments and formatting in the file.
-fn patch_vibe_hooks_toml(hooks_path: &Path, patch_mode: PatchMode, ctx: InitContext) -> Result<()> {
+fn patch_vibe_hooks_toml(
+    hooks_path: &Path,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<VibeHookPatchOutcome> {
     let InitContext { verbose, dry_run } = ctx;
 
     let existing = if hooks_path.exists() {
@@ -4536,16 +4554,16 @@ fn patch_vibe_hooks_toml(hooks_path: &Path, patch_mode: PatchMode, ctx: InitCont
         if verbose > 0 {
             eprintln!("Vibe hooks.toml already has RTK hook");
         }
-        return Ok(());
+        return Ok(VibeHookPatchOutcome::AlreadyPresent);
     }
 
     if patch_mode == PatchMode::Skip {
         println!(
             "\nManual setup needed: add RTK hook to {}\n\
-             See: https://github.com/rtk-ai/rtk#mistral-vibe",
+             See: https://www.rtk-ai.app/guide/getting-started/supported-agents#mistral-vibe",
             hooks_path.display()
         );
-        return Ok(());
+        return Ok(VibeHookPatchOutcome::Skipped);
     }
 
     if patch_mode == PatchMode::Ask {
@@ -4564,7 +4582,7 @@ fn patch_vibe_hooks_toml(hooks_path: &Path, patch_mode: PatchMode, ctx: InitCont
                     "Skipped. Re-run with --auto-patch, or add the hook manually to {}",
                     hooks_path.display()
                 );
-                return Ok(());
+                return Ok(VibeHookPatchOutcome::Skipped);
             }
         }
     }
@@ -4592,7 +4610,7 @@ fn patch_vibe_hooks_toml(hooks_path: &Path, patch_mode: PatchMode, ctx: InitCont
         atomic_write(hooks_path, &new_content)
             .with_context(|| format!("Failed to write {}", hooks_path.display()))?;
     }
-    Ok(())
+    Ok(VibeHookPatchOutcome::Installed)
 }
 
 /// TOML entry emitted for the Vibe pre_tool hook. Mirrors the shape documented
@@ -4617,6 +4635,13 @@ description = "Rewrite bash commands through the rtk proxy to save tokens."
 /// Detect an existing RTK entry by looking for the hook `name` field. Scanning
 /// the raw string is enough because `name` is required by Vibe and must be
 /// unique, so a substring match is both necessary and sufficient.
+///
+/// Tradeoff: matches the exact spacing `name = "rtk-rewrite"`. A reformatted
+/// file (`name="rtk-rewrite"` or extra whitespace) would defeat idempotency
+/// and cause a duplicate append on re-install. Acceptable because our own
+/// installer only ever writes the canonical spacing, and the alternative
+/// (parse-serialize round-trip via toml_edit) would clobber user comments
+/// and formatting in the file.
 fn vibe_hooks_toml_has_rtk(content: &str) -> bool {
     let needle = format!(r#"name = "{VIBE_HOOK_NAME}""#);
     content.contains(&needle)
