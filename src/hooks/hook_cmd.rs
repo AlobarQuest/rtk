@@ -225,7 +225,8 @@ fn heal_legacy_hook_file(path: &std::path::Path) -> bool {
     std::fs::write(&tmp, content)
         .and_then(|()| std::fs::rename(&tmp, path))
         .map_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
+            // Cleanup of our own temp file after a failed atomic write.
+            let _ = std::fs::remove_file(&tmp); // nosemgrep: filesystem-deletion
         })
         .is_ok()
 }
