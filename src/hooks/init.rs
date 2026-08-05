@@ -4501,12 +4501,7 @@ fn run_vibe_mode_at(
 
     if dry_run {
         print_dry_run_footer();
-    } else if hook_outcome != VibeHookPatchOutcome::Skipped {
-        let summary_verb = match hook_outcome {
-            VibeHookPatchOutcome::Installed => "installed",
-            VibeHookPatchOutcome::AlreadyPresent => "already present",
-            VibeHookPatchOutcome::Skipped => unreachable!(),
-        };
+    } else if let Some(summary_verb) = hook_outcome.summary_verb() {
         println!("\nMistral Vibe CLI hook {summary_verb} (global).\n");
         println!("  Hook registry: {}", hooks_path.display());
         if !hook_only {
@@ -4530,6 +4525,16 @@ enum VibeHookPatchOutcome {
     Installed,
     AlreadyPresent,
     Skipped,
+}
+
+impl VibeHookPatchOutcome {
+    fn summary_verb(self) -> Option<&'static str> {
+        match self {
+            Self::Installed => Some("installed"),
+            Self::AlreadyPresent => Some("already present"),
+            Self::Skipped => None,
+        }
+    }
 }
 
 /// Append the RTK `[[hooks]]` entry to `~/.vibe/hooks.toml` if not already present.
@@ -4652,7 +4657,10 @@ pub fn uninstall_vibe(ctx: InitContext) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
     let vibe_dir = match resolve_vibe_dir() {
         Ok(d) => d,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            eprintln!("RTK Vibe uninstall skipped: could not resolve ~/.vibe/ ({e})");
+            return Ok(());
+        }
     };
     let removed = uninstall_vibe_at(&vibe_dir, ctx)?;
 
