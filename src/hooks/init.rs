@@ -4694,6 +4694,7 @@ fn uninstall_vibe_at(vibe_dir: &Path, ctx: InitContext) -> Result<Vec<String>> {
                 prompt_path.display()
             );
         } else {
+            // nosemgrep: filesystem-deletion -- uninstall path removes only RTK's own prompt file
             fs::remove_file(&prompt_path)
                 .with_context(|| format!("Failed to remove {}", prompt_path.display()))?;
         }
@@ -4711,6 +4712,7 @@ fn uninstall_vibe_at(vibe_dir: &Path, ctx: InitContext) -> Result<Vec<String>> {
                     hooks_path.display()
                 );
             } else if new_content.trim().is_empty() {
+                // nosemgrep: filesystem-deletion -- uninstall removes hooks.toml only when it becomes empty after stripping the RTK entry
                 fs::remove_file(&hooks_path)
                     .with_context(|| format!("Failed to remove {}", hooks_path.display()))?;
             } else {
