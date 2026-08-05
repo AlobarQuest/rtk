@@ -150,32 +150,6 @@ fn detect_format(v: &Value) -> HookFormat {
     HookFormat::PassThrough
 }
 
-// Stale dual-schema config written by pre-b754b85 `rtk init --copilot`; its
-// camelCase entry is what routes invocations into the CopilotCli arm above.
-const COPILOT_LEGACY_HOOK_JSON: &str = r#"{
-  "version": 1,
-  "hooks": {
-    "PreToolUse": [
-      {
-        "type": "command",
-        "command": "rtk hook copilot",
-        "cwd": ".",
-        "timeout": 5
-      }
-    ],
-    "preToolUse": [
-      {
-        "type": "command",
-        "bash": "rtk hook copilot",
-        "powershell": "rtk hook copilot",
-        "cwd": ".",
-        "timeoutSec": 5
-      }
-    ]
-  }
-}
-"#;
-
 fn heal_legacy_copilot_configs() -> Vec<std::path::PathBuf> {
     use super::constants::{COPILOT_HOOK_FILE, GITHUB_DIR, HOOKS_SUBDIR};
 
@@ -195,21 +169,60 @@ fn heal_legacy_copilot_configs() -> Vec<std::path::PathBuf> {
     healed
 }
 
+// Exact camelCase entry written by pre-b754b85 `rtk init --copilot`; that
+// stale registration is the only thing routing invocations into the
+// CopilotCli arm above. Only this entry is removed — user additions stay.
+fn legacy_camelcase_entry() -> Value {
+    json!([{
+        "type": "command",
+        "bash": "rtk hook copilot",
+        "powershell": "rtk hook copilot",
+        "cwd": ".",
+        "timeoutSec": 5
+    }])
+}
+
 fn heal_legacy_hook_file(path: &std::path::Path) -> bool {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return false;
     };
-    let Ok(current) = serde_json::from_str::<Value>(&raw) else {
+    let Ok(mut config) = serde_json::from_str::<Value>(&raw) else {
         return false;
     };
-    let Ok(legacy) = serde_json::from_str::<Value>(COPILOT_LEGACY_HOOK_JSON) else {
+    let Some(hooks) = config.get("hooks").and_then(|h| h.as_object()) else {
         return false;
     };
-    if current != legacy {
+    if hooks.get("preToolUse") != Some(&legacy_camelcase_entry()) {
         return false;
     }
+    let pascalcase_still_registered = hooks
+        .get("PreToolUse")
+        .and_then(|p| p.as_array())
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e.get("command").and_then(|c| c.as_str()) == Some("rtk hook copilot"))
+        });
+    if !pascalcase_still_registered {
+        return false;
+    }
+    let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return false;
+    };
+    hooks.shift_remove("preToolUse");
+
+    let stock = serde_json::from_str::<Value>(super::init::COPILOT_HOOK_JSON).ok();
+    let content = if stock.is_some_and(|s| s == config) {
+        super::init::COPILOT_HOOK_JSON.to_string()
+    } else {
+        let Ok(mut pretty) = serde_json::to_string_pretty(&config) else {
+            return false;
+        };
+        pretty.push('\n');
+        pretty
+    };
     let tmp = path.with_extension(format!("heal.{}", std::process::id()));
-    std::fs::write(&tmp, super::init::COPILOT_HOOK_JSON)
+    std::fs::write(&tmp, content)
         .and_then(|()| std::fs::rename(&tmp, path))
         .map_err(|_| {
             let _ = std::fs::remove_file(&tmp);
@@ -826,6 +839,19 @@ mod tests {
 
     // --- Copilot legacy config self-heal ---
 
+    const LEGACY_STOCK: &str = r#"{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      { "type": "command", "command": "rtk hook copilot", "cwd": ".", "timeout": 5 }
+    ],
+    "preToolUse": [
+      { "type": "command", "bash": "rtk hook copilot", "powershell": "rtk hook copilot", "cwd": ".", "timeoutSec": 5 }
+    ]
+  }
+}
+"#;
+
     fn heal_input(dir: &tempfile::TempDir, content: &str) -> std::path::PathBuf {
         let path = dir.path().join("rtk-rewrite.json");
         std::fs::write(&path, content).expect("write test config");
@@ -833,9 +859,9 @@ mod tests {
     }
 
     #[test]
-    fn heal_rewrites_exact_legacy_stock_to_current_stock() {
+    fn heal_rewrites_legacy_stock_to_current_stock_bytes() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let path = heal_input(&dir, COPILOT_LEGACY_HOOK_JSON);
+        let path = heal_input(&dir, LEGACY_STOCK);
 
         assert!(heal_legacy_hook_file(&path));
         assert_eq!(
@@ -845,7 +871,47 @@ mod tests {
     }
 
     #[test]
-    fn heal_is_key_order_insensitive() {
+    fn heal_preserves_user_hooks_and_keys() {
+        let extended = r#"{
+  "version": 1,
+  "customTopLevel": { "keep": true },
+  "hooks": {
+    "sessionStart": [
+      { "type": "command", "command": "echo hi" }
+    ],
+    "PreToolUse": [
+      { "type": "command", "command": "rtk hook copilot", "cwd": ".", "timeout": 5 }
+    ],
+    "preToolUse": [
+      { "type": "command", "bash": "rtk hook copilot", "powershell": "rtk hook copilot", "cwd": ".", "timeoutSec": 5 }
+    ]
+  }
+}
+"#;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = heal_input(&dir, extended);
+
+        assert!(heal_legacy_hook_file(&path));
+        let healed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert!(healed["hooks"].get("preToolUse").is_none());
+        assert_eq!(
+            healed["hooks"]["PreToolUse"][0]["command"],
+            "rtk hook copilot"
+        );
+        assert_eq!(healed["hooks"]["sessionStart"][0]["command"], "echo hi");
+        assert_eq!(healed["customTopLevel"]["keep"], true);
+        let keys: Vec<&str> = healed["hooks"]
+            .as_object()
+            .expect("hooks object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["sessionStart", "PreToolUse"], "key order preserved");
+    }
+
+    #[test]
+    fn heal_matches_legacy_entry_regardless_of_field_order() {
         let reordered = r#"{
   "hooks": {
     "preToolUse": [
@@ -865,7 +931,7 @@ mod tests {
     #[test]
     fn heal_second_run_is_a_noop() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let path = heal_input(&dir, COPILOT_LEGACY_HOOK_JSON);
+        let path = heal_input(&dir, LEGACY_STOCK);
         assert!(heal_legacy_hook_file(&path));
 
         assert!(!heal_legacy_hook_file(&path));
@@ -876,34 +942,45 @@ mod tests {
     }
 
     #[test]
-    fn heal_refuses_any_deviation_from_legacy_stock() {
-        let customized = COPILOT_LEGACY_HOOK_JSON.replace(
+    fn heal_refuses_non_stock_camelcase_or_missing_pascalcase() {
+        let customized = LEGACY_STOCK.replace(
             r#""bash": "rtk hook copilot""#,
             r#""bash": "my-wrapper.sh""#,
         );
-        let extra_key =
-            COPILOT_LEGACY_HOOK_JSON.replace(r#""version": 1,"#, r#""version": 1, "extra": true,"#);
-        let missing_pascal = COPILOT_LEGACY_HOOK_JSON.replace(
+        let extra_field = LEGACY_STOCK.replace(r#""timeoutSec": 5"#, r#""timeoutSec": 5, "x": 1"#);
+        let two_entries = LEGACY_STOCK.replace(
+            r#""preToolUse": [
+      {"#,
+            r#""preToolUse": [
+      { "type": "command", "bash": "rtk hook copilot", "powershell": "rtk hook copilot", "cwd": ".", "timeoutSec": 5 },
+      {"#,
+        );
+        let missing_pascal = LEGACY_STOCK.replace(
             r#""PreToolUse": [
-      {
-        "type": "command",
-        "command": "rtk hook copilot",
-        "cwd": ".",
-        "timeout": 5
-      }
+      { "type": "command", "command": "rtk hook copilot", "cwd": ".", "timeout": 5 }
     ],
     "#,
             "",
         );
+        let foreign_pascal = LEGACY_STOCK.replace(
+            r#""command": "rtk hook copilot""#,
+            r#""command": "other-tool --hook""#,
+        );
         for content in [
             customized.as_str(),
-            extra_key.as_str(),
+            extra_field.as_str(),
+            two_entries.as_str(),
             missing_pascal.as_str(),
+            foreign_pascal.as_str(),
             crate::hooks::init::COPILOT_HOOK_JSON,
             "{ not json",
             "{}",
             "",
         ] {
+            let parsed: Result<Value, _> = serde_json::from_str(content);
+            if content == missing_pascal || content == two_entries {
+                assert!(parsed.is_ok(), "fixture must stay valid JSON: {content:?}");
+            }
             let dir = tempfile::TempDir::new().expect("tempdir");
             let path = heal_input(&dir, content);
             assert!(!heal_legacy_hook_file(&path), "input: {content:?}");
