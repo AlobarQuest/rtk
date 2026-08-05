@@ -78,7 +78,12 @@ pub fn run_copilot() -> Result<()> {
 
     match detect_format(&v) {
         HookFormat::VsCode { command } => handle_vscode(&command),
-        HookFormat::CopilotCli { command, args } => handle_copilot_cli(&command, &args),
+        HookFormat::CopilotCli { command, args } => {
+            for path in heal_legacy_copilot_configs() {
+                audit_log("self_heal", &path.display().to_string(), "");
+            }
+            handle_copilot_cli(&command, &args)
+        }
         HookFormat::CopilotIde { command } => handle_copilot_ide(&command),
         HookFormat::PassThrough => Ok(()),
     }
@@ -143,6 +148,73 @@ fn detect_format(v: &Value) -> HookFormat {
     }
 
     HookFormat::PassThrough
+}
+
+// Stale dual-schema config written by pre-b754b85 `rtk init --copilot`; its
+// camelCase entry is what routes invocations into the CopilotCli arm above.
+const COPILOT_LEGACY_HOOK_JSON: &str = r#"{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "rtk hook copilot",
+        "cwd": ".",
+        "timeout": 5
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "rtk hook copilot",
+        "powershell": "rtk hook copilot",
+        "cwd": ".",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}
+"#;
+
+fn heal_legacy_copilot_configs() -> Vec<std::path::PathBuf> {
+    use super::constants::{COPILOT_HOOK_FILE, GITHUB_DIR, HOOKS_SUBDIR};
+
+    let mut healed = Vec::new();
+    let project = std::path::Path::new(GITHUB_DIR)
+        .join(HOOKS_SUBDIR)
+        .join(COPILOT_HOOK_FILE);
+    if heal_legacy_hook_file(&project) {
+        healed.push(project);
+    }
+    if let Ok(dir) = super::init::copilot_user_dir() {
+        let global = dir.join(HOOKS_SUBDIR).join(COPILOT_HOOK_FILE);
+        if heal_legacy_hook_file(&global) {
+            healed.push(global);
+        }
+    }
+    healed
+}
+
+fn heal_legacy_hook_file(path: &std::path::Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(current) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let Ok(legacy) = serde_json::from_str::<Value>(COPILOT_LEGACY_HOOK_JSON) else {
+        return false;
+    };
+    if current != legacy {
+        return false;
+    }
+    let tmp = path.with_extension(format!("heal.{}", std::process::id()));
+    std::fs::write(&tmp, super::init::COPILOT_HOOK_JSON)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+        .is_ok()
 }
 
 fn get_rewritten(cmd: &str) -> Option<String> {
@@ -750,6 +822,110 @@ mod tests {
 
     fn rewrite_command_no_prefixes(cmd: &str, excluded: &[String]) -> Option<String> {
         crate::discover::registry::rewrite_command(cmd, excluded, &[])
+    }
+
+    // --- Copilot legacy config self-heal ---
+
+    fn heal_input(dir: &tempfile::TempDir, content: &str) -> std::path::PathBuf {
+        let path = dir.path().join("rtk-rewrite.json");
+        std::fs::write(&path, content).expect("write test config");
+        path
+    }
+
+    #[test]
+    fn heal_rewrites_exact_legacy_stock_to_current_stock() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = heal_input(&dir, COPILOT_LEGACY_HOOK_JSON);
+
+        assert!(heal_legacy_hook_file(&path));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            crate::hooks::init::COPILOT_HOOK_JSON
+        );
+    }
+
+    #[test]
+    fn heal_is_key_order_insensitive() {
+        let reordered = r#"{
+  "hooks": {
+    "preToolUse": [
+      { "timeoutSec": 5, "cwd": ".", "powershell": "rtk hook copilot", "bash": "rtk hook copilot", "type": "command" }
+    ],
+    "PreToolUse": [
+      { "timeout": 5, "cwd": ".", "command": "rtk hook copilot", "type": "command" }
+    ]
+  },
+  "version": 1
+}"#;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = heal_input(&dir, reordered);
+        assert!(heal_legacy_hook_file(&path));
+    }
+
+    #[test]
+    fn heal_second_run_is_a_noop() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = heal_input(&dir, COPILOT_LEGACY_HOOK_JSON);
+        assert!(heal_legacy_hook_file(&path));
+
+        assert!(!heal_legacy_hook_file(&path));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            crate::hooks::init::COPILOT_HOOK_JSON
+        );
+    }
+
+    #[test]
+    fn heal_refuses_any_deviation_from_legacy_stock() {
+        let customized = COPILOT_LEGACY_HOOK_JSON.replace(
+            r#""bash": "rtk hook copilot""#,
+            r#""bash": "my-wrapper.sh""#,
+        );
+        let extra_key =
+            COPILOT_LEGACY_HOOK_JSON.replace(r#""version": 1,"#, r#""version": 1, "extra": true,"#);
+        let missing_pascal = COPILOT_LEGACY_HOOK_JSON.replace(
+            r#""PreToolUse": [
+      {
+        "type": "command",
+        "command": "rtk hook copilot",
+        "cwd": ".",
+        "timeout": 5
+      }
+    ],
+    "#,
+            "",
+        );
+        for content in [
+            customized.as_str(),
+            extra_key.as_str(),
+            missing_pascal.as_str(),
+            crate::hooks::init::COPILOT_HOOK_JSON,
+            "{ not json",
+            "{}",
+            "",
+        ] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let path = heal_input(&dir, content);
+            assert!(!heal_legacy_hook_file(&path), "input: {content:?}");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read"),
+                content,
+                "input: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn heal_missing_file_is_a_noop() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("rtk-rewrite.json");
+        assert!(!heal_legacy_hook_file(&path));
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("readdir").count(),
+            0,
+            "heal must not create files"
+        );
     }
 
     // --- Copilot format detection ---
