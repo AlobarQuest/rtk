@@ -352,6 +352,68 @@ pub fn run_gemini() -> Result<()> {
     Ok(())
 }
 
+// ── Vibe hook ─────────────────────────────────────────────────
+
+/// Run the Mistral Vibe CLI pre_tool hook.
+///
+/// Vibe hook contract (https://docs.mistral.ai/vibe/code/cli/hooks):
+/// - stdin: JSON with `tool_name`, `tool_input`, `hook_event_name`, etc.
+/// - Passthrough: exit 0 with empty stdout.
+/// - Rewrite: emit `{"hook_specific_output": {"tool_input": {"command": "..."}}}`.
+/// - Deny: emit `{"decision": "deny", "reason": "..."}`.
+pub fn run_vibe() -> Result<()> {
+    let input = read_stdin_limited()?;
+    if let Some(output) = run_vibe_inner(&input) {
+        let _ = writeln!(io::stdout(), "{output}");
+    }
+    Ok(())
+}
+
+fn run_vibe_inner(input: &str) -> Option<String> {
+    let json: Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
+            return None;
+        }
+    };
+
+    let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+    if tool_name != "bash" {
+        return None;
+    }
+
+    let cmd = json
+        .pointer("/tool_input/command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if cmd.is_empty() {
+        return None;
+    }
+
+    match decide_hook_action(cmd, permissions::Host::Vibe) {
+        HookDecision::Deny => {
+            audit_log("deny", cmd, "");
+            Some(r#"{"decision":"deny","reason":"Blocked by RTK permission rule"}"#.to_string())
+        }
+        HookDecision::AllowRewrite(ref rewritten) | HookDecision::AskRewrite(ref rewritten) => {
+            audit_log("rewrite", cmd, rewritten);
+            Some(vibe_rewrite_json(rewritten))
+        }
+        HookDecision::Defer => None,
+    }
+}
+
+fn vibe_rewrite_json(rewritten: &str) -> String {
+    serde_json::json!({
+        "hook_specific_output": {
+            "tool_input": { "command": rewritten }
+        },
+        "system_message": format!("rtk: rewrote to `{}`", rewritten),
+    })
+    .to_string()
+}
+
 fn print_allow() {
     let _ = writeln!(io::stdout(), r#"{{"decision":"allow"}}"#);
 }
@@ -1972,5 +2034,64 @@ mod tests {
         // so Droid runs them unchanged.
         let input = droid_input("Execute", "definitely-not-a-real-binary --foo");
         assert!(run_droid_inner(&input).is_none());
+    }
+
+    fn vibe_input(tool: &str, cmd: &str) -> String {
+        json!({
+            "session_id": "abc123",
+            "hook_event_name": "pre_tool",
+            "tool_name": tool,
+            "tool_input": { "command": cmd }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_vibe_rewrites_bash_command() {
+        let input = vibe_input("bash", "git status");
+        let out = run_vibe_inner(&input).expect("rewrite expected");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let rewritten = v
+            .pointer("/hook_specific_output/tool_input/command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        assert!(
+            rewritten.starts_with("rtk "),
+            "expected rtk-prefixed rewrite, got `{rewritten}`"
+        );
+        assert!(
+            v.get("system_message").is_some(),
+            "expected system_message for UI visibility"
+        );
+    }
+
+    #[test]
+    fn test_vibe_ignores_non_bash_tool() {
+        let input = vibe_input("read_file", "irrelevant");
+        assert!(run_vibe_inner(&input).is_none());
+    }
+
+    #[test]
+    fn test_vibe_empty_command_passthrough() {
+        let input = vibe_input("bash", "");
+        assert!(run_vibe_inner(&input).is_none());
+    }
+
+    #[test]
+    fn test_vibe_malformed_json_returns_none() {
+        assert!(run_vibe_inner("not json at all").is_none());
+        assert!(run_vibe_inner("{ unterminated").is_none());
+    }
+
+    #[test]
+    fn test_vibe_unknown_binary_passthrough() {
+        let input = vibe_input("bash", "definitely-not-a-real-binary --foo");
+        assert!(run_vibe_inner(&input).is_none());
+    }
+
+    #[test]
+    fn test_vibe_substitution_defers() {
+        let input = vibe_input("bash", "echo $(rm -rf /)");
+        assert!(run_vibe_inner(&input).is_none());
     }
 }
