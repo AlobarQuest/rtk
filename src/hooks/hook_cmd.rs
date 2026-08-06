@@ -78,7 +78,12 @@ pub fn run_copilot() -> Result<()> {
 
     match detect_format(&v) {
         HookFormat::VsCode { command } => handle_vscode(&command),
-        HookFormat::CopilotCli { command, args } => handle_copilot_cli(&command, &args),
+        HookFormat::CopilotCli { command, args } => {
+            for path in heal_legacy_copilot_configs() {
+                audit_log("self_heal", &path.display().to_string(), "");
+            }
+            handle_copilot_cli(&command, &args)
+        }
         HookFormat::CopilotIde { command } => handle_copilot_ide(&command),
         HookFormat::PassThrough => Ok(()),
     }
@@ -143,6 +148,87 @@ fn detect_format(v: &Value) -> HookFormat {
     }
 
     HookFormat::PassThrough
+}
+
+fn heal_legacy_copilot_configs() -> Vec<std::path::PathBuf> {
+    use super::constants::{COPILOT_HOOK_FILE, GITHUB_DIR, HOOKS_SUBDIR};
+
+    let mut healed = Vec::new();
+    let project = std::path::Path::new(GITHUB_DIR)
+        .join(HOOKS_SUBDIR)
+        .join(COPILOT_HOOK_FILE);
+    if heal_legacy_hook_file(&project) {
+        healed.push(project);
+    }
+    if let Ok(dir) = super::init::copilot_user_dir() {
+        let global = dir.join(HOOKS_SUBDIR).join(COPILOT_HOOK_FILE);
+        if heal_legacy_hook_file(&global) {
+            healed.push(global);
+        }
+    }
+    healed
+}
+
+// Exact camelCase entry written by pre-b754b85 `rtk init --copilot`; that
+// stale registration is the only thing routing invocations into the
+// CopilotCli arm above. Only this entry is removed — user additions stay.
+fn legacy_camelcase_entry() -> Value {
+    json!([{
+        "type": "command",
+        "bash": "rtk hook copilot",
+        "powershell": "rtk hook copilot",
+        "cwd": ".",
+        "timeoutSec": 5
+    }])
+}
+
+fn heal_legacy_hook_file(path: &std::path::Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(mut config) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let Some(hooks) = config.get("hooks").and_then(|h| h.as_object()) else {
+        return false;
+    };
+    if hooks.get("preToolUse") != Some(&legacy_camelcase_entry()) {
+        return false;
+    }
+    let pascalcase_still_registered = hooks
+        .get("PreToolUse")
+        .and_then(|p| p.as_array())
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e.get("command").and_then(|c| c.as_str()) == Some("rtk hook copilot"))
+        });
+    if !pascalcase_still_registered {
+        return false;
+    }
+    let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return false;
+    };
+    hooks.shift_remove("preToolUse");
+
+    let stock = serde_json::from_str::<Value>(super::init::COPILOT_HOOK_JSON).ok();
+    let content = if stock.is_some_and(|s| s == config) {
+        super::init::COPILOT_HOOK_JSON.to_string()
+    } else {
+        let Ok(mut pretty) = serde_json::to_string_pretty(&config) else {
+            return false;
+        };
+        pretty.push('\n');
+        pretty
+    };
+    let tmp = path.with_extension(format!("heal.{}", std::process::id()));
+    std::fs::write(&tmp, content)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|_| {
+            // Cleanup of our own temp file after a failed atomic write.
+            let _ = std::fs::remove_file(&tmp); // nosemgrep: filesystem-deletion
+        })
+        .is_ok()
 }
 
 fn get_rewritten(cmd: &str) -> Option<String> {

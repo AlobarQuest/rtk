@@ -4797,7 +4797,7 @@ fn strip_vibe_rtk_entry(content: &str) -> Option<String> {
 // process spawn per tool call for no behavioral benefit (confirmed live:
 // Copilot CLI honors the PascalCase-only schema on its own, receiving the
 // same `tool_name`/`tool_input.command` shape either way).
-const COPILOT_HOOK_JSON: &str = r#"{
+pub(crate) const COPILOT_HOOK_JSON: &str = r#"{
   "version": 1,
   "hooks": {
     "PreToolUse": [
@@ -4969,7 +4969,7 @@ fn uninstall_copilot_at(base: &Path, ctx: InitContext) -> Result<Vec<String>> {
     Ok(removed)
 }
 
-fn copilot_user_dir() -> Result<PathBuf> {
+pub(crate) fn copilot_user_dir() -> Result<PathBuf> {
     if let Ok(custom) = std::env::var(COPILOT_HOME_ENV) {
         return Ok(PathBuf::from(custom));
     }
