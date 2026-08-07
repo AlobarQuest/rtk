@@ -5,6 +5,24 @@ All notable changes to rtk (Rust Token Killer) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.45.0](https://github.com/rtk-ai/rtk/compare/v0.44.2...v0.45.0) (2026-08-07)
+
+
+### Features
+
+* **hooks:** add transparent hook support for Mistral Vibe CLI ([d480f1e](https://github.com/rtk-ai/rtk/commit/d480f1ec481fbd30bce16269a31d5d063bb96023))
+* **hooks:** transparent pre_tool rewrite for Mistral Vibe CLI (closes [#800](https://github.com/rtk-ai/rtk/issues/800)) ([de1f568](https://github.com/rtk-ai/rtk/commit/de1f568c50ec4eeaba6b89695050fc08dc6a9d54))
+* **rewrite:** rewrite multiline blocks ([3044911](https://github.com/rtk-ai/rtk/commit/3044911b50bc59777d0dedbcd17eb513305c8de5))
+
+
+### Bug Fixes
+
+* **hooks:** copilot self heal dual hooks (drop camelCase entry) ([9936b2b](https://github.com/rtk-ai/rtk/commit/9936b2b9ce560283d7be21fdfad027cb537be69c))
+* **hooks:** heal only rtk's own legacy camelCase entry, keep user config ([db31da9](https://github.com/rtk-ai/rtk/commit/db31da9af4d46ece27f996f350ecbaf6b724e208))
+* **hooks:** self-heal stale dual-schema Copilot hook config ([d1f7139](https://github.com/rtk-ai/rtk/commit/d1f71398fde6e071c416cb2b6dbe9665b2bfb488))
+* **hooks:** stop Copilot from silently deciding permission on unconfigured commands ([8722378](https://github.com/rtk-ai/rtk/commit/8722378a22d197ad8cc2e86d40b468cc8fb8571d))
+* **vibe:** address PR review — exit code contract, tests, telemetry, docs ([1847b07](https://github.com/rtk-ai/rtk/commit/1847b07f7a87fecba7fe0e39ade3d360c897dd66))
+
 ## [0.44.2](https://github.com/rtk-ai/rtk/compare/v0.44.1...v0.44.2) (2026-08-01)
 
 
