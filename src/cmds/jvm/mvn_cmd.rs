@@ -146,6 +146,15 @@ fn is_boilerplate(line: &str) -> bool {
     BOILER_PREFIXES.iter().any(|p| line.starts_with(p)) || line.trim_end() == "[ERROR]"
 }
 
+/// Blank separator line as emitted by both binaries: plain `mvn` writes a
+/// truly empty line between a Surefire failure trail and the next section;
+/// `mvnd` routes everything through the daemon logger, which prefixes even
+/// blank lines with `[INFO] ` (see `mvnd_test_fail_raw.txt`). Both terminate
+/// (or bridge, in the re-arm state) a failure trail.
+fn is_blank_separator(line: &str) -> bool {
+    line.is_empty() || line.trim_end() == "[INFO]"
+}
+
 /// `[ERROR] FQN.method -- Time elapsed: 0.030 s <<< FAILURE!` (or `<<< ERROR!`).
 /// Distinguished from CLOSE by call position: only consulted when
 /// `in_block == false` (CLOSE only occurs while a block is open). A
@@ -327,7 +336,7 @@ impl<'a> SurefireBlock<'a> {
         }
 
         if self.failure_trail {
-            if line.is_empty() {
+            if is_blank_separator(line) {
                 if !self.drop_trail {
                     out.push('\n');
                 }
@@ -351,7 +360,7 @@ impl<'a> SurefireBlock<'a> {
         }
 
         if let Some(dropped) = self.trail_rearm {
-            if line.is_empty() {
+            if is_blank_separator(line) {
                 // Tolerate extra blanks between per-test blocks: stay armed,
                 // let the blank fall through (outer keep-lists drop it).
                 return SurefireStep::Passthrough;
@@ -1095,6 +1104,91 @@ mod tests {
     #[test]
     fn mvnd_binary_is_never_the_wrapper() {
         assert_eq!(mvn_binary(true), "mvnd");
+    }
+
+    // ── Maven Daemon fixtures ────────────────────────────────────────────────
+    //
+    // Real output captured with Apache Maven Daemon 1.0.6 (Maven 3.9.16,
+    // non-TTY) on the skeleton projects under `tests/fixtures/`. Non-TTY mvnd
+    // output is plain Maven output plus daemon-specific lines with no
+    // `[INFO]`-only shape the keep-lists would retain: `Processing build on
+    // daemon <id>`, `BuildTimeEventSpy is registered.`, the SmartBuilder
+    // thread-count line, and the concurrency stats block. Parallel reactor
+    // builds additionally prefix per-module log lines with `[module] `.
+
+    /// Warmed `mvnd clean install` on the multi-module skeleton: the parallel
+    /// reactor case. Per-module `[module] [INFO] …` lines and daemon chatter
+    /// are noise; the (unprefixed) reactor summary and footer are the signal.
+    #[test]
+    fn mvnd_reactor_pass_keeps_summary_drops_daemon_noise() {
+        let i = include_str!("../../../tests/fixtures/mvnd_reactor_pass_raw.txt");
+        let o = filter_package(i);
+        assert!(o.contains("[INFO] Reactor Summary for multi-module-skeleton 1.0.0-SNAPSHOT:"));
+        assert!(o.contains("child-a ............................................ SUCCESS"));
+        assert!(o.contains("child-b ............................................ SUCCESS"));
+        assert!(o.contains("[INFO] BUILD SUCCESS"));
+        assert!(o.contains("[INFO] Total time:"));
+        // Daemon chatter and `[module] `-prefixed parallel lines are dropped.
+        assert!(!o.contains("Processing build on daemon"));
+        assert!(!o.contains("BuildTimeEventSpy"));
+        assert!(!o.contains("SmartBuilder"));
+        assert!(!o.contains("Bottleneck projects"));
+        assert!(!o.contains("[child-a] [INFO]"));
+        assert!(!o.contains("[child-b] [INFO]"));
+    }
+
+    #[test]
+    fn mvnd_reactor_pass_savings() {
+        let i = include_str!("../../../tests/fixtures/mvnd_reactor_pass_raw.txt");
+        let o = filter_package(i);
+        let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
+        assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
+    }
+
+    /// Warmed `mvnd test` on the failing skeleton (exit code 1). Same Surefire
+    /// shape as `mvn`: failure names, messages, and user stack frames survive;
+    /// daemon chatter, framework frames, and help boilerplate do not.
+    #[test]
+    fn mvnd_test_fail_preserves_failures() {
+        let i = include_str!("../../../tests/fixtures/mvnd_test_fail_raw.txt");
+        let o = filter_surefire(i);
+        assert!(o.contains("[INFO] Running com.example.rtk.BoomTest"));
+        assert!(o.contains("[INFO] Running com.example.rtk.CalcTest"));
+        assert!(o.contains("failOne: addition should equal five ==> expected: <5> but was: <4>"));
+        assert!(o.contains("at com.example.rtk.CalcTest.failOne(CalcTest.java:12)"));
+        assert!(o.contains("[ERROR]   CalcTest.failOne:12"));
+        assert!(o.contains("[ERROR] Tests run: 16, Failures: 1, Errors: 2, Skipped: 0"));
+        // Passing classes are collapsed entirely.
+        assert!(!o.contains("PassOneTest"));
+        assert!(o.contains("[INFO] BUILD FAILURE"));
+        assert!(o.contains("[ERROR] Failed to execute goal"));
+        // Daemon chatter, framework frames, and boilerplate are dropped.
+        assert!(!o.contains("Processing build on daemon"));
+        assert!(!o.contains("BuildTimeEventSpy"));
+        assert!(!o.contains("SmartBuilder"));
+        assert!(!o.contains("at java.base/"));
+        assert!(!o.contains("Re-run Maven"));
+    }
+
+    #[test]
+    fn mvnd_test_fail_savings() {
+        let i = include_str!("../../../tests/fixtures/mvnd_test_fail_raw.txt");
+        let o = filter_surefire(i);
+        let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
+        assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
+    }
+
+    /// `mvnd compile` on a syntax error (exit code 1): compile diagnostics
+    /// (file, coordinates, message) survive the compile filter.
+    #[test]
+    fn mvnd_compile_error_preserves_diagnostics() {
+        let i = include_str!("../../../tests/fixtures/mvnd_compile_error_raw.txt");
+        let o = filter_compile(i);
+        assert!(o.contains("Calc.java:[5,21] ';' expected"));
+        assert!(o.contains("[INFO] BUILD FAILURE"));
+        assert!(o.contains("[ERROR] Failed to execute goal"));
+        assert!(!o.contains("Processing build on daemon"));
+        assert!(!o.contains("BuildTimeEventSpy"));
     }
 
     // ── Surefire filter ──────────────────────────────────────────────────────
