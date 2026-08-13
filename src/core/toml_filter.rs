@@ -1426,6 +1426,15 @@ make[1]: Leaving directory '/home/user/project/docs'
         let capitalized = find_filter_in("java -jar build/libs/MySpringApp.jar", &filters)
             .expect("a jar with 'Spring' capitalized in its filename must still match");
         assert_eq!(capitalized.name, "spring-boot");
+
+        assert!(
+            find_filter_in(
+                "java -jar /opt/spring-cache/other-tool.jar",
+                &filters
+            )
+            .is_none_or(|f| f.name != "spring-boot"),
+            "'spring' appearing only in a directory segment (not the jar filename itself) must not activate the spring-boot filter"
+        );
     }
 
     #[test]
@@ -1462,6 +1471,9 @@ make[1]: Leaving directory '/home/user/project/docs'
         let plain = find_filter_in("ssh user@host", &filters)
             .expect("plain ssh invocation must still match");
         assert_eq!(plain.name, "ssh");
+
+        let bare = find_filter_in("ssh", &filters).expect("bare ssh with no args must still match");
+        assert_eq!(bare.name, "ssh");
     }
 
     // --- Edge cases ---
