@@ -1405,6 +1405,61 @@ make[1]: Leaving directory '/home/user/project/docs'
         );
     }
 
+    #[test]
+    fn test_spring_boot_match_command_requires_spring_named_jar() {
+        let filters = make_filters(BUILTIN_TOML);
+
+        assert!(
+            find_filter_in("java -jar build/libs/my-other-tool.jar", &filters)
+                .is_none_or(|f| f.name != "spring-boot"),
+            "a non-Spring jar must not activate the spring-boot filter"
+        );
+
+        let spring_jar = find_filter_in("java -jar build/libs/my-spring-app.jar", &filters)
+            .expect("a jar with 'spring' in its filename must still match");
+        assert_eq!(spring_jar.name, "spring-boot");
+
+        let mvn_run = find_filter_in("mvn spring-boot:run", &filters)
+            .expect("mvn spring-boot:run must still match");
+        assert_eq!(mvn_run.name, "spring-boot");
+    }
+
+    #[test]
+    fn test_liquibase_match_command_ignores_path_substring() {
+        let filters = make_filters(BUILTIN_TOML);
+
+        assert!(
+            find_filter_in("rm -rf /opt/liquibase", &filters).is_none_or(|f| f.name != "liquibase"),
+            "'liquibase' appearing only as a path argument must not activate the liquibase filter"
+        );
+
+        let bare = find_filter_in("liquibase status", &filters)
+            .expect("bare liquibase invocation must still match");
+        assert_eq!(bare.name, "liquibase");
+
+        let full_path = find_filter_in("/usr/local/bin/liquibase update", &filters)
+            .expect("path-qualified liquibase invocation must still match");
+        assert_eq!(full_path.name, "liquibase");
+    }
+
+    #[test]
+    fn test_ssh_match_command_excludes_ssh_dash_utilities() {
+        let filters = make_filters(BUILTIN_TOML);
+
+        assert!(
+            find_filter_in("ssh-keygen -t ed25519", &filters).is_none_or(|f| f.name != "ssh"),
+            "ssh-keygen must not activate the plain ssh connection filter"
+        );
+        assert!(
+            find_filter_in("ssh-add ~/.ssh/id_ed25519", &filters).is_none_or(|f| f.name != "ssh"),
+            "ssh-add must not activate the plain ssh connection filter"
+        );
+
+        let plain = find_filter_in("ssh user@host", &filters)
+            .expect("plain ssh invocation must still match");
+        assert_eq!(plain.name, "ssh");
+    }
+
     // --- Edge cases ---
 
     #[test]
