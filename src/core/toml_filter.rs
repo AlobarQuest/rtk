@@ -1422,6 +1422,10 @@ make[1]: Leaving directory '/home/user/project/docs'
         let mvn_run = find_filter_in("mvn spring-boot:run", &filters)
             .expect("mvn spring-boot:run must still match");
         assert_eq!(mvn_run.name, "spring-boot");
+
+        let capitalized = find_filter_in("java -jar build/libs/MySpringApp.jar", &filters)
+            .expect("a jar with 'Spring' capitalized in its filename must still match");
+        assert_eq!(capitalized.name, "spring-boot");
     }
 
     #[test]
