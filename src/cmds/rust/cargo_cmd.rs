@@ -1439,6 +1439,9 @@ pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    const TINY_BUILD_SUCCESS_OUTPUT: &str =
+        "    Finished dev [unoptimized + debuginfo] target(s) in 0.01s\n";
+
     use super::*;
     use crate::core::args_utils::restore_double_dash_with_raw;
 
@@ -1561,7 +1564,7 @@ mod tests {
 
     #[test]
     fn test_filter_cargo_build_success_uses_raw_when_summary_is_larger() {
-        let output = "    Finished dev [unoptimized + debuginfo] target(s) in 0.01s\n";
+        let output = TINY_BUILD_SUCCESS_OUTPUT;
         let result = filter_cargo_build(output);
         assert_eq!(result, output);
     }
@@ -2325,7 +2328,7 @@ error: test run failed
 
     #[test]
     fn test_cargo_build_stream_success_uses_raw_when_summary_is_larger() {
-        let input = "    Finished dev [unoptimized + debuginfo] target(s) in 0.01s\n";
+        let input = TINY_BUILD_SUCCESS_OUTPUT;
         let mut f = BlockStreamFilter::new(CargoBuildHandler::with_label("build"));
         let result = run_block_filter(&mut f, input, 0);
         assert_eq!(result, input);
