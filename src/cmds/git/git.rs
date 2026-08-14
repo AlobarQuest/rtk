@@ -432,9 +432,9 @@ fn run_log(
     global_args: &[String],
 ) -> Result<i32> {
     if requests_raw_log_output(args) {
-        let mut passthrough_args = Vec::with_capacity(args.len() + 1);
-        passthrough_args.push(OsString::from("log"));
-        passthrough_args.extend(args.iter().map(OsString::from));
+        let passthrough_args: Vec<OsString> = std::iter::once(OsString::from("log"))
+            .chain(args.iter().map(OsString::from))
+            .collect();
         return run_passthrough(&passthrough_args, global_args, verbose);
     }
 
@@ -518,12 +518,14 @@ fn run_log(
 }
 
 fn requests_raw_log_output(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "-p" | "-u" | "--patch" | "--patch-with-raw" | "--patch-with-stat"
-        )
-    })
+    args.iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-p" | "-u" | "--patch" | "--patch-with-raw" | "--patch-with-stat"
+            )
+        })
 }
 
 /// Filter git log output: truncate long messages, cap lines
@@ -2753,6 +2755,17 @@ A  added.rs
             let args = vec![flag.to_string()];
             assert!(requests_raw_log_output(&args), "{flag} should pass through");
         }
+    }
+
+    #[test]
+    fn test_patch_flag_after_pathspec_separator_is_ignored() {
+        // `git log -- -p` means "show history for a path literally named -p",
+        // not "show patches" — the flag lookalike appears after `--`.
+        let args = vec!["--".to_string(), "-p".to_string()];
+        assert!(
+            !requests_raw_log_output(&args),
+            "-p after -- is a pathspec, not a patch flag, and should stay on the filtered path"
+        );
     }
 
     #[test]
