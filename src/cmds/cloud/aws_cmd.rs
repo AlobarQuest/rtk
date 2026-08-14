@@ -243,8 +243,8 @@ fn run_generic(subcommand: &str, args: &[String], verbose: u8, full_sub: &str) -
     }
 
     let output = cmd.output().context("Failed to run aws CLI")?;
-    let raw = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let raw = crate::core::utils::decode_process_output(&output.stdout);
+    let stderr = crate::core::utils::decode_process_output(&output.stderr);
 
     if !output.status.success() {
         timer.track(
@@ -316,8 +316,8 @@ fn run_aws_json(
     let output = cmd
         .output()
         .context(format!("Failed to run {}", cmd_desc))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = crate::core::utils::decode_process_output(&output.stdout);
+    let stderr = crate::core::utils::decode_process_output(&output.stderr);
 
     if !output.status.success() {
         eprintln!("{}", stderr.trim());
@@ -388,8 +388,8 @@ fn run_s3_ls(extra_args: &[String], verbose: u8) -> Result<i32> {
     }
 
     let output = cmd.output().context("Failed to run aws s3 ls")?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = crate::core::utils::decode_process_output(&output.stdout);
+    let stderr = crate::core::utils::decode_process_output(&output.stderr);
     let raw = if stderr.is_empty() {
         stdout.clone()
     } else {
@@ -438,8 +438,8 @@ fn run_s3_transfer(operation: &str, extra_args: &[String], verbose: u8) -> Resul
     let output = cmd
         .output()
         .context(format!("Failed to run {}", cmd_label))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = crate::core::utils::decode_process_output(&output.stdout);
+    let stderr = crate::core::utils::decode_process_output(&output.stderr);
     let raw = if stderr.is_empty() {
         stdout.clone()
     } else {

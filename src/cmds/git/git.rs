@@ -1037,8 +1037,8 @@ fn run_commit(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         .output()
         .context("Failed to run git commit")?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = crate::core::utils::decode_process_output(&output.stdout);
+    let stderr = crate::core::utils::decode_process_output(&output.stderr);
     let exit_code = exit_code_from_output(&output, "git commit");
     let raw_output = format!("{}\n{}", stdout, stderr);
 
@@ -2956,7 +2956,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
             .args(["branch", "--list", branch])
             .output()
             .expect("git branch --list should work");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = crate::core::utils::decode_process_output(&output.stdout);
         assert!(
             stdout.contains(branch),
             "Branch '{}' was not created. run_branch silently swallowed the creation.",
@@ -2977,7 +2977,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
             .args(["branch", "--list", branch])
             .output()
             .expect("git branch --list should work");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = crate::core::utils::decode_process_output(&output.stdout);
         assert!(
             stdout.contains(branch),
             "Branch '{}' was not created from commit.",
@@ -3080,8 +3080,8 @@ no changes added to commit (use "git add" and/or "git commit -a")
         );
 
         // Message should be on stderr, not stdout
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = crate::core::utils::decode_process_output(&output.stderr);
+        let stdout = crate::core::utils::decode_process_output(&output.stdout);
         assert!(
             stderr.to_lowercase().contains("not a git repository"),
             "Expected 'not a git repository' on stderr, got stderr={:?}, stdout={:?}",

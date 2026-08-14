@@ -260,7 +260,7 @@ fn main() {{
             .expect("failed to run rtk read");
 
         assert!(output.status.success());
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = crate::core::utils::decode_process_output(&output.stdout);
         assert!(stdout.contains("alpha"), "first file content missing");
         assert!(stdout.contains("charlie"), "second file content missing");
     }
@@ -280,8 +280,8 @@ fn main() {{
             .expect("failed to run rtk read");
 
         assert!(!output.status.success(), "should exit non-zero on missing file");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = crate::core::utils::decode_process_output(&output.stdout);
+        let stderr = crate::core::utils::decode_process_output(&output.stderr);
         assert!(stdout.contains("valid content"), "valid file should still be printed");
         assert!(stderr.contains("rtk_nonexistent_file"), "should report missing file on stderr");
     }
@@ -298,7 +298,7 @@ fn main() {{
             .output()
             .expect("failed to run rtk read");
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = crate::core::utils::decode_process_output(&output.stderr);
         assert!(
             stderr.contains("stdin specified more than once"),
             "should warn about duplicate stdin, got stderr: {}",

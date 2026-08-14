@@ -153,8 +153,8 @@ pub fn run_other(args: &[OsString], verbose: u8) -> Result<i32> {
         .output()
         .with_context(|| format!("Failed to run go {}", subcommand))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = crate::core::utils::decode_process_output(&output.stdout);
+    let stderr = crate::core::utils::decode_process_output(&output.stderr);
     let raw = format!("{}\n{}", stdout, stderr);
 
     print!("{}", stdout);
@@ -181,8 +181,8 @@ fn detect_go_tool_golangci_version() -> u32 {
 
     match output {
         Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stdout = crate::core::utils::decode_process_output(&o.stdout);
+            let stderr = crate::core::utils::decode_process_output(&o.stderr);
             let version_text = if stdout.trim().is_empty() {
                 &*stderr
             } else {
@@ -269,8 +269,8 @@ fn run_go_tool_golangci_lint(args: &[OsString], verbose: u8) -> Result<i32> {
         .output()
         .context("Failed to run go tool golangci-lint")?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = crate::core::utils::decode_process_output(&output.stdout);
+    let stderr = crate::core::utils::decode_process_output(&output.stderr);
     let raw = format!("{}\n{}", stdout, stderr);
 
     // v2 outputs JSON on first line + trailing text; v1 outputs just JSON

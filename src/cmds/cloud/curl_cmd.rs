@@ -43,8 +43,8 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     // Skip filtering on failure: curl can return HTML error bodies that would
     // be misleading to summarize, and we want the real exit code surfaced.
     if !output.status.success() {
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let stderr_str = crate::core::utils::decode_process_output(&output.stderr);
+        let stdout_str = crate::core::utils::decode_process_output(&output.stdout);
         let msg = if stderr_str.trim().is_empty() {
             stdout_str.trim().to_string()
         } else {
@@ -72,7 +72,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         return Ok(exit_code);
     }
 
-    let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+    let raw = crate::core::utils::decode_process_output(&output.stdout);
     let is_tty = std::io::stdout().is_terminal();
     let filtered = filter_curl_output(&raw, is_tty);
 
