@@ -342,26 +342,73 @@ section "wc"
 bench "wc" "wc Cargo.toml src/main.rs" "$RTK wc Cargo.toml src/main.rs"
 
 # ===================
-# curl
+# curl / wget — fully offline. mockhttp.org was both a network dependency and
+# non-deterministic (its /json output is random), which made the benchmark flaky.
+# Serve fixed fixtures locally instead. The JSON is pretty-printed on purpose so
+# `rtk` actually exercises JSON minification (a pre-minified body leaves nothing
+# to compact).
 # ===================
-section "curl"
-if command -v curl &> /dev/null; then
-  CURL_JSON_FIXTURE=$(mktemp)
-  cat > "$CURL_JSON_FIXTURE" << 'JSONEOF'
-{"message":"Hello from RTK benchmark","status":"success","code":200}
+NET_FIXTURE_DIR="$(mktemp -d)"
+readonly NET_HTTP_PORT=8899   # loopback-only server shared by curl + wget
+NET_HTTP_PID=""
+cleanup_net_fixtures() {
+  [ -n "$NET_HTTP_PID" ] && kill "$NET_HTTP_PID" 2>/dev/null
+  rm -rf "$NET_FIXTURE_DIR"
+  # `rtk wget <url>/data.json` saves to ./data.json (default basename); remove
+  # that download and any numbered duplicates from repeated runs.
+  rm -f data.json data.json.* 2>/dev/null
+}
+trap cleanup_net_fixtures EXIT
+
+cat > "$NET_FIXTURE_DIR/data.json" << 'JSONEOF'
+{
+    "message": "Hello from RTK benchmark",
+    "status": "success",
+    "code": 200,
+    "items": [
+        { "id": 1, "name": "first" },
+        { "id": 2, "name": "second" }
+    ]
+}
 JSONEOF
-  bench "curl json" "curl -s file://$CURL_JSON_FIXTURE" "$RTK curl file://$CURL_JSON_FIXTURE"
-  rm -f "$CURL_JSON_FIXTURE"
-  bench "curl text" "curl -s https://mockhttp.org/robots.txt" "$RTK curl https://mockhttp.org/robots.txt"
+cat > "$NET_FIXTURE_DIR/robots.txt" << 'TXTEOF'
+User-agent: *
+Disallow: /private/
+Allow: /
+Sitemap: https://example.com/sitemap.xml
+TXTEOF
+
+# Bring up a loopback HTTP server once so both curl and wget get real response
+# headers (`Content-Type: application/json`) — that's what lets rtk detect JSON
+# and minify it. file:// carries no headers, so it can't demonstrate that path.
+NET_HTTP_URL=""
+if command -v python3 &> /dev/null; then
+  ( cd "$NET_FIXTURE_DIR" && exec python3 -m http.server "$NET_HTTP_PORT" --bind 127.0.0.1 ) >/dev/null 2>&1 &
+  NET_HTTP_PID=$!
+  for _ in $(seq 1 25); do
+    curl -s -o /dev/null "http://127.0.0.1:$NET_HTTP_PORT/data.json" 2>/dev/null \
+      && { NET_HTTP_URL="http://127.0.0.1:$NET_HTTP_PORT"; break; }
+    sleep 0.2
+  done
 fi
 
-# ===================
-# wget
-# ===================
-if command -v wget &> /dev/null; then
+section "curl"
+if command -v curl &> /dev/null; then
+  if [ -n "$NET_HTTP_URL" ]; then
+    bench "curl json" "curl -s $NET_HTTP_URL/data.json" "$RTK curl $NET_HTTP_URL/data.json"
+    bench "curl text" "curl -s $NET_HTTP_URL/robots.txt" "$RTK curl $NET_HTTP_URL/robots.txt"
+  else
+    # No python3 to host a local server — fall back to file:// (no headers, so
+    # no JSON minification, but still fully offline and deterministic).
+    bench "curl json" "curl -s file://$NET_FIXTURE_DIR/data.json" "$RTK curl file://$NET_FIXTURE_DIR/data.json"
+    bench "curl text" "curl -s file://$NET_FIXTURE_DIR/robots.txt" "$RTK curl file://$NET_FIXTURE_DIR/robots.txt"
+  fi
+fi
+
+# wget — rtk doesn't accept file://, so it needs the loopback server above.
+if command -v wget &> /dev/null && [ -n "$NET_HTTP_URL" ]; then
   section "wget"
-  bench "wget" "wget -qO- https://mockhttp.org/json" "$RTK wget https://mockhttp.org/json"
-  rm -f json 2>/dev/null
+  bench "wget" "wget -qO- $NET_HTTP_URL/data.json" "$RTK wget $NET_HTTP_URL/data.json"
 fi
 
 # ===================
