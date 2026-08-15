@@ -196,6 +196,11 @@ impl BlockHandler for CargoTestHandler {
     }
 
     fn format_summary(&self, _exit_code: i32, raw: &str) -> Option<String> {
+        // Same never-worse guard as CargoBuildHandler (#3430 review): if the
+        // compacted summary ends up larger than the raw output (e.g. a tiny
+        // `cargo test` run), keep the raw output instead of "compacting" it
+        // into something bigger.
+        let summary = (|| -> Option<String> {
         if self.summary_lines.is_empty() {
             let json = extract_json_diagnostics(raw);
             if self.has_compile_errors || !json.errors.is_empty() {
@@ -251,6 +256,8 @@ impl BlockHandler for CargoTestHandler {
         }
 
         None
+        })();
+        summary.map(|s| crate::core::guard::never_worse(raw, &s).to_string())
     }
 }
 
