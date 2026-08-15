@@ -6,8 +6,9 @@ use std::sync::mpsc;
 #[cfg(test)]
 use regex::Regex;
 
-/// Read `reader` line by line, decoding each line lossily (invalid UTF-8
-/// bytes become U+FFFD) instead of erroring.
+/// Read `reader` line by line, decoding each line through the console code
+/// page and falling back to lossy UTF-8 (invalid bytes become U+FFFD) instead
+/// of erroring.
 ///
 /// `BufRead::lines()` returns `Err` for a non-UTF-8 line, and callers
 /// commonly chain `.map_while(Result::ok)` to skip bad lines — but
@@ -16,6 +17,11 @@ use regex::Regex;
 /// every line after it too, not just the bad one. This reads raw bytes and
 /// never fails on the source encoding, so a garbled line still surfaces
 /// instead of vanishing along with everything downstream of it.
+///
+/// The OEM/ANSI lines this guards against are exactly what
+/// [`decode_process_output`](super::utils::decode_process_output) exists to
+/// read, so the streamed path decodes them the same way the captured path
+/// does rather than going straight to U+FFFD.
 fn read_lines_lossy(reader: impl Read) -> impl Iterator<Item = String> {
     BufReader::new(reader).split(b'\n').filter_map(|res| {
         let mut buf = match res {
@@ -28,7 +34,7 @@ fn read_lines_lossy(reader: impl Read) -> impl Iterator<Item = String> {
         if buf.last() == Some(&b'\r') {
             buf.pop();
         }
-        Some(String::from_utf8_lossy(&buf).into_owned())
+        Some(super::utils::decode_process_output(&buf))
     })
 }
 

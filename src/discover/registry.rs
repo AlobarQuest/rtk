@@ -2762,7 +2762,7 @@ mod tests {
             !output.status.success(),
             "Should exit non-zero (no rewrite)"
         );
-        let stderr = crate::core::utils::decode_process_output(&output.stderr);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("RTK_DISABLED=1 detected"),
             "Should warn on stderr, got: {}",
