@@ -517,15 +517,80 @@ fn run_log(
     Ok(0)
 }
 
+/// True for git log/diff options that take their value as a separate,
+/// space-delimited token (e.g. `--grep -p` searches messages for the
+/// literal string "-p"; it does not request patch output). Consuming
+/// that value token keeps flag-lookalike values from being misread as
+/// the corresponding boolean flag.
+fn consumes_next_token_as_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--after"
+            | "--anchored"
+            | "--author"
+            | "--before"
+            | "--color-moved-ws"
+            | "--committer"
+            | "--date"
+            | "--decorate-refs"
+            | "--decorate-refs-exclude"
+            | "--diff-merges"
+            | "--dst-prefix"
+            | "--encoding"
+            | "--exclude"
+            | "--expand-tabs"
+            | "--find-object"
+            | "--glob"
+            | "--grep"
+            | "--grep-reflog"
+            | "--inter-hunk-context"
+            | "--line-prefix"
+            | "--max-depth"
+            | "--max-parents"
+            | "--min-parents"
+            | "--output"
+            | "--output-indicator-context"
+            | "--output-indicator-new"
+            | "--output-indicator-old"
+            | "--rotate-to"
+            | "--since"
+            | "--since-as-filter"
+            | "--skip"
+            | "--skip-to"
+            | "--src-prefix"
+            | "--stat-count"
+            | "--stat-name-width"
+            | "--stat-width"
+            | "--unified"
+            | "--until"
+            | "--word-diff-regex"
+            | "--ws-error-highlight"
+            | "-G"
+            | "-I"
+            | "-L"
+            | "-O"
+            | "-S"
+            | "-U"
+            | "-l"
+            | "-n"
+    )
+}
+
 fn requests_raw_log_output(args: &[String]) -> bool {
-    args.iter()
-        .take_while(|arg| *arg != "--")
-        .any(|arg| {
-            matches!(
-                arg.as_str(),
-                "-p" | "-u" | "--patch" | "--patch-with-raw" | "--patch-with-stat"
-            )
-        })
+    let mut iter = args.iter().take_while(|arg| *arg != "--");
+    while let Some(arg) = iter.next() {
+        if consumes_next_token_as_value(arg.as_str()) {
+            iter.next(); // skip the value token, whatever it looks like
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "-p" | "-u" | "--patch" | "--patch-with-raw" | "--patch-with-stat"
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Filter git log output: truncate long messages, cap lines
@@ -1135,7 +1200,11 @@ fn format_checkout_output(args: &[String], raw: &str, exit_code: i32) -> String 
 
 fn format_checkout_success(args: &[String], raw: &str) -> String {
     if let Some(restored) = checkout_restored_count(args) {
-        return format!("ok {} {}", restored, pluralize(restored, "file restored", "files restored"));
+        return format!(
+            "ok {} {}",
+            restored,
+            pluralize(restored, "file restored", "files restored")
+        );
     }
     if let Some(branch) = checkout_reset_branch_arg(args) {
         return format!("ok {}", branch);
@@ -1233,7 +1302,11 @@ fn quoted_suffix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
-    if count == 1 { singular } else { plural }
+    if count == 1 {
+        singular
+    } else {
+        plural
+    }
 }
 
 fn filter_checkout_failure(raw: &str) -> String {
@@ -1251,8 +1324,9 @@ fn filter_checkout_failure(raw: &str) -> String {
             || trimmed.starts_with("CONFLICT");
 
         if is_header {
-            in_file_list =
-                trimmed.contains("following") && trimmed.contains("files") && trimmed.ends_with(':');
+            in_file_list = trimmed.contains("following")
+                && trimmed.contains("files")
+                && trimmed.ends_with(':');
             important.push(trimmed.to_string());
             continue;
         }
@@ -1786,7 +1860,12 @@ fn run_stash(
                 compact_stash_stat(&result.stdout)
             };
             let shown = crate::core::runner::emit_guarded(&filtered, None, &result.stdout);
-            timer.track("git stash show", "rtk git stash show", &result.stdout, &shown);
+            timer.track(
+                "git stash show",
+                "rtk git stash show",
+                &result.stdout,
+                &shown,
+            );
         }
         Some("apply") | Some("branch") | Some("clear") | Some("create") | Some("drop")
         | Some("export") | Some("import") | Some("pop") | Some("store") => {
@@ -1920,7 +1999,7 @@ fn compress_stat_summary(summary: &str) -> String {
         .replace("deletion(-)", "-")
         .replace("files changed", "changed")
         .replace("file changed", "changed")
-		.replace(",", "")
+        .replace(",", "")
 }
 
 fn parse_stash_stat(stat: &str) -> (Vec<String>, String) {
@@ -2376,7 +2455,12 @@ mod tests {
         let (files, summary) = parse_stash_stat(raw);
         assert_eq!(
             files,
-            vec!["del.md 2 -", "keep.md 5 +-", "logo.bin (binary)", "new.rs 40 +"]
+            vec![
+                "del.md 2 -",
+                "keep.md 5 +-",
+                "logo.bin (binary)",
+                "new.rs 40 +"
+            ]
         );
         assert_eq!(summary, "4 files changed, 44 insertions(+), 3 deletions(-)");
     }
@@ -2390,7 +2474,10 @@ mod tests {
     #[test]
     fn test_compact_stash_stat_passthrough_numstat() {
         let raw = "0\t1\tdel.md\n3\t2\tkeep.md\n1\t0\tn1.rs\n";
-        assert_eq!(compact_stash_stat(raw), "0\t1\tdel.md\n3\t2\tkeep.md\n1\t0\tn1.rs");
+        assert_eq!(
+            compact_stash_stat(raw),
+            "0\t1\tdel.md\n3\t2\tkeep.md\n1\t0\tn1.rs"
+        );
     }
 
     #[test]
@@ -2464,7 +2551,11 @@ mod tests {
         let compact = format!("{}\n{}", files.join("\n"), summary);
         let savings =
             100.0 - (estimate_tokens(&compact) as f64 / estimate_tokens(raw) as f64 * 100.0);
-        assert!(savings >= 40.0, "expected >=40% savings, got {:.1}%", savings);
+        assert!(
+            savings >= 40.0,
+            "expected >=40% savings, got {:.1}%",
+            savings
+        );
     }
 
     #[test]
@@ -2751,7 +2842,13 @@ A  added.rs
 
     #[test]
     fn test_patch_log_flags_request_raw_output() {
-        for flag in ["-p", "-u", "--patch", "--patch-with-raw", "--patch-with-stat"] {
+        for flag in [
+            "-p",
+            "-u",
+            "--patch",
+            "--patch-with-raw",
+            "--patch-with-stat",
+        ] {
             let args = vec![flag.to_string()];
             assert!(requests_raw_log_output(&args), "{flag} should pass through");
         }
@@ -2777,6 +2874,30 @@ A  added.rs
                 "{flag} should remain on the filtered log path"
             );
         }
+    }
+
+    #[test]
+    fn test_patch_flag_as_value_of_grep_is_not_misdetected() {
+        // `git log --grep -p` searches commit messages for the literal
+        // string "-p"; git does not treat it as the patch flag.
+        for opt in ["--grep", "--author", "--committer", "-S", "-G"] {
+            let args = vec![opt.to_string(), "-p".to_string()];
+            assert!(
+                !requests_raw_log_output(&args),
+                "-p as the value of {opt} should stay on the filtered path"
+            );
+        }
+    }
+
+    #[test]
+    fn test_patch_flag_still_detected_after_value_taking_option() {
+        // The value-taking option consumes only its own value token;
+        // a genuine -p later in the args still triggers the raw path.
+        let args = vec!["--grep".to_string(), "fix".to_string(), "-p".to_string()];
+        assert!(
+            requests_raw_log_output(&args),
+            "a real -p after --grep's value should still request raw output"
+        );
     }
 
     #[test]
