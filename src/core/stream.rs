@@ -562,22 +562,30 @@ impl CaptureResult {
 
 pub fn exec_capture(cmd: &mut Command) -> Result<CaptureResult> {
     cmd.stdin(Stdio::null());
-    let output = cmd.output().context("Failed to execute command")?;
-    Ok(CaptureResult {
-        stdout: super::utils::decode_process_output(&output.stdout),
-        stderr: super::utils::decode_process_output(&output.stderr),
-        exit_code: status_to_exit_code(output.status),
-    })
+    capture(cmd)
 }
 
 /// Like [`exec_capture`] but inherits stdin so a wrapped engine can read a piped stdin.
 pub fn exec_capture_stdin(cmd: &mut Command) -> Result<CaptureResult> {
     cmd.stdin(Stdio::inherit());
+    capture(cmd)
+}
+
+/// Run `cmd` to completion, decode what it wrote, and report the exit code.
+///
+/// A process killed by a signal has no exit code of its own, and returning
+/// only the synthesized `128 + signal` hides why it died. `exit_code_from_output`
+/// announces that on stderr, so callers moving here from a hand-rolled
+/// `.output()` keep the diagnostic instead of losing it. The program name is
+/// used as the label so no call site has to pass one.
+fn capture(cmd: &mut Command) -> Result<CaptureResult> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
     let output = cmd.output().context("Failed to execute command")?;
+    let exit_code = super::utils::exit_code_from_output(&output, &program);
     Ok(CaptureResult {
         stdout: super::utils::decode_process_output(&output.stdout),
         stderr: super::utils::decode_process_output(&output.stderr),
-        exit_code: status_to_exit_code(output.status),
+        exit_code,
     })
 }
 
@@ -696,6 +704,26 @@ pub(crate) mod tests {
         child.kill().unwrap();
         let status = child.wait().unwrap();
         assert_eq!(status_to_exit_code(status), 137);
+    }
+
+    #[test]
+    fn test_exec_capture_decodes_and_reports_exit_code() {
+        let captured = exec_capture(&mut Command::new("false")).expect("spawn");
+        assert_eq!(captured.exit_code, 1);
+        assert!(!captured.success());
+    }
+
+    /// A signal-killed child keeps the `128 + signal` code that
+    /// `exit_code_from_output` reports, so callers that moved off a hand-rolled
+    /// `.output()` neither lose the code nor the stderr diagnostic with it.
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_capture_reports_signal_exit_code() {
+        // `kill -TERM $$` makes the shell terminate itself by signal 15.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("kill -TERM $$");
+        let captured = exec_capture(&mut cmd).expect("spawn");
+        assert_eq!(captured.exit_code, 128 + 15);
     }
 
     #[test]
