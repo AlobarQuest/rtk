@@ -190,8 +190,12 @@ bench "read -n" "cat -n src/main.rs" "$RTK read src/main.rs -n"
 section "find"
 bench "find *" "find . -type f" "$RTK find '*'"
 bench "find *.rs" "find . -name '*.rs' -type f" "$RTK find '*.rs'"
-bench "find --max 10" "find . -not -path './target/*' -not -path './.git/*' -type f | head -10" "$RTK find '*' --max 10"
-bench "find --max 100" "find . -not -path './target/*' -not -path './.git/*' -type f | head -100" "$RTK find '*' --max 100"
+# `rtk find --max N` caps how many names are DISPLAYED but still scans and
+# summarizes the whole tree, so the honest baseline is the full `find` a user
+# would otherwise read — not a `head -N`-truncated slice, which measures a
+# different (early-terminated) operation and made `--max 10` spuriously negative.
+bench "find --max 10" "find . -not -path './target/*' -not -path './.git/*' -type f" "$RTK find '*' --max 10"
+bench "find --max 100" "find . -not -path './target/*' -not -path './.git/*' -type f" "$RTK find '*' --max 100"
 
 # ===================
 # git
