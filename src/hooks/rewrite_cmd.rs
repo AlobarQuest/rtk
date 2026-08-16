@@ -104,25 +104,46 @@ mod tests {
         );
     }
 
+    /// The verdict still drives the outcome: an allow rule yields `Allow`.
+    /// Pinning both directions keeps the mapping covered without depending
+    /// on which rules the developer happens to have configured.
+    #[test]
+    fn test_allow_verdict_yields_allow() {
+        assert!(matches!(
+            evaluate_with_verdict("git status", PermissionVerdict::Allow, &[], &[]),
+            RewriteOutcome::Allow(_)
+        ));
+    }
+
+    #[test]
+    fn test_deny_verdict_yields_deny() {
+        assert_eq!(
+            evaluate_with_verdict("git status", PermissionVerdict::Deny, &[], &[]),
+            RewriteOutcome::Deny
+        );
+    }
+
+    /// Commands with an unattestable construct are always a passthrough,
+    /// regardless of permission verdict.
+    ///
+    /// The verdict is pinned to `Default` rather than going through `evaluate`,
+    /// which reads the developer's own `.claude/settings.local.json`: a
+    /// `Bash(git *)` allow rule turns the expected `Ask` into `Allow` and these
+    /// tests fail on that machine only (#3146). Pinning the verdict keeps the
+    /// assertions about the rewrite logic and nothing about the host.
     mod unattestable_passthrough {
         use super::super::{evaluate_with_verdict, RewriteOutcome};
         use crate::hooks::permissions::PermissionVerdict;
 
-        /// Evaluate with the verdict a machine with no permission rules produces.
-        ///
-        /// Calling `evaluate` here instead would read the developer's own
-        /// `.claude/settings.local.json`: a `Bash(git *)` allow rule turns the
-        /// expected `Ask` into `Allow` and these tests fail on that machine only
-        /// (#3146). The verdict is pinned so the assertions describe the rewrite
-        /// logic and nothing about the host.
-        fn eval(cmd: &str) -> RewriteOutcome {
-            evaluate_with_verdict(cmd, PermissionVerdict::Default, &[], &[])
-        }
-
         #[test]
         fn test_backtick_substitution_passthrough() {
             assert_eq!(
-                eval("git status `rm -rf /tmp/x`"),
+                evaluate_with_verdict(
+                    "git status `rm -rf /tmp/x`",
+                    PermissionVerdict::Default,
+                    &[],
+                    &[]
+                ),
                 RewriteOutcome::Passthrough
             );
         }
@@ -130,7 +151,12 @@ mod tests {
         #[test]
         fn test_dollar_substitution_passthrough() {
             assert_eq!(
-                eval("git status $(rm -rf /tmp/x)"),
+                evaluate_with_verdict(
+                    "git status $(rm -rf /tmp/x)",
+                    PermissionVerdict::Default,
+                    &[],
+                    &[]
+                ),
                 RewriteOutcome::Passthrough
             );
         }
@@ -138,43 +164,43 @@ mod tests {
         #[test]
         fn test_double_quoted_substitution_passthrough() {
             assert_eq!(
-                eval("git log --pretty=\"$(rm -rf /tmp/x)\""),
+                evaluate_with_verdict(
+                    "git log --pretty=\"$(rm -rf /tmp/x)\"",
+                    PermissionVerdict::Default,
+                    &[],
+                    &[]
+                ),
                 RewriteOutcome::Passthrough
             );
         }
 
         #[test]
         fn test_file_redirect_passthrough() {
-            assert_eq!(eval("git log > /tmp/out.txt"), RewriteOutcome::Passthrough);
+            assert_eq!(
+                evaluate_with_verdict(
+                    "git log > /tmp/out.txt",
+                    PermissionVerdict::Default,
+                    &[],
+                    &[]
+                ),
+                RewriteOutcome::Passthrough
+            );
         }
 
         #[test]
         fn test_fd_dup_redirect_still_rewrites() {
-            assert!(matches!(eval("git status 2>&1"), RewriteOutcome::Ask(_)));
-        }
-
-        #[test]
-        fn test_plain_command_still_rewrites() {
-            assert!(matches!(eval("git status"), RewriteOutcome::Ask(_)));
-        }
-
-        /// The verdict still drives the outcome: an allow rule yields `Allow`.
-        /// Pinning both directions keeps the mapping covered without depending
-        /// on which rules the developer happens to have configured.
-        #[test]
-        fn test_allow_verdict_yields_allow() {
             assert!(matches!(
-                evaluate_with_verdict("git status", PermissionVerdict::Allow, &[], &[]),
-                RewriteOutcome::Allow(_)
+                evaluate_with_verdict("git status 2>&1", PermissionVerdict::Default, &[], &[]),
+                RewriteOutcome::Ask(_)
             ));
         }
 
         #[test]
-        fn test_deny_verdict_yields_deny() {
-            assert_eq!(
-                evaluate_with_verdict("git status", PermissionVerdict::Deny, &[], &[]),
-                RewriteOutcome::Deny
-            );
+        fn test_plain_command_still_rewrites() {
+            assert!(matches!(
+                evaluate_with_verdict("git status", PermissionVerdict::Default, &[], &[]),
+                RewriteOutcome::Ask(_)
+            ));
         }
     }
 
