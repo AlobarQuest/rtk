@@ -16,7 +16,7 @@ const DEFAULT_MAX_FILE_SIZE: usize = 1_048_576;
 /// Sanitize a command slug for use in filenames.
 /// Replaces non-alphanumeric chars (except underscore/hyphen) with underscore.
 /// Long slugs (usually an embedded file path that duplicates the command the LLM
-/// already issued) collapse to a short readable prefix plus a collision-resistant
+/// already issued) collapse to a short readable prefix plus a short disambiguating
 /// hash, keeping recovery filenames unique but compact — fewer tokens per tee hint.
 fn sanitize_slug(slug: &str) -> String {
     let sanitized: String = slug
@@ -37,17 +37,14 @@ fn sanitize_slug(slug: &str) -> String {
     format!("{}_{}", prefix, short_hash(&sanitized))
 }
 
-/// First 6 hex chars (24 bits) of the SHA-256 of `s` — a compact, collision-resistant
-/// tag. Distinct slugs get distinct tags (~1-in-16M collision), so shortening never
-/// makes two different commands share a tee filename (the epoch already scopes writes
-/// to the same second, exactly as before).
+/// First 6 hex chars (24 bits) of the SHA-256 of `s` — a compact tag to keep
+/// shortened slugs distinct. Not collision-resistant on its own: 24 bits hits a
+/// birthday collision after only a few thousand distinct slugs. It's safe here
+/// because a clash also requires the identical readable prefix *and* the same
+/// epoch second, which together scope tee writes exactly as before.
 fn short_hash(s: &str) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(s.as_bytes())
-        .iter()
-        .take(3)
-        .map(|b| format!("{:02x}", b))
-        .collect()
+    format!("{:x}", Sha256::digest(s.as_bytes()))[..6].to_string()
 }
 
 /// Get the tee directory, respecting config and env overrides.
