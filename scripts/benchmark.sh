@@ -349,14 +349,20 @@ bench "wc" "wc Cargo.toml src/main.rs" "$RTK wc Cargo.toml src/main.rs"
 # to compact).
 # ===================
 NET_FIXTURE_DIR="$(mktemp -d)"
-readonly NET_HTTP_PORT=8899   # loopback-only server shared by curl + wget
+# Server log lives outside the served directory so it is never itself served.
+NET_HTTP_LOG="$(mktemp)"
 NET_HTTP_PID=""
+# Every step is failure-tolerant: this runs from an EXIT trap under `set -e`, so
+# a single failing command (e.g. `kill` on a server that already died) would
+# otherwise abort the trap and leak the fixture dir and downloaded files.
 cleanup_net_fixtures() {
-  [ -n "$NET_HTTP_PID" ] && kill "$NET_HTTP_PID" 2>/dev/null
-  rm -rf "$NET_FIXTURE_DIR"
+  if [ -n "$NET_HTTP_PID" ]; then
+    kill "$NET_HTTP_PID" 2>/dev/null || true
+  fi
+  rm -rf "$NET_FIXTURE_DIR" "$NET_HTTP_LOG" || true
   # `rtk wget <url>/data.json` saves to ./data.json (default basename); remove
   # that download and any numbered duplicates from repeated runs.
-  rm -f data.json data.json.* 2>/dev/null
+  rm -f data.json data.json.* 2>/dev/null || true
 }
 trap cleanup_net_fixtures EXIT
 
@@ -381,14 +387,27 @@ TXTEOF
 # Bring up a loopback HTTP server once so both curl and wget get real response
 # headers (`Content-Type: application/json`) — that's what lets rtk detect JSON
 # and minify it. file:// carries no headers, so it can't demonstrate that path.
+#
+# Port 0 asks the kernel for a free port, so a busy fixed port can never make the
+# benchmark fail. `python3 -u` keeps stdout unbuffered, so the "Serving HTTP on
+# 127.0.0.1 port NNNNN" line — printed only once the socket is bound and
+# listening — reaches the log as soon as the server is ready.
+readonly NET_HTTP_EPHEMERAL_PORT=0
+readonly NET_HTTP_READY_ATTEMPTS=25
+readonly NET_HTTP_READY_DELAY=0.2
 NET_HTTP_URL=""
 if command -v python3 &> /dev/null; then
-  ( cd "$NET_FIXTURE_DIR" && exec python3 -m http.server "$NET_HTTP_PORT" --bind 127.0.0.1 ) >/dev/null 2>&1 &
+  ( cd "$NET_FIXTURE_DIR" \
+      && exec python3 -u -m http.server "$NET_HTTP_EPHEMERAL_PORT" --bind 127.0.0.1 ) \
+    > "$NET_HTTP_LOG" 2>&1 &
   NET_HTTP_PID=$!
-  for _ in $(seq 1 25); do
-    curl -s -o /dev/null "http://127.0.0.1:$NET_HTTP_PORT/data.json" 2>/dev/null \
-      && { NET_HTTP_URL="http://127.0.0.1:$NET_HTTP_PORT"; break; }
-    sleep 0.2
+  for _ in $(seq 1 "$NET_HTTP_READY_ATTEMPTS"); do
+    net_http_port="$(sed -n 's/.*port \([0-9][0-9]*\).*/\1/p' "$NET_HTTP_LOG" | head -1)"
+    if [ -n "$net_http_port" ]; then
+      NET_HTTP_URL="http://127.0.0.1:$net_http_port"
+      break
+    fi
+    sleep "$NET_HTTP_READY_DELAY"
   done
 fi
 
@@ -405,10 +424,16 @@ if command -v curl &> /dev/null; then
   fi
 fi
 
-# wget — rtk doesn't accept file://, so it needs the loopback server above.
-if command -v wget &> /dev/null && [ -n "$NET_HTTP_URL" ]; then
+# wget has no offline fallback: it rejects file:// outright ("Unsupported
+# scheme"), so without the loopback server there is nothing local to fetch. Say
+# so explicitly instead of letting the case disappear from the report.
+if command -v wget &> /dev/null; then
   section "wget"
-  bench "wget" "wget -qO- $NET_HTTP_URL/data.json" "$RTK wget $NET_HTTP_URL/data.json"
+  if [ -n "$NET_HTTP_URL" ]; then
+    bench "wget" "wget -qO- $NET_HTTP_URL/data.json" "$RTK wget $NET_HTTP_URL/data.json"
+  else
+    echo "⏭️  wget (no local HTTP server available, skipped)"
+  fi
 fi
 
 # ===================
