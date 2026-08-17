@@ -155,6 +155,34 @@ fn is_blank_separator(line: &str) -> bool {
     line.is_empty() || line.trim_end() == "[INFO]"
 }
 
+// ── Parallel-reactor lanes ──────────────────────────────────────────────────
+
+/// mvnd parallel reactors prefix per-module log lines with `[module] ` while
+/// stack traces stay raw and reactor-level lines stay unprefixed — and lines
+/// from different modules interleave freely (see
+/// `mvnd_reactor_fail_raw.txt`). Classification must therefore happen on the
+/// prefix-stripped view, and Surefire block state must be tracked per module.
+///
+/// Returns `(Some(key), core)` for log-level lines — `key` is the module tag
+/// (`""` for unprefixed reactor-level lines) and `core` is the line with the
+/// module prefix stripped, for classification — or `(None, line)` for raw
+/// lines (stack traces, stray stdout), which belong to whichever lane most
+/// recently opened a Surefire block or failure trail.
+fn split_lane(line: &str) -> (Option<&str>, &str) {
+    if !line.starts_with('[') {
+        return (None, line);
+    }
+    if let Some(end) = line.find("] ") {
+        let tag = &line[1..end];
+        let rest = &line[end + 2..];
+        if !matches!(tag, "INFO" | "ERROR" | "WARNING" | "DEBUG" | "FATAL") && rest.starts_with('[')
+        {
+            return (Some(tag), rest);
+        }
+    }
+    (Some(""), line)
+}
+
 /// `[ERROR] FQN.method -- Time elapsed: 0.030 s <<< FAILURE!` (or `<<< ERROR!`).
 /// Distinguished from CLOSE by call position: only consulted when
 /// `in_block == false` (CLOSE only occurs while a block is open). A
@@ -293,12 +321,16 @@ impl<'a> SurefireBlock<'a> {
         }
     }
 
-    fn step(&mut self, line: &'a str, out: &mut String) -> SurefireStep<'a> {
-        if PLUGIN_BANNER.is_match(line) {
+    /// Matching is done on `core` (the module-prefix-stripped view of the
+    /// line — identical to `line` outside mvnd parallel reactors); `line` is
+    /// the original, which is what gets buffered and emitted so module
+    /// identity survives in the output.
+    fn step(&mut self, line: &'a str, core: &str, out: &mut String) -> SurefireStep<'a> {
+        if PLUGIN_BANNER.is_match(core) {
             return SurefireStep::Consumed;
         }
 
-        if RUNNING.is_match(line) {
+        if RUNNING.is_match(core) {
             if self.in_block {
                 self.flush_open_block_as_keep(out);
             }
@@ -313,7 +345,7 @@ impl<'a> SurefireBlock<'a> {
         }
 
         if self.in_block {
-            if let Some(caps) = CLOSE.captures(line) {
+            if let Some(caps) = CLOSE.captures(core) {
                 let fail = caps.get(1).map(|m| m.as_str() != "0").unwrap_or(false);
                 let err = caps.get(2).map(|m| m.as_str() != "0").unwrap_or(false);
                 if fail || err {
@@ -336,7 +368,7 @@ impl<'a> SurefireBlock<'a> {
         }
 
         if self.failure_trail {
-            if is_blank_separator(line) {
+            if is_blank_separator(core) {
                 if !self.drop_trail {
                     out.push('\n');
                 }
@@ -347,7 +379,7 @@ impl<'a> SurefireBlock<'a> {
                 self.drop_trail = false;
                 return SurefireStep::Consumed;
             }
-            let t = line.trim_start();
+            let t = core.trim_start();
             if t.starts_with("at ") && is_framework_frame(t) {
                 return SurefireStep::Consumed;
             }
@@ -360,13 +392,13 @@ impl<'a> SurefireBlock<'a> {
         }
 
         if let Some(dropped) = self.trail_rearm {
-            if is_blank_separator(line) {
+            if is_blank_separator(core) {
                 // Tolerate extra blanks between per-test blocks: stay armed,
                 // let the blank fall through (outer keep-lists drop it).
                 return SurefireStep::Passthrough;
             }
             self.trail_rearm = None; // disarm unconditionally on non-blank (load-bearing)
-            if is_per_test_subline(line) {
+            if is_per_test_subline(core) {
                 self.failure_trail = true;
                 self.drop_trail = dropped;
                 if !dropped {
@@ -476,11 +508,12 @@ impl FailuresSummaryCap {
         }
     }
 
-    /// If `line` is an `[ERROR]   ` entry inside the failures summary, write
-    /// it (or count it as dropped) and return `true` so the caller skips its
-    /// own keep-list. Returns `false` otherwise.
-    fn handle_entry(&mut self, line: &str, out: &mut String) -> bool {
-        if !self.in_summary || !line.starts_with("[ERROR]   ") {
+    /// If `core` is an `[ERROR]   ` entry inside the failures summary, write
+    /// `line` (the original, module prefix included) — or count it as
+    /// dropped — and return `true` so the caller skips its own keep-list.
+    /// Returns `false` otherwise.
+    fn handle_entry(&mut self, core: &str, line: &str, out: &mut String) -> bool {
+        if !self.in_summary || !core.starts_with("[ERROR]   ") {
             return false;
         }
         // Per core cap policy, `0` means summary-only: no entries, tail still counts.
@@ -529,6 +562,39 @@ impl FailuresSummaryCap {
     }
 }
 
+/// Per-module filter state for parallel reactors: each module gets its own
+/// Surefire block machine, continuation flag, and failures-summary cap,
+/// because mvnd interleaves module output line-by-line (a `[child-b]` close
+/// can land between a `[child-a]` `Running` and its close).
+struct SurefireLane<'a> {
+    block: SurefireBlock<'a>,
+    keep_continuation: bool,
+    summary: FailuresSummaryCap,
+}
+
+impl<'a> SurefireLane<'a> {
+    fn new(cap: usize) -> Self {
+        Self {
+            block: SurefireBlock::new(),
+            keep_continuation: false,
+            summary: FailuresSummaryCap::new(cap),
+        }
+    }
+}
+
+/// Index of `key`'s lane, creating it on first sight. Insertion order is
+/// preserved so end-of-stream flushes are deterministic. Linear scan: a
+/// reactor has a handful of modules, not thousands.
+fn lane_index<'a>(lanes: &mut Vec<(&'a str, SurefireLane<'a>)>, key: &'a str, cap: usize) -> usize {
+    match lanes.iter().position(|(k, _)| *k == key) {
+        Some(i) => i,
+        None => {
+            lanes.push((key, SurefireLane::new(cap)));
+            lanes.len() - 1
+        }
+    }
+}
+
 /// Buffered single-pass filter for `mvn test` / `mvn integration-test`.
 ///
 /// Drives [`SurefireBlock`] for the inner block/trail machine; applies the
@@ -549,15 +615,29 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
     }
 
     let mut out = String::new();
-    let mut block = SurefireBlock::new();
-    let mut keep_continuation = false;
+    // One lane per module prefix; lane 0 (`""`) is the root lane, which is
+    // the only lane a plain-`mvn` (or single-module mvnd) run ever uses.
+    let mut lanes: Vec<(&str, SurefireLane)> = vec![("", SurefireLane::new(cap))];
+    // Lane owning raw (unprefixed, non-log) lines: the one most recently
+    // inside a Surefire block or failure trail — mvnd emits stack traces
+    // without a module prefix even in parallel builds.
+    let mut hot: usize = 0;
     let mut in_reactor_summary = false;
     let mut emitted_failing: usize = 0;
     let mut dropped_failing: usize = 0;
-    let mut summary = FailuresSummaryCap::new(cap);
 
     for line in stripped.lines() {
-        match block.step(line, &mut out) {
+        let (key, core) = split_lane(line);
+        let idx = match key {
+            Some(k) => lane_index(&mut lanes, k, cap),
+            None => hot,
+        };
+
+        let step = lanes[idx].1.block.step(line, core, &mut out);
+        if lanes[idx].1.block.in_block || lanes[idx].1.block.failure_trail {
+            hot = idx;
+        }
+        match step {
             SurefireStep::Consumed => continue,
             SurefireStep::FailingClose {
                 running,
@@ -565,19 +645,22 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
                 close,
             } => {
                 if emitted_failing < cap {
-                    block.commit_failing(&mut out, running, &lines, close);
+                    lanes[idx].1.block.commit_failing(&mut out, running, &lines, close);
                     emitted_failing += 1;
                 } else {
-                    block.drop_failing();
+                    lanes[idx].1.block.drop_failing();
                     dropped_failing += 1;
                 }
-                keep_continuation = false;
+                hot = idx;
+                lanes[idx].1.keep_continuation = false;
                 continue;
             }
             SurefireStep::Passthrough => {}
         }
 
-        if keep_continuation && (line.starts_with(' ') || line.starts_with('\t')) {
+        let lane = &mut lanes[idx].1;
+
+        if lane.keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
             out.push_str(line);
             out.push('\n');
             continue;
@@ -586,34 +669,36 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
         // Failures-summary cap: gate `[ERROR]   ` entries, emit `+N more` tail
         // before AGG. The helper consumes only summary entries — other lines
         // (header, AGG) fall through to the keep-list below.
-        if summary.handle_entry(line, &mut out) {
+        if lane.summary.handle_entry(core, line, &mut out) {
             continue;
         }
 
         // Order matters: call reactor_summary_keep first so its BUILD_FOOT
         // clears-flag side effect always runs regardless of `||` short-circuit.
-        let reactor_keep = reactor_summary_keep(line, &mut in_reactor_summary);
-        if reactor_keep || keep_outside_block(line) {
+        let reactor_keep = reactor_summary_keep(core, &mut in_reactor_summary);
+        if reactor_keep || keep_outside_block(core) {
             // Pre-emit the summary tail when we're about to write AGG.
-            summary.handle_aggregate(line, &mut out);
+            lane.summary.handle_aggregate(core, &mut out);
             // Detect summary header so subsequent `[ERROR]   ` entries get capped.
-            summary.handle_header(line);
+            lane.summary.handle_header(core);
             out.push_str(line);
             out.push('\n');
-            keep_continuation = line.starts_with("[ERROR]")
-                && !line.starts_with("[ERROR] Tests run:")
-                && !line.starts_with("[ERROR] Failures:")
-                && !line.starts_with("[ERROR] Errors:");
+            lane.keep_continuation = core.starts_with("[ERROR]")
+                && !core.starts_with("[ERROR] Tests run:")
+                && !core.starts_with("[ERROR] Failures:")
+                && !core.starts_with("[ERROR] Errors:");
             continue;
         }
         // Dropped line (e.g. help boilerplate): reset so a stale flag can't
         // keep an indented line that follows a dropped `[ERROR]` line.
         // Parity with filter_package's fall-through reset.
-        keep_continuation = false;
+        lane.keep_continuation = false;
     }
 
-    block.finish(&mut out);
-    summary.finish(&mut out);
+    for (_, lane) in &mut lanes {
+        lane.block.finish(&mut out);
+        lane.summary.finish(&mut out);
+    }
     if dropped_failing > 0 {
         out.push_str(&format!(
             "\n… +{} more failing test classes\n",
@@ -642,17 +727,20 @@ pub fn filter_compile(raw: &str) -> String {
     let mut seen_warnings: HashSet<String> = HashSet::new();
 
     for line in stripped.lines() {
-        if MODULE_BANNER.is_match(line) {
+        // Classify on the module-prefix-stripped view; emit the original so
+        // module identity survives in mvnd parallel reactors.
+        let core = split_lane(line).1;
+        if MODULE_BANNER.is_match(core) {
             out.push_str(line);
             out.push('\n');
             keep_continuation = false;
             continue;
         }
-        if BUILD_FOOT.is_match(line)
-            || line.starts_with("[INFO] Building ")
-            || line.starts_with("[INFO] Total time:")
-            || line.starts_with("[INFO] Finished at:")
-            || line.starts_with("[INFO] Scanning ")
+        if BUILD_FOOT.is_match(core)
+            || core.starts_with("[INFO] Building ")
+            || core.starts_with("[INFO] Total time:")
+            || core.starts_with("[INFO] Finished at:")
+            || core.starts_with("[INFO] Scanning ")
         {
             out.push_str(line);
             out.push('\n');
@@ -661,23 +749,23 @@ pub fn filter_compile(raw: &str) -> String {
         }
         // Help boilerplate: drop before the `[ERROR]` catch-all (parity with
         // keep_outside_block / filter_quiet).
-        if is_boilerplate(line) {
+        if is_boilerplate(core) {
             keep_continuation = false;
             continue;
         }
-        if line.starts_with("[ERROR]") {
+        if core.starts_with("[ERROR]") {
             out.push_str(line);
             out.push('\n');
             keep_continuation = true;
             continue;
         }
-        if keep_continuation && (line.starts_with(' ') || line.starts_with('\t')) {
+        if keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
             out.push_str(line);
             out.push('\n');
             continue;
         }
-        if line.starts_with("[WARNING]") {
-            let payload = line.strip_prefix("[WARNING] ").unwrap_or(line);
+        if core.starts_with("[WARNING]") {
+            let payload = core.strip_prefix("[WARNING] ").unwrap_or(core);
             let norm = FILE_COORD.replace_all(payload, "").to_string();
             if seen_warnings.insert(norm) {
                 out.push_str(line);
@@ -712,16 +800,28 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
     }
 
     let mut out = String::new();
-    let mut block = SurefireBlock::new();
-    let mut keep_continuation = false;
+    // Per-module lanes + raw-line routing: see filter_surefire_with_cap.
+    let mut lanes: Vec<(&str, SurefireLane)> = vec![("", SurefireLane::new(cap))];
+    let mut hot: usize = 0;
     let mut in_reactor_summary = false;
+    // Warning dedup is deliberately global: the same warning surfacing from
+    // several reactor modules is still the same warning.
     let mut seen_warnings: HashSet<String> = HashSet::new();
     let mut emitted_failing: usize = 0;
     let mut dropped_failing: usize = 0;
-    let mut summary = FailuresSummaryCap::new(cap);
 
     for line in stripped.lines() {
-        match block.step(line, &mut out) {
+        let (key, core) = split_lane(line);
+        let idx = match key {
+            Some(k) => lane_index(&mut lanes, k, cap),
+            None => hot,
+        };
+
+        let step = lanes[idx].1.block.step(line, core, &mut out);
+        if lanes[idx].1.block.in_block || lanes[idx].1.block.failure_trail {
+            hot = idx;
+        }
+        match step {
             SurefireStep::Consumed => continue,
             SurefireStep::FailingClose {
                 running,
@@ -729,58 +829,63 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
                 close,
             } => {
                 if emitted_failing < cap {
-                    block.commit_failing(&mut out, running, &lines, close);
+                    lanes[idx].1.block.commit_failing(&mut out, running, &lines, close);
                     emitted_failing += 1;
                 } else {
-                    block.drop_failing();
+                    lanes[idx].1.block.drop_failing();
                     dropped_failing += 1;
                 }
-                keep_continuation = false;
+                hot = idx;
+                lanes[idx].1.keep_continuation = false;
                 continue;
             }
             SurefireStep::Passthrough => {}
         }
 
+        let lane = &mut lanes[idx].1;
+
         // Failures-summary cap (see filter_surefire_with_cap for details).
-        if summary.handle_entry(line, &mut out) {
+        if lane.summary.handle_entry(core, line, &mut out) {
             continue;
         }
 
         // Order matters: call reactor_summary_keep first so its BUILD_FOOT
         // clears-flag side effect always runs regardless of `||` short-circuit.
-        let reactor_keep = reactor_summary_keep(line, &mut in_reactor_summary);
+        let reactor_keep = reactor_summary_keep(core, &mut in_reactor_summary);
         // Outside any Surefire block: compile-keep AND surefire-outside-keep merge.
-        if reactor_keep || MODULE_BANNER.is_match(line) || keep_outside_block(line) {
-            summary.handle_aggregate(line, &mut out);
-            summary.handle_header(line);
+        if reactor_keep || MODULE_BANNER.is_match(core) || keep_outside_block(core) {
+            lane.summary.handle_aggregate(core, &mut out);
+            lane.summary.handle_header(core);
             out.push_str(line);
             out.push('\n');
-            keep_continuation = line.starts_with("[ERROR]")
-                && !line.starts_with("[ERROR] Tests run:")
-                && !line.starts_with("[ERROR] Failures:")
-                && !line.starts_with("[ERROR] Errors:");
+            lane.keep_continuation = core.starts_with("[ERROR]")
+                && !core.starts_with("[ERROR] Tests run:")
+                && !core.starts_with("[ERROR] Failures:")
+                && !core.starts_with("[ERROR] Errors:");
             continue;
         }
-        if keep_continuation && (line.starts_with(' ') || line.starts_with('\t')) {
+        if lane.keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
             out.push_str(line);
             out.push('\n');
             continue;
         }
-        if line.starts_with("[WARNING]") {
-            let payload = line.strip_prefix("[WARNING] ").unwrap_or(line);
+        if core.starts_with("[WARNING]") {
+            let payload = core.strip_prefix("[WARNING] ").unwrap_or(core);
             let norm = FILE_COORD.replace_all(payload, "").to_string();
             if seen_warnings.insert(norm) {
                 out.push_str(line);
                 out.push('\n');
             }
-            keep_continuation = false;
+            lane.keep_continuation = false;
             continue;
         }
-        keep_continuation = false;
+        lane.keep_continuation = false;
     }
 
-    block.finish(&mut out);
-    summary.finish(&mut out);
+    for (_, lane) in &mut lanes {
+        lane.block.finish(&mut out);
+        lane.summary.finish(&mut out);
+    }
     if dropped_failing > 0 {
         out.push_str(&format!(
             "\n… +{} more failing test classes\n",
@@ -1128,13 +1233,16 @@ mod tests {
         assert!(o.contains("child-b ............................................ SUCCESS"));
         assert!(o.contains("[INFO] BUILD SUCCESS"));
         assert!(o.contains("[INFO] Total time:"));
-        // Daemon chatter and `[module] `-prefixed parallel lines are dropped.
+        // Module identity survives on keeper lines (parity with plain-mvn
+        // reactors, whose banners/artifact lines are kept).
+        assert!(o.contains("[child-b] [INFO] Building jar:"));
+        // Daemon chatter and per-module noise are dropped.
         assert!(!o.contains("Processing build on daemon"));
         assert!(!o.contains("BuildTimeEventSpy"));
         assert!(!o.contains("SmartBuilder"));
         assert!(!o.contains("Bottleneck projects"));
-        assert!(!o.contains("[child-a] [INFO]"));
-        assert!(!o.contains("[child-b] [INFO]"));
+        assert!(!o.contains("skip non existing resourceDirectory"));
+        assert!(!o.contains("[INFO] Deleting"));
     }
 
     #[test]
@@ -1176,6 +1284,78 @@ mod tests {
         let o = filter_surefire(i);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
         assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
+    }
+
+    /// Failing test inside a parallel reactor (`mvnd clean test` on the
+    /// multi-module-fail-skeleton, exit code 1): module output interleaves
+    /// line-by-line and per-module lines carry a `[module] ` prefix, while
+    /// the assertion message and stack frames arrive raw (unprefixed). The
+    /// failing class, its message, user frame, and summary entry must all
+    /// survive — with module identity — and the interleaved passing classes
+    /// from the other module must not bleed into the failing block.
+    #[test]
+    fn mvnd_parallel_reactor_fail_preserves_diagnostics() {
+        let i = include_str!("../../../tests/fixtures/mvnd_reactor_fail_raw.txt");
+        let o = filter_surefire(i);
+        assert!(o.contains("[child-a] [INFO] Running com.example.rtk.ParallelFailTest"));
+        assert!(o.contains(
+            "[child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed:"
+        ));
+        assert!(o.contains("parallel reactor diagnostic ==> expected: <1> but was: <2>"));
+        assert!(o.contains("at com.example.rtk.ParallelFailTest.reactorDiagnostic(ParallelFailTest.java:10)"));
+        assert!(o.contains("[child-a] [ERROR]   ParallelFailTest.reactorDiagnostic:10"));
+        assert!(o.contains("[child-a] [ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0"));
+        // Reactor summary keeps the per-module verdicts.
+        assert!(o.contains("child-a ............................................ FAILURE"));
+        assert!(o.contains("[INFO] BUILD FAILURE"));
+        assert!(o.contains("[ERROR] Failed to execute goal"));
+        // Interleaved passing classes are collapsed; a passing close from the
+        // other module must never be attributed to the failing block.
+        assert!(!o.contains("PassBetaTest"));
+        assert!(!o.contains("PassGammaTest"));
+        assert!(!o.contains("PassAlphaTest"));
+        // Framework frames, daemon chatter, and boilerplate are dropped.
+        assert!(!o.contains("at org.junit.jupiter"));
+        assert!(!o.contains("at java.base/"));
+        assert!(!o.contains("Processing build on daemon"));
+        assert!(!o.contains("Re-run Maven"));
+    }
+
+    #[test]
+    fn mvnd_parallel_reactor_fail_savings() {
+        let i = include_str!("../../../tests/fixtures/mvnd_reactor_fail_raw.txt");
+        let o = filter_surefire(i);
+        let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
+        assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
+    }
+
+    // Snapshot regression tests locking the full filtered output of every
+    // mvnd fixture (insta, per docs/contributing/CODING_PRACTICES.md) — the
+    // substring assertions above document intent; the snapshots catch
+    // everything else.
+
+    #[test]
+    fn mvnd_reactor_pass_snapshot() {
+        let i = include_str!("../../../tests/fixtures/mvnd_reactor_pass_raw.txt");
+        insta::assert_snapshot!(filter_package(i));
+    }
+
+    #[test]
+    fn mvnd_test_fail_snapshot() {
+        let i = include_str!("../../../tests/fixtures/mvnd_test_fail_raw.txt");
+        insta::assert_snapshot!(filter_surefire(i));
+    }
+
+    #[test]
+    fn mvnd_parallel_reactor_fail_snapshot() {
+        let i = include_str!("../../../tests/fixtures/mvnd_reactor_fail_raw.txt");
+        insta::assert_snapshot!(filter_surefire(i));
+    }
+
+    #[test]
+    fn mvnd_compile_error_snapshot() {
+        let i = include_str!("../../../tests/fixtures/mvnd_compile_error_raw.txt");
+        insta::assert_snapshot!(filter_compile(i));
     }
 
     /// `mvnd compile` on a syntax error (exit code 1): compile diagnostics
