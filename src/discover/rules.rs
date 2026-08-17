@@ -785,12 +785,10 @@ pub const RULES: &[RtkRule] = &[
         // own rtk_cmd so the daemon is what actually runs.
         pattern: r"^mvnd\b(?:\s+\S+)*?\s+(compile|test|integration-test|package|install|verify|deploy)\b",
         rtk_cmd: "rtk mvnd",
-        pipeline_final_safe: false,
         rewrite_prefixes: &["mvnd"],
         category: "Build",
         savings_pct: 82.0,
-        subcmd_savings: &[],
-        subcmd_status: &[],
+        ..RtkRule::DEFAULT
     },
     RtkRule {
         pattern: r"^ping\b",

@@ -497,29 +497,36 @@ impl<'a> SurefireBlock<'a> {
 /// with hundreds of failures this can be quite large. Cap entries at
 /// [`MAX_MVN_FAILING_CLASSES`] and emit `\n… +N more failures\n` immediately
 /// before the `Tests run:` aggregate when entries were dropped.
+///
+/// The budget is **reactor-wide**, not per module: a parallel reactor emits one
+/// summary block per failing module and they interleave, so each lane keeps its
+/// own `in_summary` flag ([`SurefireLane::in_summary`]) while the entry count is
+/// shared. Counters reset only when a header opens the *first* summary, so
+/// sequential runs behave exactly as before (one summary at a time) while
+/// interleaved ones can't retain `modules × cap` entries.
 struct FailuresSummaryCap {
     cap: usize,
-    in_summary: bool,
     emitted: usize,
     dropped: usize,
+    open_lanes: usize,
 }
 
 impl FailuresSummaryCap {
     fn new(cap: usize) -> Self {
         Self {
             cap,
-            in_summary: false,
             emitted: 0,
             dropped: 0,
+            open_lanes: 0,
         }
     }
 
-    /// If `core` is an `[ERROR]   ` entry inside the failures summary, write
-    /// `line` (the original, module prefix included) — or count it as
-    /// dropped — and return `true` so the caller skips its own keep-list.
+    /// If `core` is an `[ERROR]   ` entry inside the calling lane's failures
+    /// summary, write `line` (the original, module prefix included) — or count
+    /// it as dropped — and return `true` so the caller skips its own keep-list.
     /// Returns `false` otherwise.
-    fn handle_entry(&mut self, core: &str, line: &str, out: &mut String) -> bool {
-        if !self.in_summary || !core.starts_with("[ERROR]   ") {
+    fn handle_entry(&mut self, in_summary: bool, core: &str, line: &str, out: &mut String) -> bool {
+        if !in_summary || !core.starts_with("[ERROR]   ") {
             return false;
         }
         // Per core cap policy, `0` means summary-only: no entries, tail still counts.
@@ -535,69 +542,233 @@ impl FailuresSummaryCap {
 
     /// Detect the `[ERROR] Failures:` header so subsequent `[ERROR]   ` lines
     /// get capped. Caller is responsible for writing the header to `out`.
-    fn handle_header(&mut self, line: &str) {
-        if line.starts_with("[ERROR] Failures:") {
-            self.in_summary = true;
+    fn handle_header(&mut self, line: &str, in_summary: &mut bool) {
+        if !line.starts_with("[ERROR] Failures:") || *in_summary {
+            return;
+        }
+        if self.open_lanes == 0 {
             self.emitted = 0;
             self.dropped = 0;
         }
+        *in_summary = true;
+        self.open_lanes += 1;
     }
 
     /// Pre-emit the `… +N more failures` tail when the aggregate
-    /// `[ERROR] Tests run:` line is about to be written, then close the
+    /// `[ERROR] Tests run:` line is about to be written, then close this lane's
     /// summary. Caller writes the AGG line itself afterwards.
-    fn handle_aggregate(&mut self, line: &str, out: &mut String) {
-        if !self.in_summary || !AGG.is_match(line) {
+    fn handle_aggregate(&mut self, line: &str, out: &mut String, in_summary: &mut bool) {
+        if !*in_summary || !AGG.is_match(line) {
             return;
         }
         if self.dropped > 0 {
             out.push_str(&format!("\n… +{} more failures\n", self.dropped));
+            self.dropped = 0;
         }
-        self.in_summary = false;
-        self.emitted = 0;
-        self.dropped = 0;
+        *in_summary = false;
+        self.open_lanes -= 1;
     }
 
     /// End-of-stream tail emission for cases where the AGG line never arrives
     /// (truncated output). Emits the tail with no trailing newline guard so
     /// the resulting filtered output is still well-formed.
     fn finish(&mut self, out: &mut String) {
-        if self.in_summary && self.dropped > 0 {
+        if self.open_lanes > 0 && self.dropped > 0 {
             out.push_str(&format!("\n… +{} more failures\n", self.dropped));
         }
     }
 }
 
 /// Per-module filter state for parallel reactors: each module gets its own
-/// Surefire block machine, continuation flag, and failures-summary cap,
-/// because mvnd interleaves module output line-by-line (a `[child-b]` close
-/// can land between a `[child-a]` `Running` and its close).
+/// Surefire block machine, continuation flag, and summary-open flag, because
+/// mvnd interleaves module output line-by-line (a `[child-b]` close can land
+/// between a `[child-a]` `Running` and its close). The failures-summary
+/// *budget* is deliberately not here — see [`FailuresSummaryCap`].
 struct SurefireLane<'a> {
     block: SurefireBlock<'a>,
     keep_continuation: bool,
-    summary: FailuresSummaryCap,
+    in_summary: bool,
 }
 
 impl<'a> SurefireLane<'a> {
-    fn new(cap: usize) -> Self {
+    fn new() -> Self {
         Self {
             block: SurefireBlock::new(),
             keep_continuation: false,
-            summary: FailuresSummaryCap::new(cap),
+            in_summary: false,
         }
     }
 }
 
-/// Index of `key`'s lane, creating it on first sight. Insertion order is
-/// preserved so end-of-stream flushes are deterministic. Linear scan: a
-/// reactor has a handful of modules, not thousands.
-fn lane_index<'a>(lanes: &mut Vec<(&'a str, SurefireLane<'a>)>, key: &'a str, cap: usize) -> usize {
-    match lanes.iter().position(|(k, _)| *k == key) {
+/// The set of per-module lanes plus the "hot" lane raw lines default to.
+/// Lane 0 (`""`) is the root lane, the only one a plain-`mvn` (or
+/// single-module mvnd) run ever uses. Insertion order is preserved so
+/// end-of-stream flushes are deterministic; lookups are a linear scan (a
+/// reactor has a handful of modules, not thousands).
+struct Lanes<'a> {
+    lanes: Vec<(&'a str, SurefireLane<'a>)>,
+    hot: usize,
+}
+
+impl<'a> Lanes<'a> {
+    fn new() -> Self {
+        Self {
+            lanes: vec![("", SurefireLane::new())],
+            hot: 0,
+        }
+    }
+
+    fn get(&mut self, idx: usize) -> &mut SurefireLane<'a> {
+        &mut self.lanes[idx].1
+    }
+
+    /// Lane index for a line: by module key for log-level lines (creating the
+    /// lane on first sight), by ownership rules for raw lines. `None` means a
+    /// raw line's ownership is genuinely ambiguous and the caller must
+    /// preserve it verbatim rather than guess a lane that may drop it.
+    fn route(&mut self, key: Option<&'a str>) -> Option<usize> {
+        match key {
+            Some(k) => Some(match self.lanes.iter().position(|(t, _)| *t == k) {
+                Some(i) => i,
+                None => {
+                    self.lanes.push((k, SurefireLane::new()));
+                    self.lanes.len() - 1
+                }
+            }),
+            None => self.raw_owner(),
+        }
+    }
+
+    /// Lane owning an unprefixed raw line (stack trace, stray stdout — mvnd
+    /// emits these without a module tag even in parallel builds).
+    ///
+    /// A lane inside a **failure trail** outranks one merely inside an open
+    /// block: the trail is where the actionable diagnostics land, and another
+    /// module opening a block between a failing close and its exception must
+    /// not swallow them (that block then closes green and the trail is
+    /// discarded). `None` means ownership is genuinely ambiguous — several
+    /// plain blocks open, no trail.
+    fn raw_owner(&self) -> Option<usize> {
+        if self.lanes[self.hot].1.block.failure_trail {
+            return Some(self.hot);
+        }
+        if let Some(i) = self.lanes.iter().position(|(_, l)| l.block.failure_trail) {
+            return Some(i);
+        }
+        let mut open = self
+            .lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, l))| l.block.in_block);
+        match (open.next(), open.next()) {
+            (Some((i, _)), None) => Some(i),
+            (Some(_), Some(_)) => None,
+            // Nothing open: the hot lane's outside-block keep-list decides.
+            _ => Some(self.hot),
+        }
+    }
+
+    /// Update the default lane for raw lines after `idx` consumed one. A
+    /// failure trail claims it outright; a plain open block only claims it
+    /// while no trail is active.
+    fn note_hot(&mut self, idx: usize) {
+        let b = &self.lanes[idx].1.block;
+        if b.failure_trail || (b.in_block && !self.lanes[self.hot].1.block.failure_trail) {
+            self.hot = idx;
+        }
+    }
+
+    /// End-of-stream flush of every lane's block machine, in lane order.
+    fn finish(&mut self, out: &mut String) {
+        for (_, lane) in &mut self.lanes {
+            lane.block.finish(out);
+        }
+    }
+}
+
+/// Reactor-wide cap on emitted failing test classes, with the
+/// `… +N more failing test classes` tail. Shared by
+/// `filter_surefire_with_cap` and `filter_package_with_cap`.
+struct FailingClassCap {
+    cap: usize,
+    emitted: usize,
+    dropped: usize,
+}
+
+impl FailingClassCap {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            emitted: 0,
+            dropped: 0,
+        }
+    }
+
+    /// `true` when the next failing class still fits under the cap.
+    fn admit(&mut self) -> bool {
+        if self.emitted < self.cap {
+            self.emitted += 1;
+            true
+        } else {
+            self.dropped += 1;
+            false
+        }
+    }
+
+    fn finish(&self, out: &mut String) {
+        if self.dropped > 0 {
+            out.push_str(&format!(
+                "\n… +{} more failing test classes\n",
+                self.dropped
+            ));
+        }
+    }
+}
+
+/// Shared per-line front half of `filter_surefire_with_cap` and
+/// `filter_package_with_cap`: route the line to its lane, drive the lane's
+/// Surefire block machine, and commit/drop failing closes against the
+/// reactor-wide class cap. Returns `Some((lane index, core))` when the line
+/// fell through to the caller's outside-block keep-list; `None` when it was
+/// consumed — or preserved verbatim on ambiguous raw-line ownership.
+fn drive_surefire_line<'a>(
+    lanes: &mut Lanes<'a>,
+    line: &'a str,
+    classes: &mut FailingClassCap,
+    out: &mut String,
+) -> Option<(usize, &'a str)> {
+    let (key, core) = split_lane(line);
+    let idx = match lanes.route(key) {
         Some(i) => i,
         None => {
-            lanes.push((key, SurefireLane::new(cap)));
-            lanes.len() - 1
+            // Ambiguous ownership: preserve rather than risk dropping a
+            // failing module's diagnostics into a passing block.
+            out.push_str(line);
+            out.push('\n');
+            return None;
         }
+    };
+
+    let step = lanes.get(idx).block.step(line, core, out);
+    lanes.note_hot(idx);
+    match step {
+        SurefireStep::Consumed => None,
+        SurefireStep::FailingClose {
+            running,
+            lines,
+            close,
+        } => {
+            if classes.admit() {
+                lanes.get(idx).block.commit_failing(out, running, &lines, close);
+            } else {
+                lanes.get(idx).block.drop_failing();
+            }
+            // A failing close means a trail follows: claim raw lines outright.
+            lanes.hot = idx;
+            lanes.get(idx).keep_continuation = false;
+            None
+        }
+        SurefireStep::Passthrough => Some((idx, core)),
     }
 }
 
@@ -621,50 +792,17 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
     }
 
     let mut out = String::new();
-    // One lane per module prefix; lane 0 (`""`) is the root lane, which is
-    // the only lane a plain-`mvn` (or single-module mvnd) run ever uses.
-    let mut lanes: Vec<(&str, SurefireLane)> = vec![("", SurefireLane::new(cap))];
-    // Lane owning raw (unprefixed, non-log) lines: the one most recently
-    // inside a Surefire block or failure trail — mvnd emits stack traces
-    // without a module prefix even in parallel builds.
-    let mut hot: usize = 0;
+    let mut lanes = Lanes::new();
+    let mut classes = FailingClassCap::new(cap);
+    let mut summary = FailuresSummaryCap::new(cap);
     let mut in_reactor_summary = false;
-    let mut emitted_failing: usize = 0;
-    let mut dropped_failing: usize = 0;
 
     for line in stripped.lines() {
-        let (key, core) = split_lane(line);
-        let idx = match key {
-            Some(k) => lane_index(&mut lanes, k, cap),
-            None => hot,
+        let (idx, core) = match drive_surefire_line(&mut lanes, line, &mut classes, &mut out) {
+            Some(v) => v,
+            None => continue,
         };
-
-        let step = lanes[idx].1.block.step(line, core, &mut out);
-        if lanes[idx].1.block.in_block || lanes[idx].1.block.failure_trail {
-            hot = idx;
-        }
-        match step {
-            SurefireStep::Consumed => continue,
-            SurefireStep::FailingClose {
-                running,
-                lines,
-                close,
-            } => {
-                if emitted_failing < cap {
-                    lanes[idx].1.block.commit_failing(&mut out, running, &lines, close);
-                    emitted_failing += 1;
-                } else {
-                    lanes[idx].1.block.drop_failing();
-                    dropped_failing += 1;
-                }
-                hot = idx;
-                lanes[idx].1.keep_continuation = false;
-                continue;
-            }
-            SurefireStep::Passthrough => {}
-        }
-
-        let lane = &mut lanes[idx].1;
+        let lane = lanes.get(idx);
 
         if lane.keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
             out.push_str(line);
@@ -675,7 +813,7 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
         // Failures-summary cap: gate `[ERROR]   ` entries, emit `+N more` tail
         // before AGG. The helper consumes only summary entries — other lines
         // (header, AGG) fall through to the keep-list below.
-        if lane.summary.handle_entry(core, line, &mut out) {
+        if summary.handle_entry(lane.in_summary, core, line, &mut out) {
             continue;
         }
 
@@ -684,9 +822,9 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
         let reactor_keep = reactor_summary_keep(core, &mut in_reactor_summary);
         if reactor_keep || keep_outside_block(core) {
             // Pre-emit the summary tail when we're about to write AGG.
-            lane.summary.handle_aggregate(core, &mut out);
+            summary.handle_aggregate(core, &mut out, &mut lane.in_summary);
             // Detect summary header so subsequent `[ERROR]   ` entries get capped.
-            lane.summary.handle_header(core);
+            summary.handle_header(core, &mut lane.in_summary);
             out.push_str(line);
             out.push('\n');
             lane.keep_continuation = core.starts_with("[ERROR]")
@@ -701,16 +839,9 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
         lane.keep_continuation = false;
     }
 
-    for (_, lane) in &mut lanes {
-        lane.block.finish(&mut out);
-        lane.summary.finish(&mut out);
-    }
-    if dropped_failing > 0 {
-        out.push_str(&format!(
-            "\n… +{} more failing test classes\n",
-            dropped_failing
-        ));
-    }
+    lanes.finish(&mut out);
+    summary.finish(&mut out);
+    classes.finish(&mut out);
     out
 }
 
@@ -729,17 +860,32 @@ pub fn filter_compile(raw: &str) -> String {
     }
 
     let mut out = String::new();
-    let mut keep_continuation = false;
+    // Continuation ownership is per module: javac emits `symbol:` / `location:`
+    // as raw indented lines *after* the `[ERROR] … cannot find symbol` line, and
+    // mvnd interleaves reactor modules, so a `[child-b] [INFO]` line landing in
+    // between must not clear the flag armed by `[child-a] [ERROR]`. Compile
+    // never opens Surefire blocks, so `route` sends raw lines to the hot lane —
+    // the one that most recently armed a continuation.
+    let mut lanes = Lanes::new();
     let mut seen_warnings: HashSet<String> = HashSet::new();
 
     for line in stripped.lines() {
         // Classify on the module-prefix-stripped view; emit the original so
         // module identity survives in mvnd parallel reactors.
-        let core = split_lane(line).1;
+        let (key, core) = split_lane(line);
+        let idx = match lanes.route(key) {
+            Some(i) => i,
+            // Unreachable without Surefire blocks, but preserve for parity.
+            None => {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+        };
         if MODULE_BANNER.is_match(core) {
             out.push_str(line);
             out.push('\n');
-            keep_continuation = false;
+            lanes.get(idx).keep_continuation = false;
             continue;
         }
         if BUILD_FOOT.is_match(core)
@@ -750,22 +896,23 @@ pub fn filter_compile(raw: &str) -> String {
         {
             out.push_str(line);
             out.push('\n');
-            keep_continuation = false;
+            lanes.get(idx).keep_continuation = false;
             continue;
         }
         // Help boilerplate: drop before the `[ERROR]` catch-all (parity with
         // keep_outside_block / filter_quiet).
         if is_boilerplate(core) {
-            keep_continuation = false;
+            lanes.get(idx).keep_continuation = false;
             continue;
         }
         if core.starts_with("[ERROR]") {
             out.push_str(line);
             out.push('\n');
-            keep_continuation = true;
+            lanes.get(idx).keep_continuation = true;
+            lanes.hot = idx;
             continue;
         }
-        if keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
+        if lanes.get(idx).keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
             out.push_str(line);
             out.push('\n');
             continue;
@@ -777,11 +924,11 @@ pub fn filter_compile(raw: &str) -> String {
                 out.push_str(line);
                 out.push('\n');
             }
-            keep_continuation = false;
+            lanes.get(idx).keep_continuation = false;
             continue;
         }
         // Drop everything else
-        keep_continuation = false;
+        lanes.get(idx).keep_continuation = false;
     }
 
     out
@@ -806,52 +953,24 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
     }
 
     let mut out = String::new();
-    // Per-module lanes + raw-line routing: see filter_surefire_with_cap.
-    let mut lanes: Vec<(&str, SurefireLane)> = vec![("", SurefireLane::new(cap))];
-    let mut hot: usize = 0;
+    // Per-module lanes + raw-line routing: see drive_surefire_line.
+    let mut lanes = Lanes::new();
+    let mut classes = FailingClassCap::new(cap);
+    let mut summary = FailuresSummaryCap::new(cap);
     let mut in_reactor_summary = false;
     // Warning dedup is deliberately global: the same warning surfacing from
     // several reactor modules is still the same warning.
     let mut seen_warnings: HashSet<String> = HashSet::new();
-    let mut emitted_failing: usize = 0;
-    let mut dropped_failing: usize = 0;
 
     for line in stripped.lines() {
-        let (key, core) = split_lane(line);
-        let idx = match key {
-            Some(k) => lane_index(&mut lanes, k, cap),
-            None => hot,
+        let (idx, core) = match drive_surefire_line(&mut lanes, line, &mut classes, &mut out) {
+            Some(v) => v,
+            None => continue,
         };
-
-        let step = lanes[idx].1.block.step(line, core, &mut out);
-        if lanes[idx].1.block.in_block || lanes[idx].1.block.failure_trail {
-            hot = idx;
-        }
-        match step {
-            SurefireStep::Consumed => continue,
-            SurefireStep::FailingClose {
-                running,
-                lines,
-                close,
-            } => {
-                if emitted_failing < cap {
-                    lanes[idx].1.block.commit_failing(&mut out, running, &lines, close);
-                    emitted_failing += 1;
-                } else {
-                    lanes[idx].1.block.drop_failing();
-                    dropped_failing += 1;
-                }
-                hot = idx;
-                lanes[idx].1.keep_continuation = false;
-                continue;
-            }
-            SurefireStep::Passthrough => {}
-        }
-
-        let lane = &mut lanes[idx].1;
+        let lane = lanes.get(idx);
 
         // Failures-summary cap (see filter_surefire_with_cap for details).
-        if lane.summary.handle_entry(core, line, &mut out) {
+        if summary.handle_entry(lane.in_summary, core, line, &mut out) {
             continue;
         }
 
@@ -860,8 +979,8 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
         let reactor_keep = reactor_summary_keep(core, &mut in_reactor_summary);
         // Outside any Surefire block: compile-keep AND surefire-outside-keep merge.
         if reactor_keep || MODULE_BANNER.is_match(core) || keep_outside_block(core) {
-            lane.summary.handle_aggregate(core, &mut out);
-            lane.summary.handle_header(core);
+            summary.handle_aggregate(core, &mut out, &mut lane.in_summary);
+            summary.handle_header(core, &mut lane.in_summary);
             out.push_str(line);
             out.push('\n');
             lane.keep_continuation = core.starts_with("[ERROR]")
@@ -888,16 +1007,9 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
         lane.keep_continuation = false;
     }
 
-    for (_, lane) in &mut lanes {
-        lane.block.finish(&mut out);
-        lane.summary.finish(&mut out);
-    }
-    if dropped_failing > 0 {
-        out.push_str(&format!(
-            "\n… +{} more failing test classes\n",
-            dropped_failing
-        ));
-    }
+    lanes.finish(&mut out);
+    summary.finish(&mut out);
+    classes.finish(&mut out);
     out
 }
 
@@ -1333,6 +1445,144 @@ mod tests {
         let o = filter_surefire(i);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
         assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
+    }
+
+    // The four tests below use inline strings rather than captures: they pin
+    // *interleavings* (which module's line lands between which two others),
+    // and a real `mvnd` run can't be made to emit a chosen interleaving on
+    // demand — the captured fixtures above happen to keep each failure trail
+    // contiguous. Line shapes are copied verbatim from
+    // `mvnd_reactor_fail_raw.txt` / `mvnd_compile_error_raw.txt`, only the
+    // ordering is arranged.
+
+    /// Another module opening a Surefire block *between* a failing close and
+    /// its raw (unprefixed) exception trail must not steal the trail: routing
+    /// those lines into the passing block discards them when it closes green.
+    /// An active failure trail outranks an ordinary open block. Asserted on
+    /// both entry points that drive the lane machinery.
+    fn assert_interleaved_trail_survives(filter: fn(&str) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+             [child-a] [INFO] Running com.example.rtk.ParallelFailTest\n\
+             [child-b] [INFO] Running com.example.rtk.PassBetaTest\n\
+             [child-b] [INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.157 s -- in com.example.rtk.PassBetaTest\n\
+             [child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.153 s <<< FAILURE! -- in com.example.rtk.ParallelFailTest\n\
+             [child-a] [ERROR] com.example.rtk.ParallelFailTest.reactorDiagnostic -- Time elapsed: 0.098 s <<< FAILURE!\n\
+             [child-b] [INFO] Running com.example.rtk.PassGammaTest\n\
+             org.opentest4j.AssertionFailedError: parallel reactor diagnostic ==> expected: <1> but was: <2>\n\
+             \tat com.example.rtk.ParallelFailTest.reactorDiagnostic(ParallelFailTest.java:10)\n\
+             [child-b] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in com.example.rtk.PassGammaTest\n\
+             [child-a] [INFO] \n\
+             [INFO] BUILD FAILURE\n";
+        let o = filter(i);
+        assert!(
+            o.contains("parallel reactor diagnostic ==> expected: <1> but was: <2>"),
+            "assertion message survives the interleave; got:\n{o}"
+        );
+        assert!(
+            o.contains(
+                "at com.example.rtk.ParallelFailTest.reactorDiagnostic(ParallelFailTest.java:10)"
+            ),
+            "user frame survives the interleave; got:\n{o}"
+        );
+        // The interleaving module's passing classes are still collapsed.
+        assert!(!o.contains("PassBetaTest"), "got:\n{o}");
+        assert!(!o.contains("PassGammaTest"), "got:\n{o}");
+    }
+
+    #[test]
+    fn mvnd_interleaved_block_does_not_steal_failure_trail() {
+        assert_interleaved_trail_survives(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_package_interleaved_block_does_not_steal_failure_trail() {
+        assert_interleaved_trail_survives(filter_package);
+    }
+
+    /// Raw lines with no unambiguous owner — several plain blocks open, no
+    /// failure trail — are preserved verbatim rather than buffered into a
+    /// guessed lane that may drop them.
+    fn assert_ambiguous_raw_line_preserved(filter: fn(&str) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+             [child-a] [INFO] Running com.example.rtk.PassAlphaTest\n\
+             [child-b] [INFO] Running com.example.rtk.PassBetaTest\n\
+             java.lang.IllegalStateException: stray reactor stdout\n\
+             [child-a] [INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.026 s -- in com.example.rtk.PassAlphaTest\n\
+             [child-b] [INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.157 s -- in com.example.rtk.PassBetaTest\n\
+             [INFO] BUILD SUCCESS\n";
+        let o = filter(i);
+        assert!(
+            o.contains("stray reactor stdout"),
+            "ambiguous raw line preserved; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn mvnd_ambiguous_raw_line_is_preserved() {
+        assert_ambiguous_raw_line_preserved(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_package_ambiguous_raw_line_is_preserved() {
+        assert_ambiguous_raw_line_preserved(filter_package);
+    }
+
+    /// javac emits `symbol:` / `location:` as raw indented lines *after* the
+    /// `[ERROR] … cannot find symbol` line. A line from another reactor module
+    /// landing in between must not clear the continuation flag — ownership is
+    /// per lane.
+    #[test]
+    fn mvnd_parallel_compile_keeps_interleaved_continuations() {
+        let i = "[INFO] Scanning for projects...\n\
+             [child-a] [ERROR] /C:/work/child-a/src/main/java/com/example/rtk/A.java:[7,9] cannot find symbol\n\
+             [child-b] [INFO] Compiling 1 source file with javac [debug target 21] to target\\classes\n\
+             \x20 symbol:   variable bar\n\
+             \x20 location: class com.example.rtk.A\n\
+             [INFO] BUILD FAILURE\n";
+        let o = filter_compile(i);
+        assert!(
+            o.contains("symbol:   variable bar"),
+            "continuation survives the interleave; got:\n{o}"
+        );
+        assert!(
+            o.contains("location: class com.example.rtk.A"),
+            "continuation survives the interleave; got:\n{o}"
+        );
+    }
+
+    /// The `[ERROR] Failures:` cap is reactor-wide: two modules' summaries
+    /// interleaving must share one budget, not get `modules × cap` entries.
+    fn assert_summary_cap_shared_across_lanes(filter: fn(&str, usize) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+             [child-a] [ERROR] Failures: \n\
+             [child-a] [ERROR]   ChildATest.one:11 boom a1\n\
+             [child-b] [ERROR] Failures: \n\
+             [child-b] [ERROR]   ChildBTest.one:11 boom b1\n\
+             [child-a] [ERROR]   ChildATest.two:12 boom a2\n\
+             [child-b] [ERROR]   ChildBTest.two:12 boom b2\n\
+             [child-a] [ERROR] Tests run: 4, Failures: 2, Errors: 0, Skipped: 0\n\
+             [child-b] [ERROR] Tests run: 4, Failures: 2, Errors: 0, Skipped: 0\n\
+             [INFO] BUILD FAILURE\n";
+        let o = filter(i, 2);
+        assert_eq!(
+            o.matches("boom ").count(),
+            2,
+            "cap=2 bounds the whole reactor, not each module; got:\n{o}"
+        );
+        assert!(
+            o.contains("… +2 more failures"),
+            "tail counts both dropped entries; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn mvnd_failures_summary_cap_is_shared_across_lanes() {
+        assert_summary_cap_shared_across_lanes(filter_surefire_with_cap);
+    }
+
+    #[test]
+    fn mvnd_package_failures_summary_cap_is_shared_across_lanes() {
+        assert_summary_cap_shared_across_lanes(filter_package_with_cap);
     }
 
     // Snapshot regression tests locking the full filtered output of every
