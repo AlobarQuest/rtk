@@ -138,6 +138,65 @@ impl CargoTestHandler {
             has_compile_errors: false,
         }
     }
+
+    /// Compacted `cargo test` summary, before the never-worse guard.
+    fn compute_test_summary(&self, raw: &str) -> Option<String> {
+        if self.summary_lines.is_empty() {
+            let json = extract_json_diagnostics(raw);
+            if self.has_compile_errors || !json.errors.is_empty() {
+                // Content-based (exit 0): a real compile error yields "cargo test: N
+                // errors"; a bare "could not compile" leaves the raw tail fallback.
+                let build_filtered = filter_cargo_build_labeled(raw, "test", 0);
+                if build_filtered.contains("cargo test:") {
+                    return Some(format!("{}\n", build_filtered));
+                }
+                // Fallback: last 5 meaningful lines
+                let meaningful: Vec<&str> = raw
+                    .lines()
+                    .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with("Compiling"))
+                    .collect();
+                let last5: Vec<&str> = meaningful.iter().rev().take(5).rev().copied().collect();
+                return Some(format!("{}\n", last5.join("\n")));
+            }
+        }
+
+        // No failures emitted — aggregate pass results
+        let mut aggregated: Option<AggregatedTestResult> = None;
+        let mut all_parsed = true;
+
+        for line in &self.summary_lines {
+            if let Some(parsed) = AggregatedTestResult::parse_line(line) {
+                if let Some(ref mut agg) = aggregated {
+                    agg.merge(&parsed);
+                } else {
+                    aggregated = Some(parsed);
+                }
+            } else {
+                all_parsed = false;
+                break;
+            }
+        }
+
+        if all_parsed {
+            if let Some(agg) = aggregated {
+                if agg.suites > 0 {
+                    return Some(format!("{}\n", agg.format_compact()));
+                }
+            }
+        }
+
+        // Fallback: show raw summary lines
+        if !self.summary_lines.is_empty() {
+            let mut s = String::new();
+            for line in &self.summary_lines {
+                s.push_str(line);
+                s.push('\n');
+            }
+            return Some(s);
+        }
+
+        None
+    }
 }
 
 impl BlockHandler for CargoTestHandler {
@@ -200,64 +259,8 @@ impl BlockHandler for CargoTestHandler {
         // compacted summary ends up larger than the raw output (e.g. a tiny
         // `cargo test` run), keep the raw output instead of "compacting" it
         // into something bigger.
-        let summary = (|| -> Option<String> {
-        if self.summary_lines.is_empty() {
-            let json = extract_json_diagnostics(raw);
-            if self.has_compile_errors || !json.errors.is_empty() {
-                // Content-based (exit 0): a real compile error yields "cargo test: N
-                // errors"; a bare "could not compile" leaves the raw tail fallback.
-                let build_filtered = filter_cargo_build_labeled(raw, "test", 0);
-                if build_filtered.contains("cargo test:") {
-                    return Some(format!("{}\n", build_filtered));
-                }
-                // Fallback: last 5 meaningful lines
-                let meaningful: Vec<&str> = raw
-                    .lines()
-                    .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with("Compiling"))
-                    .collect();
-                let last5: Vec<&str> = meaningful.iter().rev().take(5).rev().copied().collect();
-                return Some(format!("{}\n", last5.join("\n")));
-            }
-        }
-
-        // No failures emitted — aggregate pass results
-        let mut aggregated: Option<AggregatedTestResult> = None;
-        let mut all_parsed = true;
-
-        for line in &self.summary_lines {
-            if let Some(parsed) = AggregatedTestResult::parse_line(line) {
-                if let Some(ref mut agg) = aggregated {
-                    agg.merge(&parsed);
-                } else {
-                    aggregated = Some(parsed);
-                }
-            } else {
-                all_parsed = false;
-                break;
-            }
-        }
-
-        if all_parsed {
-            if let Some(agg) = aggregated {
-                if agg.suites > 0 {
-                    return Some(format!("{}\n", agg.format_compact()));
-                }
-            }
-        }
-
-        // Fallback: show raw summary lines
-        if !self.summary_lines.is_empty() {
-            let mut s = String::new();
-            for line in &self.summary_lines {
-                s.push_str(line);
-                s.push('\n');
-            }
-            return Some(s);
-        }
-
-        None
-        })();
-        summary.map(|s| crate::core::guard::never_worse(raw, &s).to_string())
+        let summary = self.compute_test_summary(raw)?;
+        Some(crate::core::guard::never_worse(raw, &summary).to_string())
     }
 }
 
@@ -1574,6 +1577,35 @@ mod tests {
         let output = TINY_BUILD_SUCCESS_OUTPUT;
         let result = filter_cargo_build(output);
         assert_eq!(result, output);
+    }
+
+    #[test]
+    fn test_cargo_test_summary_uses_raw_when_summary_is_larger() {
+        // A one-line compile failure is already minimal: prefixing it with the
+        // "cargo test: N errors, ..." header emits more tokens than the raw
+        // output, so the never-worse guard must keep the raw output.
+        const CARGO_COMPILE_FAILURE_EXIT_CODE: i32 = 101;
+        let raw = "error[E0433]: failed to resolve: use of undeclared type `Foo`\n";
+
+        let mut handler = CargoTestHandler::new();
+        for line in raw.lines() {
+            handler.should_skip(line);
+        }
+
+        let unguarded = handler
+            .compute_test_summary(raw)
+            .expect("compile failure yields a summary");
+        assert!(
+            unguarded.len() > raw.len(),
+            "expected the compacted summary to be larger than the raw output, got {:?}",
+            unguarded
+        );
+        assert_eq!(
+            handler
+                .format_summary(CARGO_COMPILE_FAILURE_EXIT_CODE, raw)
+                .as_deref(),
+            Some(raw)
+        );
     }
 
     #[test]
