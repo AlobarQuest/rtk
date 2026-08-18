@@ -172,8 +172,15 @@ fn is_blank_separator(line: &str) -> bool {
 /// Returns `(Some(key), core)` for log-level lines — `key` is the module tag
 /// (`""` for unprefixed reactor-level lines) and `core` is the line with the
 /// module prefix stripped, for classification — or `(None, line)` for raw
-/// lines (stack traces, stray stdout), which belong to whichever lane most
-/// recently opened a Surefire block or failure trail.
+/// lines (stack traces, stray stdout), whose owning lane is resolved by
+/// [`Lanes::raw_owner`] (unique owner, or preserved verbatim).
+///
+/// Residual seam: a raw line of shape `[tag] text` where `tag` is not a log
+/// level and `text` doesn't start with `[` (e.g. slf4j's `[main] INFO …` on
+/// test stdout) keys to the root lane rather than classifying as raw, so
+/// inside a trail it bypasses trail handling and falls to the root
+/// keep-list. Real Surefire trail lines start with an FQCN, `at `,
+/// `Caused by:`, or whitespace, so no realistic diagnostic takes this path.
 fn split_lane(line: &str) -> (Option<&str>, &str) {
     if !line.starts_with('[') {
         return (None, line);
@@ -499,16 +506,20 @@ impl<'a> SurefireBlock<'a> {
 /// before the `Tests run:` aggregate when entries were dropped.
 ///
 /// The budget is **reactor-wide**, not per module: a parallel reactor emits one
-/// summary block per failing module and they interleave, so each lane keeps its
-/// own `in_summary` flag ([`SurefireLane::in_summary`]) while the entry count is
-/// shared. Counters reset only when a header opens the *first* summary, so
-/// sequential runs behave exactly as before (one summary at a time) while
-/// interleaved ones can't retain `modules × cap` entries.
+/// summary block per failing module, so each lane keeps its own `in_summary`
+/// flag ([`SurefireLane::in_summary`]) while the entry count is shared. The
+/// budget spans the whole filter invocation and never resets — whether module
+/// summaries interleave or run back-to-back, the run keeps at most `cap`
+/// entries total, never `modules × cap`. `dropped` alone resets when a tail is
+/// emitted, so each `… +N more` reports the drops since the previous tail.
+/// This also means a `verify` run whose Surefire and Failsafe phases each emit
+/// a summary shares one budget across both — the second summary can get zero
+/// entries, with the tail still reporting every drop. That is the documented
+/// semantics: at most `cap` entries per run.
 struct FailuresSummaryCap {
     cap: usize,
     emitted: usize,
     dropped: usize,
-    open_lanes: usize,
 }
 
 impl FailuresSummaryCap {
@@ -517,7 +528,6 @@ impl FailuresSummaryCap {
             cap,
             emitted: 0,
             dropped: 0,
-            open_lanes: 0,
         }
     }
 
@@ -546,12 +556,7 @@ impl FailuresSummaryCap {
         if !line.starts_with("[ERROR] Failures:") || *in_summary {
             return;
         }
-        if self.open_lanes == 0 {
-            self.emitted = 0;
-            self.dropped = 0;
-        }
         *in_summary = true;
-        self.open_lanes += 1;
     }
 
     /// Pre-emit the `… +N more failures` tail when the aggregate
@@ -566,14 +571,13 @@ impl FailuresSummaryCap {
             self.dropped = 0;
         }
         *in_summary = false;
-        self.open_lanes -= 1;
     }
 
     /// End-of-stream tail emission for cases where the AGG line never arrives
     /// (truncated output). Emits the tail with no trailing newline guard so
     /// the resulting filtered output is still well-formed.
     fn finish(&mut self, out: &mut String) {
-        if self.open_lanes > 0 && self.dropped > 0 {
+        if self.dropped > 0 {
             out.push_str(&format!("\n… +{} more failures\n", self.dropped));
         }
     }
@@ -600,11 +604,16 @@ impl<'a> SurefireLane<'a> {
     }
 }
 
-/// The set of per-module lanes plus the "hot" lane raw lines default to.
-/// Lane 0 (`""`) is the root lane, the only one a plain-`mvn` (or
-/// single-module mvnd) run ever uses. Insertion order is preserved so
-/// end-of-stream flushes are deterministic; lookups are a linear scan (a
-/// reactor has a handful of modules, not thousands).
+/// The set of per-module lanes plus the "hot" lane raw lines fall back to
+/// when no block, trail, or armed continuation exists anywhere. `hot` has a
+/// single writer — a failing close (stray raw lines after its trail ends
+/// attribute to the failing lane's keep-list); every other ownership claim
+/// (trails, open blocks, armed continuations) is resolved by
+/// [`Lanes::raw_owner`] scanning per-lane state for a unique owner. Lane 0
+/// (`""`) is the root lane, the only one a plain-`mvn` (or single-module
+/// mvnd) run ever uses. Insertion order is preserved so end-of-stream
+/// flushes are deterministic; lookups are a linear scan (a reactor has a
+/// handful of modules, not thousands).
 struct Lanes<'a> {
     lanes: Vec<(&'a str, SurefireLane<'a>)>,
     hot: usize,
@@ -642,18 +651,57 @@ impl<'a> Lanes<'a> {
     /// Lane owning an unprefixed raw line (stack trace, stray stdout — mvnd
     /// emits these without a module tag even in parallel builds).
     ///
-    /// A lane inside a **failure trail** outranks one merely inside an open
-    /// block: the trail is where the actionable diagnostics land, and another
-    /// module opening a block between a failing close and its exception must
-    /// not swallow them (that block then closes green and the trail is
-    /// discarded). `None` means ownership is genuinely ambiguous — several
-    /// plain blocks open, no trail.
+    /// One rule, applied literally: a raw line is routed only when its owner
+    /// is **unique** — exactly one lane in a failure trail (trails outrank
+    /// open blocks: that's where actionable diagnostics land), else exactly
+    /// one lane with an open block. Any tie is genuine ambiguity → `None`,
+    /// and the caller preserves the line verbatim rather than guessing a lane
+    /// that may drop it. With nothing open at all there is no block or trail
+    /// to misroute into, so the hot lane's outside-block keep-list decides.
+    ///
+    /// An armed compile continuation is itself a competing claim, wherever
+    /// its lane sits — the arming lane need not be `hot`, since a failing
+    /// close elsewhere steals `hot` unconditionally. Its raw `symbol:` /
+    /// `location:` lines must be neither buffered into another lane's open
+    /// block (destroyed on a green close) nor consumed by a trail (silently,
+    /// if that trail is dropping), so any block or trail open alongside an
+    /// armed lane is a tie too, and several armed lanes are a tie on their
+    /// own. With nothing open, a unique armed lane outranks the hot lane —
+    /// its continuations are the only raw lines anyone is expecting.
+    ///
+    /// Deliberate over-keep, never loss: when a tie preserves verbatim, a
+    /// capped class's framework frames (or a passing block's stack chatter)
+    /// can leak into the output for the duration of the tie — and an armed
+    /// claim persists until its lane's next keyed line, so the tie window
+    /// can outlive the continuations themselves. That trades a few noise
+    /// lines for the guarantee that actionable diagnostics are never routed
+    /// into a lane that discards them.
+    ///
+    /// A unique *dropping* trail consuming raw lines silently is loss-free
+    /// even with blocks open concurrently: a dropping trail exists only once
+    /// the class cap is exhausted ([`FailingClassCap::admit`] is monotonic),
+    /// so a concurrent block's failing close would be capped and dropped
+    /// too, and a green close discards its buffer by definition.
     fn raw_owner(&self) -> Option<usize> {
-        if self.lanes[self.hot].1.block.failure_trail {
-            return Some(self.hot);
-        }
-        if let Some(i) = self.lanes.iter().position(|(_, l)| l.block.failure_trail) {
-            return Some(i);
+        let mut armed_lanes = self
+            .lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, l))| l.keep_continuation);
+        let armed = match (armed_lanes.next(), armed_lanes.next()) {
+            (Some((i, _)), None) => Some(i),
+            (Some(_), Some(_)) => return None,
+            _ => None,
+        };
+        let mut trails = self
+            .lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, l))| l.block.failure_trail);
+        match (trails.next(), trails.next()) {
+            (Some((i, _)), None) if armed.is_none() => return Some(i),
+            (Some(_), _) => return None,
+            _ => {}
         }
         let mut open = self
             .lanes
@@ -661,20 +709,11 @@ impl<'a> Lanes<'a> {
             .enumerate()
             .filter(|(_, (_, l))| l.block.in_block);
         match (open.next(), open.next()) {
-            (Some((i, _)), None) => Some(i),
-            (Some(_), Some(_)) => None,
-            // Nothing open: the hot lane's outside-block keep-list decides.
-            _ => Some(self.hot),
-        }
-    }
-
-    /// Update the default lane for raw lines after `idx` consumed one. A
-    /// failure trail claims it outright; a plain open block only claims it
-    /// while no trail is active.
-    fn note_hot(&mut self, idx: usize) {
-        let b = &self.lanes[idx].1.block;
-        if b.failure_trail || (b.in_block && !self.lanes[self.hot].1.block.failure_trail) {
-            self.hot = idx;
+            (Some((i, _)), None) if armed.is_none() => Some(i),
+            (Some(_), _) => None,
+            // Nothing open: the unique armed lane's continuation handling,
+            // else the hot lane's outside-block keep-list, decides.
+            _ => Some(armed.unwrap_or(self.hot)),
         }
     }
 
@@ -750,7 +789,12 @@ fn drive_surefire_line<'a>(
     };
 
     let step = lanes.get(idx).block.step(line, core, out);
-    lanes.note_hot(idx);
+    // A lane inside a Surefire block has no pending javac continuations:
+    // entering a block retires any stale armed claim, so a single lane can't
+    // hold a permanent armed-vs-block tie against raw-line routing.
+    if lanes.get(idx).block.in_block {
+        lanes.get(idx).keep_continuation = false;
+    }
     match step {
         SurefireStep::Consumed => None,
         SurefireStep::FailingClose {
@@ -763,7 +807,9 @@ fn drive_surefire_line<'a>(
             } else {
                 lanes.get(idx).block.drop_failing();
             }
-            // A failing close means a trail follows: claim raw lines outright.
+            // While the trail is active, raw_owner routes by trail uniqueness;
+            // `hot` claims only the nothing-open fallback for stray raw lines
+            // after the trail ends.
             lanes.hot = idx;
             lanes.get(idx).keep_continuation = false;
             None
@@ -802,9 +848,7 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
             Some(v) => v,
             None => continue,
         };
-        let lane = lanes.get(idx);
-
-        if lane.keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
+        if lanes.get(idx).keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
             out.push_str(line);
             out.push('\n');
             continue;
@@ -813,7 +857,7 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
         // Failures-summary cap: gate `[ERROR]   ` entries, emit `+N more` tail
         // before AGG. The helper consumes only summary entries — other lines
         // (header, AGG) fall through to the keep-list below.
-        if summary.handle_entry(lane.in_summary, core, line, &mut out) {
+        if summary.handle_entry(lanes.get(idx).in_summary, core, line, &mut out) {
             continue;
         }
 
@@ -822,12 +866,15 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
         let reactor_keep = reactor_summary_keep(core, &mut in_reactor_summary);
         if reactor_keep || keep_outside_block(core) {
             // Pre-emit the summary tail when we're about to write AGG.
-            summary.handle_aggregate(core, &mut out, &mut lane.in_summary);
+            summary.handle_aggregate(core, &mut out, &mut lanes.get(idx).in_summary);
             // Detect summary header so subsequent `[ERROR]   ` entries get capped.
-            summary.handle_header(core, &mut lane.in_summary);
+            summary.handle_header(core, &mut lanes.get(idx).in_summary);
             out.push_str(line);
             out.push('\n');
-            lane.keep_continuation = core.starts_with("[ERROR]")
+            // The armed per-lane flag is an owner claim in its own right:
+            // raw_owner routes (or verbatim-preserves) the raw indented
+            // continuations by scanning all lanes for it.
+            lanes.get(idx).keep_continuation = core.starts_with("[ERROR]")
                 && !core.starts_with("[ERROR] Tests run:")
                 && !core.starts_with("[ERROR] Failures:")
                 && !core.starts_with("[ERROR] Errors:");
@@ -835,8 +882,14 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
         }
         // Dropped line (e.g. help boilerplate): reset so a stale flag can't
         // keep an indented line that follows a dropped `[ERROR]` line.
-        // Parity with filter_package's fall-through reset.
-        lane.keep_continuation = false;
+        // Parity with filter_package's fall-through reset. Known limit: a raw
+        // non-indented stray line (another module's stdout) landing in the
+        // one-line window between arm and `symbol:` also resets — with
+        // nothing open it routes to the armed lane and falls through here.
+        // Sequentially this reset is load-bearing; the interleaved stray is
+        // rare and costs the remaining continuations, never the `[ERROR]`
+        // diagnostic line itself.
+        lanes.get(idx).keep_continuation = false;
     }
 
     lanes.finish(&mut out);
@@ -864,8 +917,8 @@ pub fn filter_compile(raw: &str) -> String {
     // as raw indented lines *after* the `[ERROR] … cannot find symbol` line, and
     // mvnd interleaves reactor modules, so a `[child-b] [INFO]` line landing in
     // between must not clear the flag armed by `[child-a] [ERROR]`. Compile
-    // never opens Surefire blocks, so `route` sends raw lines to the hot lane —
-    // the one that most recently armed a continuation.
+    // never opens Surefire blocks, so `route` resolves raw lines to the unique
+    // armed lane (or preserves them verbatim when several lanes are armed).
     let mut lanes = Lanes::new();
     let mut seen_warnings: HashSet<String> = HashSet::new();
 
@@ -875,7 +928,8 @@ pub fn filter_compile(raw: &str) -> String {
         let (key, core) = split_lane(line);
         let idx = match lanes.route(key) {
             Some(i) => i,
-            // Unreachable without Surefire blocks, but preserve for parity.
+            // Reachable when two modules are armed concurrently (a tie):
+            // preserve the raw line verbatim rather than guess an owner.
             None => {
                 out.push_str(line);
                 out.push('\n');
@@ -908,8 +962,9 @@ pub fn filter_compile(raw: &str) -> String {
         if core.starts_with("[ERROR]") {
             out.push_str(line);
             out.push('\n');
+            // Armed flag is an owner claim scanned by raw_owner — no `hot`
+            // bookkeeping needed.
             lanes.get(idx).keep_continuation = true;
-            lanes.hot = idx;
             continue;
         }
         if lanes.get(idx).keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
@@ -967,10 +1022,8 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
             Some(v) => v,
             None => continue,
         };
-        let lane = lanes.get(idx);
-
         // Failures-summary cap (see filter_surefire_with_cap for details).
-        if summary.handle_entry(lane.in_summary, core, line, &mut out) {
+        if summary.handle_entry(lanes.get(idx).in_summary, core, line, &mut out) {
             continue;
         }
 
@@ -979,17 +1032,19 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
         let reactor_keep = reactor_summary_keep(core, &mut in_reactor_summary);
         // Outside any Surefire block: compile-keep AND surefire-outside-keep merge.
         if reactor_keep || MODULE_BANNER.is_match(core) || keep_outside_block(core) {
-            summary.handle_aggregate(core, &mut out, &mut lane.in_summary);
-            summary.handle_header(core, &mut lane.in_summary);
+            summary.handle_aggregate(core, &mut out, &mut lanes.get(idx).in_summary);
+            summary.handle_header(core, &mut lanes.get(idx).in_summary);
             out.push_str(line);
             out.push('\n');
-            lane.keep_continuation = core.starts_with("[ERROR]")
+            // Armed flag is an owner claim scanned by raw_owner — see
+            // filter_surefire_with_cap.
+            lanes.get(idx).keep_continuation = core.starts_with("[ERROR]")
                 && !core.starts_with("[ERROR] Tests run:")
                 && !core.starts_with("[ERROR] Failures:")
                 && !core.starts_with("[ERROR] Errors:");
             continue;
         }
-        if lane.keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
+        if lanes.get(idx).keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
             out.push_str(line);
             out.push('\n');
             continue;
@@ -1001,10 +1056,10 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
                 out.push_str(line);
                 out.push('\n');
             }
-            lane.keep_continuation = false;
+            lanes.get(idx).keep_continuation = false;
             continue;
         }
-        lane.keep_continuation = false;
+        lanes.get(idx).keep_continuation = false;
     }
 
     lanes.finish(&mut out);
@@ -1447,7 +1502,7 @@ mod tests {
         assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
     }
 
-    // The four tests below use inline strings rather than captures: they pin
+    // The tests below use inline strings rather than captures: they pin
     // *interleavings* (which module's line lands between which two others),
     // and a real `mvnd` run can't be made to emit a chosen interleaving on
     // demand — the captured fixtures above happen to keep each failure trail
@@ -1583,6 +1638,373 @@ mod tests {
     #[test]
     fn mvnd_package_failures_summary_cap_is_shared_across_lanes() {
         assert_summary_cap_shared_across_lanes(filter_package_with_cap);
+    }
+
+    /// The failures-summary budget spans the whole invocation: module
+    /// summaries that run back-to-back (child A opens and closes its summary
+    /// before child B opens) share one budget too — sequential lanes must not
+    /// each get a fresh `cap`.
+    fn assert_summary_cap_spans_sequential_lanes(filter: fn(&str, usize) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+             [child-a] [ERROR] Failures: \n\
+             [child-a] [ERROR]   ChildATest.one:11 boom a1\n\
+             [child-a] [ERROR]   ChildATest.two:12 boom a2\n\
+             [child-a] [ERROR] Tests run: 4, Failures: 2, Errors: 0, Skipped: 0\n\
+             [child-b] [ERROR] Failures: \n\
+             [child-b] [ERROR]   ChildBTest.one:11 boom b1\n\
+             [child-b] [ERROR]   ChildBTest.two:12 boom b2\n\
+             [child-b] [ERROR] Tests run: 4, Failures: 2, Errors: 0, Skipped: 0\n\
+             [INFO] BUILD FAILURE\n";
+        let o = filter(i, 2);
+        assert_eq!(
+            o.matches("boom ").count(),
+            2,
+            "cap=2 bounds the whole run, sequential summaries included; got:\n{o}"
+        );
+        assert!(
+            o.contains("… +2 more failures"),
+            "tail reports the dropped second-module entries; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn mvnd_failures_summary_cap_spans_sequential_lanes() {
+        assert_summary_cap_spans_sequential_lanes(filter_surefire_with_cap);
+    }
+
+    #[test]
+    fn mvnd_package_failures_summary_cap_spans_sequential_lanes() {
+        assert_summary_cap_spans_sequential_lanes(filter_package_with_cap);
+    }
+
+    /// A compile error surfacing inside a test/package run: the raw indented
+    /// `symbol:` / `location:` continuations must route back to the module
+    /// that armed them even when another module's line lands in between —
+    /// arming claims raw-line ownership on these paths too, not just in
+    /// `filter_compile`.
+    fn assert_interleaved_compile_continuation_survives(filter: fn(&str) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+             [child-a] [ERROR] /C:/work/child-a/src/main/java/com/example/rtk/A.java:[7,9] cannot find symbol\n\
+             [child-b] [INFO] Compiling 1 source file with javac [debug target 21] to target\\classes\n\
+             \x20 symbol:   variable bar\n\
+             \x20 location: class com.example.rtk.A\n\
+             [INFO] BUILD FAILURE\n";
+        let o = filter(i);
+        assert!(
+            o.contains("symbol:   variable bar"),
+            "continuation survives the interleave; got:\n{o}"
+        );
+        assert!(
+            o.contains("location: class com.example.rtk.A"),
+            "continuation survives the interleave; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn mvnd_surefire_interleaved_compile_continuation_survives() {
+        assert_interleaved_compile_continuation_survives(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_package_interleaved_compile_continuation_survives() {
+        assert_interleaved_compile_continuation_survives(filter_package);
+    }
+
+    // ── Exhaustive interleaving sweeps ──────────────────────────────────────
+    //
+    // mvnd's scheduler controls interleaving, not us: any order-preserving
+    // merge of two modules' output is a run that can really happen. Rather
+    // than pinning hand-picked orderings one review round at a time, sweep
+    // every merge and assert the failure signal survives all of them —
+    // routed into its lane or preserved verbatim, never dropped.
+
+    /// All order-preserving merges of `a` and `b` (each module's own lines
+    /// keep their order; the interleaving varies).
+    fn merges<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<Vec<&'a str>> {
+        fn rec<'a>(
+            a: &[&'a str],
+            b: &[&'a str],
+            prefix: &mut Vec<&'a str>,
+            out: &mut Vec<Vec<&'a str>>,
+        ) {
+            if a.is_empty() && b.is_empty() {
+                out.push(prefix.clone());
+                return;
+            }
+            if let Some((&h, t)) = a.split_first() {
+                prefix.push(h);
+                rec(t, b, prefix, out);
+                prefix.pop();
+            }
+            if let Some((&h, t)) = b.split_first() {
+                prefix.push(h);
+                rec(a, t, prefix, out);
+                prefix.pop();
+            }
+        }
+        let mut out = Vec::new();
+        rec(a, b, &mut Vec::new(), &mut out);
+        out
+    }
+
+    fn sweep_input(merge: &[&str]) -> String {
+        format!(
+            "[INFO] Scanning for projects...\n{}\n[INFO] BUILD FAILURE\n",
+            merge.join("\n")
+        )
+    }
+
+    /// child-a: one failing class — Running, failing close, per-test subline,
+    /// raw exception message, raw user frame, blank trail terminator. Line
+    /// shapes copied from `mvnd_reactor_fail_raw.txt`.
+    const SWEEP_FAIL_A: [&str; 6] = [
+        "[child-a] [INFO] Running com.example.rtk.ParallelFailTest",
+        "[child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.153 s <<< FAILURE! -- in com.example.rtk.ParallelFailTest",
+        "[child-a] [ERROR] com.example.rtk.ParallelFailTest.reactorDiagnostic -- Time elapsed: 0.098 s <<< FAILURE!",
+        "org.opentest4j.AssertionFailedError: parallel reactor diagnostic ==> expected: <1> but was: <2>",
+        "\tat com.example.rtk.ParallelFailTest.reactorDiagnostic(ParallelFailTest.java:10)",
+        "[child-a] [INFO] ",
+    ];
+
+    /// child-b: two passing classes (open/close, open/close).
+    const SWEEP_PASS_B: [&str; 4] = [
+        "[child-b] [INFO] Running com.example.rtk.PassBetaTest",
+        "[child-b] [INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.157 s -- in com.example.rtk.PassBetaTest",
+        "[child-b] [INFO] Running com.example.rtk.PassGammaTest",
+        "[child-b] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in com.example.rtk.PassGammaTest",
+    ];
+
+    /// child-a variant: a compile error with raw indented continuations —
+    /// arming a continuation must survive racing another module's open block.
+    const SWEEP_COMPILE_A: [&str; 3] = [
+        "[child-a] [ERROR] /C:/work/child-a/src/main/java/com/example/rtk/A.java:[7,9] cannot find symbol",
+        "  symbol:   variable bar",
+        "  location: class com.example.rtk.A",
+    ];
+
+    /// child-b variant: one failing class of its own, for the capped sweep.
+    const SWEEP_FAIL_B: [&str; 6] = [
+        "[child-b] [INFO] Running com.example.rtk.OtherFailTest",
+        "[child-b] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.120 s <<< FAILURE! -- in com.example.rtk.OtherFailTest",
+        "[child-b] [ERROR] com.example.rtk.OtherFailTest.otherDiagnostic -- Time elapsed: 0.080 s <<< FAILURE!",
+        "org.opentest4j.AssertionFailedError: other reactor diagnostic ==> expected: <3> but was: <4>",
+        "\tat com.example.rtk.OtherFailTest.otherDiagnostic(OtherFailTest.java:8)",
+        "[child-b] [INFO] ",
+    ];
+
+    /// Failing module × passing module, all 210 merges: the failure's close
+    /// line, assertion message, and user frame survive every interleaving,
+    /// and the passing module's classes stay collapsed in every one.
+    fn assert_every_interleaving_keeps_diagnostics(filter: fn(&str) -> String) {
+        for (n, m) in merges(&SWEEP_FAIL_A, &SWEEP_PASS_B).iter().enumerate() {
+            let i = sweep_input(m);
+            let o = filter(&i);
+            assert!(
+                o.contains("expected: <1> but was: <2>")
+                    && o.contains("ParallelFailTest.reactorDiagnostic(ParallelFailTest.java:10)")
+                    && o.contains("<<< FAILURE! -- in com.example.rtk.ParallelFailTest"),
+                "merge #{n} lost failure signal;\ninput:\n{i}\noutput:\n{o}"
+            );
+            assert!(
+                !o.contains("PassBetaTest") && !o.contains("PassGammaTest"),
+                "merge #{n} leaked passing classes;\ninput:\n{i}\noutput:\n{o}"
+            );
+        }
+    }
+
+    #[test]
+    fn mvnd_every_interleaving_keeps_diagnostics() {
+        assert_every_interleaving_keeps_diagnostics(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_package_every_interleaving_keeps_diagnostics() {
+        assert_every_interleaving_keeps_diagnostics(filter_package);
+    }
+
+    /// Two failing modules under `cap = 1`, all 924 merges: whichever class
+    /// the cap admits keeps its full diagnostics in every interleaving — a
+    /// capped (dropping) trail in one lane must never swallow the admitted
+    /// lane's raw exception or frames — and the `+1 more` tail always
+    /// reports the capped class.
+    fn assert_every_interleaving_keeps_admitted_class(filter: fn(&str, usize) -> String) {
+        for (n, m) in merges(&SWEEP_FAIL_A, &SWEEP_FAIL_B).iter().enumerate() {
+            let i = sweep_input(m);
+            let o = filter(&i, 1);
+            let a = o.contains("<<< FAILURE! -- in com.example.rtk.ParallelFailTest");
+            let b = o.contains("<<< FAILURE! -- in com.example.rtk.OtherFailTest");
+            assert!(
+                a != b,
+                "merge #{n}: exactly one class admitted under cap=1;\ninput:\n{i}\noutput:\n{o}"
+            );
+            let (msg, frame) = if a {
+                (
+                    "expected: <1> but was: <2>",
+                    "ParallelFailTest.reactorDiagnostic(ParallelFailTest.java:10)",
+                )
+            } else {
+                (
+                    "expected: <3> but was: <4>",
+                    "OtherFailTest.otherDiagnostic(OtherFailTest.java:8)",
+                )
+            };
+            assert!(
+                o.contains(msg) && o.contains(frame),
+                "merge #{n}: admitted class lost its diagnostics;\ninput:\n{i}\noutput:\n{o}"
+            );
+            assert!(
+                o.contains("+1 more failing test classes"),
+                "merge #{n}: cap tail missing;\ninput:\n{i}\noutput:\n{o}"
+            );
+        }
+    }
+
+    #[test]
+    fn mvnd_every_interleaving_keeps_admitted_class() {
+        assert_every_interleaving_keeps_admitted_class(filter_surefire_with_cap);
+    }
+
+    #[test]
+    fn mvnd_package_every_interleaving_keeps_admitted_class() {
+        assert_every_interleaving_keeps_admitted_class(filter_package_with_cap);
+    }
+
+    /// Compile-error module × passing test module, all 35 merges: the raw
+    /// `symbol:` / `location:` continuations survive every interleaving —
+    /// in particular when they race another module's open Surefire block,
+    /// which must not buffer them into a green close that discards them.
+    fn assert_every_interleaving_keeps_compile_continuation(filter: fn(&str) -> String) {
+        for (n, m) in merges(&SWEEP_COMPILE_A, &SWEEP_PASS_B).iter().enumerate() {
+            let i = sweep_input(m);
+            let o = filter(&i);
+            assert!(
+                o.contains("symbol:   variable bar")
+                    && o.contains("location: class com.example.rtk.A"),
+                "merge #{n} lost compile continuation;\ninput:\n{i}\noutput:\n{o}"
+            );
+            assert!(
+                !o.contains("PassBetaTest") && !o.contains("PassGammaTest"),
+                "merge #{n} leaked passing classes;\ninput:\n{i}\noutput:\n{o}"
+            );
+        }
+    }
+
+    #[test]
+    fn mvnd_every_interleaving_keeps_compile_continuation() {
+        assert_every_interleaving_keeps_compile_continuation(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_package_every_interleaving_keeps_compile_continuation() {
+        assert_every_interleaving_keeps_compile_continuation(filter_package);
+    }
+
+    /// Compile-error module × *failing* test module, all 84 merges: the armed
+    /// continuation claim must survive a failing close stealing `hot` — the
+    /// admitted class's diagnostics and the compile continuations both
+    /// survive every interleaving.
+    fn assert_every_interleaving_keeps_continuation_and_failure(filter: fn(&str) -> String) {
+        for (n, m) in merges(&SWEEP_COMPILE_A, &SWEEP_FAIL_B).iter().enumerate() {
+            let i = sweep_input(m);
+            let o = filter(&i);
+            assert!(
+                o.contains("symbol:   variable bar")
+                    && o.contains("location: class com.example.rtk.A"),
+                "merge #{n} lost compile continuation;\ninput:\n{i}\noutput:\n{o}"
+            );
+            assert!(
+                o.contains("expected: <3> but was: <4>")
+                    && o.contains("OtherFailTest.otherDiagnostic(OtherFailTest.java:8)")
+                    && o.contains("<<< FAILURE! -- in com.example.rtk.OtherFailTest"),
+                "merge #{n} lost failure signal;\ninput:\n{i}\noutput:\n{o}"
+            );
+        }
+    }
+
+    #[test]
+    fn mvnd_every_interleaving_keeps_continuation_and_failure() {
+        assert_every_interleaving_keeps_continuation_and_failure(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_package_every_interleaving_keeps_continuation_and_failure() {
+        assert_every_interleaving_keeps_continuation_and_failure(filter_package);
+    }
+
+    /// Dropping-trail variant of the orphaned-continuation case, cap=1: A's
+    /// class is admitted, B's is capped (its trail is consuming raw lines
+    /// silently), and C arms a compile continuation. The continuations land
+    /// while B's dropping trail is active — an armed lane alongside a trail
+    /// is a tie, so they must be preserved verbatim, not swallowed by the
+    /// dropping trail.
+    fn assert_continuation_survives_dropping_trail(filter: fn(&str, usize) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+             [child-a] [INFO] Running com.example.rtk.ParallelFailTest\n\
+             [child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.153 s <<< FAILURE! -- in com.example.rtk.ParallelFailTest\n\
+             org.opentest4j.AssertionFailedError: parallel reactor diagnostic ==> expected: <1> but was: <2>\n\
+             [child-a] [INFO] \n\
+             [child-b] [INFO] Running com.example.rtk.OtherFailTest\n\
+             [child-b] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.120 s <<< FAILURE! -- in com.example.rtk.OtherFailTest\n\
+             [child-c] [ERROR] /C:/work/child-c/src/main/java/com/example/rtk/C.java:[7,9] cannot find symbol\n\
+             \x20 symbol:   variable bar\n\
+             \x20 location: class com.example.rtk.C\n\
+             [child-b] [INFO] \n\
+             [INFO] BUILD FAILURE\n";
+        let o = filter(i, 1);
+        assert!(
+            o.contains("symbol:   variable bar") && o.contains("location: class com.example.rtk.C"),
+            "continuations survive a concurrent dropping trail; got:\n{o}"
+        );
+        assert!(
+            o.contains("expected: <1> but was: <2>"),
+            "admitted class keeps its diagnostics; got:\n{o}"
+        );
+        assert!(
+            o.contains("+1 more failing test classes"),
+            "capped class reported in the tail; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn mvnd_continuation_survives_dropping_trail() {
+        assert_continuation_survives_dropping_trail(filter_surefire_with_cap);
+    }
+
+    #[test]
+    fn mvnd_package_continuation_survives_dropping_trail() {
+        assert_continuation_survives_dropping_trail(filter_package_with_cap);
+    }
+
+    /// Entering a Surefire block retires a lane's stale armed claim: a lane
+    /// that armed a continuation and then opened its own block must not hold
+    /// a permanent armed-vs-block tie that leaks its in-block stdout
+    /// verbatim past a green close.
+    fn assert_block_entry_retires_armed_claim(filter: fn(&str) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+             [child-a] [ERROR] /C:/work/child-a/src/main/java/com/example/rtk/A.java:[7,9] cannot find symbol\n\
+             [child-a] [INFO] Running com.example.rtk.PassAlphaTest\n\
+             stray in-block stdout line\n\
+             [child-a] [INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.026 s -- in com.example.rtk.PassAlphaTest\n\
+             [INFO] BUILD FAILURE\n";
+        let o = filter(i);
+        assert!(
+            !o.contains("stray in-block stdout line"),
+            "green-closing block's stdout stays collapsed after arm retires; got:\n{o}"
+        );
+        assert!(
+            o.contains("cannot find symbol"),
+            "the [ERROR] diagnostic line itself survives; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn mvnd_block_entry_retires_armed_claim() {
+        assert_block_entry_retires_armed_claim(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_package_block_entry_retires_armed_claim() {
+        assert_block_entry_retires_armed_claim(filter_package);
     }
 
     // Snapshot regression tests locking the full filtered output of every
