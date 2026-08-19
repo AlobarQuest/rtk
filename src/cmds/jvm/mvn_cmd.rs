@@ -302,8 +302,10 @@ struct SurefireBlock<'a> {
     /// Set when a trail ends at a blank line; holds the `drop_trail` value so
     /// the next per-test subline of the same class re-enters the trail with
     /// the same keep/drop decision (a capped class must drop **all** its
-    /// per-test blocks, not just the first). Cleared by any non-blank
-    /// non-subline line, by `RUNNING`, and by `commit_failing`/`drop_failing`.
+    /// per-test blocks, not just the first). Cleared by the lane's own keyed
+    /// non-blank non-subline lines, by `RUNNING`, and by
+    /// `commit_failing`/`drop_failing` — never by raw lines, which reach the
+    /// lane only via routing fallback and can't speak for the trail.
     trail_rearm: Option<bool>,
 }
 
@@ -338,7 +340,7 @@ impl<'a> SurefireBlock<'a> {
     /// line — identical to `line` outside mvnd parallel reactors); `line` is
     /// the original, which is what gets buffered and emitted so module
     /// identity survives in the output.
-    fn step(&mut self, line: &'a str, core: &str, out: &mut String) -> SurefireStep<'a> {
+    fn step(&mut self, line: &'a str, core: &str, keyed: bool, out: &mut String) -> SurefireStep<'a> {
         if PLUGIN_BANNER.is_match(core) {
             return SurefireStep::Consumed;
         }
@@ -410,17 +412,27 @@ impl<'a> SurefireBlock<'a> {
                 // let the blank fall through (outer keep-lists drop it).
                 return SurefireStep::Passthrough;
             }
-            self.trail_rearm = None; // disarm unconditionally on non-blank (load-bearing)
-            if is_per_test_subline(core) {
-                self.failure_trail = true;
-                self.drop_trail = dropped;
-                if !dropped {
-                    out.push_str(line);
-                    out.push('\n');
+            if keyed {
+                // Only the lane's own keyed lines disarm (load-bearing for
+                // the sequential stale-rearm case: `[INFO] Results:` etc.).
+                self.trail_rearm = None;
+                if is_per_test_subline(core) {
+                    self.failure_trail = true;
+                    self.drop_trail = dropped;
+                    if !dropped {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                    return SurefireStep::Consumed;
                 }
-                return SurefireStep::Consumed;
+                // Keyed non-subline: trail is over; already disarmed — fall
+                // through.
             }
-            // Non-subline: trail is over; already disarmed — fall through.
+            // Raw line: leave the rearm armed. A raw line reached this lane
+            // only via the routing fallback; per-test sublines are always
+            // keyed, so a raw stray can neither be the re-entry line nor
+            // prove the trail is over — letting it disarm would drop (kept
+            // class) or leak (capped class) every detail block after it.
         }
 
         SurefireStep::Passthrough
@@ -792,7 +804,7 @@ fn drive_surefire_line<'a>(
         }
     };
 
-    let step = lanes.get(idx).block.step(line, core, out);
+    let step = lanes.get(idx).block.step(line, core, key.is_some(), out);
     // A lane inside a Surefire block has no pending javac continuations:
     // entering a block retires any stale armed claim, so a single lane can't
     // hold a permanent armed-vs-block tie against raw-line routing.
@@ -2063,6 +2075,83 @@ mod tests {
     #[test]
     fn mvnd_compile_raw_stray_does_not_disarm_continuation() {
         assert_raw_stray_does_not_disarm_continuation(filter_compile);
+    }
+
+    /// child-a variant: one class with TWO blank-separated per-test detail
+    /// blocks (Surefire's multi-failure shape) — `trail_rearm` carries the
+    /// keep/drop decision across the blanks.
+    const SWEEP_MULTIFAIL_A: [&str; 9] = [
+        "[child-a] [INFO] Running com.example.rtk.MultiFailTest",
+        "[child-a] [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0, Time elapsed: 0.051 s <<< FAILURE! -- in com.example.rtk.MultiFailTest",
+        "[child-a] [ERROR] com.example.rtk.MultiFailTest.first -- Time elapsed: 0.020 s <<< FAILURE!",
+        "org.opentest4j.AssertionFailedError: boomFirst ==> expected: <1> but was: <2>",
+        "[child-a] [INFO] ",
+        "[child-a] [ERROR] com.example.rtk.MultiFailTest.second -- Time elapsed: 0.030 s <<< FAILURE!",
+        "java.lang.IllegalStateException: boomSecond",
+        "\tat com.example.rtk.MultiFailTest.second(MultiFailTest.java:30)",
+        "[child-a] [INFO] ",
+    ];
+
+    const RAW_STRAY: [&str; 1] = ["stray stdout from another reactor module"];
+
+    /// Multi-failure class × raw stray, all 10 positions: a raw stray must
+    /// not disarm `trail_rearm` between detail blocks — per-test sublines
+    /// are always keyed, so a raw line can neither be the re-entry line nor
+    /// prove the trail is over. Pre-fix, a stray in the rearm window dropped
+    /// the second block's exception message.
+    fn assert_raw_stray_does_not_disarm_trail_rearm(filter: fn(&str) -> String) {
+        for (n, m) in merges(&SWEEP_MULTIFAIL_A, &RAW_STRAY).iter().enumerate() {
+            let i = sweep_input(m);
+            let o = filter(&i);
+            assert!(
+                o.contains("boomFirst")
+                    && o.contains("boomSecond")
+                    && o.contains("MultiFailTest.first")
+                    && o.contains("MultiFailTest.second")
+                    && o.contains("at com.example.rtk.MultiFailTest.second(MultiFailTest.java:30)"),
+                "stray at position #{n} broke the multi-failure trail;\ninput:\n{i}\noutput:\n{o}"
+            );
+        }
+    }
+
+    #[test]
+    fn mvnd_raw_stray_does_not_disarm_trail_rearm() {
+        assert_raw_stray_does_not_disarm_trail_rearm(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_package_raw_stray_does_not_disarm_trail_rearm() {
+        assert_raw_stray_does_not_disarm_trail_rearm(filter_package);
+    }
+
+    /// Drop side of the same claim: with the class capped, the stray must
+    /// not disarm the *dropping* rearm either — a capped class drops ALL its
+    /// detail blocks, and a disarm here leaks the second subline through the
+    /// `[ERROR]` catch-all.
+    fn assert_raw_stray_does_not_leak_capped_rearm(filter: fn(&str, usize) -> String) {
+        let mut m: Vec<&str> = SWEEP_MULTIFAIL_A[..5].to_vec();
+        m.push(RAW_STRAY[0]);
+        m.extend_from_slice(&SWEEP_MULTIFAIL_A[5..]);
+        let i = sweep_input(&m);
+        let o = filter(&i, 0);
+        assert!(
+            !o.contains("MultiFailTest") && !o.contains("boom"),
+            "capped class stays fully dropped across the stray; got:\n{o}"
+        );
+        assert!(
+            o.contains("+1 more failing test classes"),
+            "capped class still reported in the tail; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn mvnd_raw_stray_does_not_leak_capped_rearm() {
+        assert_raw_stray_does_not_leak_capped_rearm(filter_surefire_with_cap);
+    }
+
+    #[test]
+    fn mvnd_package_raw_stray_does_not_leak_capped_rearm() {
+        assert_raw_stray_does_not_leak_capped_rearm(filter_package_with_cap);
     }
 
     // Snapshot regression tests locking the full filtered output of every
