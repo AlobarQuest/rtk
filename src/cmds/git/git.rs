@@ -538,7 +538,6 @@ fn consumes_next_token_as_value(arg: &str) -> bool {
             | "--dst-prefix"
             | "--encoding"
             | "--exclude"
-            | "--expand-tabs"
             | "--find-object"
             | "--glob"
             | "--grep"
@@ -561,7 +560,6 @@ fn consumes_next_token_as_value(arg: &str) -> bool {
             | "--stat-count"
             | "--stat-name-width"
             | "--stat-width"
-            | "--unified"
             | "--until"
             | "--word-diff-regex"
             | "--ws-error-highlight"
@@ -570,7 +568,6 @@ fn consumes_next_token_as_value(arg: &str) -> bool {
             | "-L"
             | "-O"
             | "-S"
-            | "-U"
             | "-l"
             | "-n"
     )
@@ -2898,6 +2895,23 @@ A  added.rs
             requests_raw_log_output(&args),
             "a real -p after --grep's value should still request raw output"
         );
+    }
+
+    #[test]
+    fn test_optional_value_options_do_not_consume_next_token() {
+        // -U, --unified and --expand-tabs only take an attached value
+        // (-U3, --unified=3, --expand-tabs=4); a bare separate token after
+        // them is not their value, so it must not be swallowed. Confirmed
+        // against git 2.53.0: `git log --expand-tabs 4` fails with
+        // "fatal: ambiguous argument '4'" rather than treating 4 as the
+        // option's value.
+        for opt in ["-U", "--unified", "--expand-tabs"] {
+            let args = vec![opt.to_string(), "-p".to_string()];
+            assert!(
+                requests_raw_log_output(&args),
+                "a real -p after {opt} should still request raw output"
+            );
+        }
     }
 
     #[test]
