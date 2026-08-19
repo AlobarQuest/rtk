@@ -545,8 +545,6 @@ fn consumes_next_token_as_value(arg: &str) -> bool {
             | "--inter-hunk-context"
             | "--line-prefix"
             | "--max-depth"
-            | "--max-parents"
-            | "--min-parents"
             | "--output"
             | "--output-indicator-context"
             | "--output-indicator-new"
@@ -2899,13 +2897,19 @@ A  added.rs
 
     #[test]
     fn test_optional_value_options_do_not_consume_next_token() {
-        // -U, --unified and --expand-tabs only take an attached value
-        // (-U3, --unified=3, --expand-tabs=4); a bare separate token after
+        // These options only take an attached value (-U3, --unified=3,
+        // --expand-tabs=4, --max-parents=2); a bare separate token after
         // them is not their value, so it must not be swallowed. Confirmed
-        // against git 2.53.0: `git log --expand-tabs 4` fails with
+        // against git 2.53.0: e.g. `git log --expand-tabs 4` fails with
         // "fatal: ambiguous argument '4'" rather than treating 4 as the
         // option's value.
-        for opt in ["-U", "--unified", "--expand-tabs"] {
+        for opt in [
+            "-U",
+            "--unified",
+            "--expand-tabs",
+            "--max-parents",
+            "--min-parents",
+        ] {
             let args = vec![opt.to_string(), "-p".to_string()];
             assert!(
                 requests_raw_log_output(&args),
