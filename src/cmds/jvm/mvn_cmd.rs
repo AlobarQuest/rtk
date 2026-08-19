@@ -2154,6 +2154,40 @@ mod tests {
         assert_raw_stray_does_not_leak_capped_rearm(filter_package_with_cap);
     }
 
+    /// Two modules armed concurrently: raw continuation lines have no unique
+    /// owner (two armed lanes are a tie on their own) and must be preserved
+    /// verbatim rather than routed to a guess. Completes the claimant
+    /// matrix; in `filter_compile` this is the `route → None` arm.
+    fn assert_two_armed_lanes_preserve_continuations(filter: fn(&str) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+             [child-a] [ERROR] /C:/work/child-a/src/main/java/com/example/rtk/A.java:[7,9] cannot find symbol\n\
+             [child-b] [ERROR] /C:/work/child-b/src/main/java/com/example/rtk/B.java:[3,5] cannot find symbol\n\
+             \x20 symbol:   variable bar\n\
+             \x20 location: class com.example.rtk.A\n\
+             [INFO] BUILD FAILURE\n";
+        let o = filter(i);
+        assert!(
+            o.contains("symbol:   variable bar")
+                && o.contains("location: class com.example.rtk.A"),
+            "ambiguous continuations preserved verbatim; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn mvnd_two_armed_lanes_preserve_continuations() {
+        assert_two_armed_lanes_preserve_continuations(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_package_two_armed_lanes_preserve_continuations() {
+        assert_two_armed_lanes_preserve_continuations(filter_package);
+    }
+
+    #[test]
+    fn mvnd_compile_two_armed_lanes_preserve_continuations() {
+        assert_two_armed_lanes_preserve_continuations(filter_compile);
+    }
+
     // Snapshot regression tests locking the full filtered output of every
     // mvnd fixture (insta, per docs/contributing/CODING_PRACTICES.md) — the
     // substring assertions above document intent; the snapshots catch
@@ -2732,6 +2766,20 @@ mod tests {
         let o_lf = filter_package(&i_lf);
         let i_crlf = i_lf.replace('\n', "\r\n");
         let o_crlf = filter_package(&i_crlf);
+        assert_eq!(
+            o_lf,
+            o_crlf.replace("\r\n", "\n"),
+            "CRLF filtered output must match LF (modulo line endings)"
+        );
+    }
+
+    #[test]
+    fn compile_handles_crlf_line_endings() {
+        let i_lf = include_str!("../../../tests/fixtures/mvnd_compile_error_raw.txt")
+            .replace("\r\n", "\n");
+        let o_lf = filter_compile(&i_lf);
+        let i_crlf = i_lf.replace('\n', "\r\n");
+        let o_crlf = filter_compile(&i_crlf);
         assert_eq!(
             o_lf,
             o_crlf.replace("\r\n", "\n"),
