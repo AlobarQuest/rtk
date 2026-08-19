@@ -443,15 +443,20 @@ fn run_log(
     let mut cmd = git_cmd(global_args);
     cmd.arg("log");
 
+    // Only inspect tokens that are actually flags — a value belonging to
+    // --grep/--author/etc. (e.g. `--grep --pretty`) must not be misread as
+    // one of the flags below.
+    let flag_args = real_flag_args(args);
+
     // Check if user provided format flags
-    let has_format_flag = args.iter().any(|arg| {
+    let has_format_flag = flag_args.iter().any(|arg| {
         arg.starts_with("--oneline") || arg.starts_with("--pretty") || arg.starts_with("--format")
     });
 
     // Check if user provided limit flag (-N, -n N, --max-count=N, --max-count N)
-    let has_limit_flag = args.iter().any(|arg| {
+    let has_limit_flag = flag_args.iter().any(|arg| {
         (arg.starts_with('-') && arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
-            || arg == "-n"
+            || *arg == "-n"
             || arg.starts_with("--max-count")
     });
 
@@ -478,9 +483,9 @@ fn run_log(
     };
 
     // Only add --no-merges if user didn't explicitly request merge commits
-    let wants_merges = args
+    let wants_merges = flag_args
         .iter()
-        .any(|arg| arg == "--merges" || arg == "--min-parents=2" || arg == "--no-merges");
+        .any(|arg| *arg == "--merges" || *arg == "--min-parents=2" || *arg == "--no-merges");
     // Don't add --no-merges if user explicitly requested merges or an exact count (-n N / --max-count)
     if !wants_merges && !has_limit_flag {
         cmd.arg("--no-merges");
@@ -573,59 +578,94 @@ fn consumes_next_token_as_value(arg: &str) -> bool {
     )
 }
 
-fn requests_raw_log_output(args: &[String]) -> bool {
+/// A git log argument, classified as either a flag or the value consumed
+/// by the preceding flag.
+enum LogArg<'a> {
+    Flag(&'a str),
+    Value { flag: &'a str, value: &'a str },
+}
+
+/// Tokenizes git log `args` into [`LogArg`]s, stopping at the `--` pathspec
+/// separator (tokens after it are paths, never flags or their values —
+/// e.g. `git log -- -5` means "history for the path literally named -5").
+/// `-n`/`--max-count`'s own count and every option in
+/// [`consumes_next_token_as_value`] are paired with the flag that consumes
+/// them. Shared by every git-log flag/value/limit check in [`run_log`] so
+/// `--`-handling and option-value handling live in one place instead of
+/// being reimplemented per check.
+fn log_arg_tokens(args: &[String]) -> Vec<LogArg<'_>> {
+    let mut tokens = Vec::with_capacity(args.len());
     let mut iter = args.iter().take_while(|arg| *arg != "--");
     while let Some(arg) = iter.next() {
-        if consumes_next_token_as_value(arg.as_str()) {
-            iter.next(); // skip the value token, whatever it looks like
-            continue;
+        let arg_str = arg.as_str();
+        if arg_str == "-n" || arg_str == "--max-count" || consumes_next_token_as_value(arg_str) {
+            if let Some(value) = iter.next() {
+                tokens.push(LogArg::Value {
+                    flag: arg_str,
+                    value: value.as_str(),
+                });
+                continue;
+            }
         }
-        if matches!(
-            arg.as_str(),
-            "-p" | "-u" | "--patch" | "--patch-with-raw" | "--patch-with-stat"
-        ) {
-            return true;
-        }
+        tokens.push(LogArg::Flag(arg_str));
     }
-    false
+    tokens
+}
+
+/// Filters `args` down to the tokens that are actual flags, dropping every
+/// token consumed as a value by the preceding option.
+fn real_flag_args(args: &[String]) -> Vec<&str> {
+    log_arg_tokens(args)
+        .into_iter()
+        .map(|token| match token {
+            LogArg::Flag(flag) | LogArg::Value { flag, .. } => flag,
+        })
+        .collect()
+}
+
+fn requests_raw_log_output(args: &[String]) -> bool {
+    log_arg_tokens(args).iter().any(|token| {
+        matches!(
+            token,
+            LogArg::Flag("-p" | "-u" | "--patch" | "--patch-with-raw" | "--patch-with-stat")
+        )
+    })
 }
 
 /// Filter git log output: truncate long messages, cap lines
 /// Parse the user-specified limit from git log args.
 /// Handles: -20, -n 20, --max-count=20, --max-count 20
 fn parse_user_limit(args: &[String]) -> Option<usize> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        // -20 (combined digit form)
-        if arg.starts_with('-')
-            && arg.len() > 1
-            && arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
-        {
-            if let Ok(n) = arg[1..].parse::<usize>() {
-                return Some(n);
-            }
-        }
-        // -n 20 (two-token form)
-        if arg == "-n" {
-            if let Some(next) = iter.next() {
-                if let Ok(n) = next.parse::<usize>() {
+    for token in log_arg_tokens(args) {
+        match token {
+            // -20 (combined digit form)
+            LogArg::Flag(flag)
+                if flag.starts_with('-')
+                    && flag.len() > 1
+                    && flag.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) =>
+            {
+                if let Ok(n) = flag[1..].parse::<usize>() {
                     return Some(n);
                 }
             }
-        }
-        // --max-count=20
-        if let Some(rest) = arg.strip_prefix("--max-count=") {
-            if let Ok(n) = rest.parse::<usize>() {
-                return Some(n);
-            }
-        }
-        // --max-count 20 (two-token form)
-        if arg == "--max-count" {
-            if let Some(next) = iter.next() {
-                if let Ok(n) = next.parse::<usize>() {
+            // -n 20 / --max-count 20 (two-token form)
+            LogArg::Value {
+                flag: "-n" | "--max-count",
+                value,
+            } => {
+                if let Ok(n) = value.parse::<usize>() {
                     return Some(n);
                 }
             }
+            // --max-count=20
+            LogArg::Flag(flag) => {
+                if let Some(rest) = flag.strip_prefix("--max-count=") {
+                    if let Ok(n) = rest.parse::<usize>() {
+                        return Some(n);
+                    }
+                }
+            }
+            LogArg::Value { .. } => {}
         }
     }
     None
@@ -2926,6 +2966,99 @@ A  added.rs
                 "a real -p after {opt} should still request raw output"
             );
         }
+    }
+
+    #[test]
+    fn test_real_flag_args_drops_value_taking_option_values() {
+        // `--grep`'s value is not itself a flag and must not appear in the
+        // filtered set, even when it looks like -N, --pretty, or --merges.
+        let args = vec!["--grep".to_string(), "-5".to_string()];
+        assert_eq!(real_flag_args(&args), vec!["--grep"]);
+    }
+
+    #[test]
+    fn test_real_flag_args_keeps_limit_flag_drops_its_value() {
+        let args = vec!["-n".to_string(), "15".to_string()];
+        assert_eq!(real_flag_args(&args), vec!["-n"]);
+
+        let args = vec!["--max-count".to_string(), "25".to_string()];
+        assert_eq!(real_flag_args(&args), vec!["--max-count"]);
+    }
+
+    #[test]
+    fn test_real_flag_args_keeps_genuine_flags() {
+        let args = vec!["--grep".to_string(), "fix".to_string(), "--oneline".to_string()];
+        assert_eq!(real_flag_args(&args), vec!["--grep", "--oneline"]);
+    }
+
+    #[test]
+    fn test_grep_value_looking_like_limit_flag_is_not_misdetected() {
+        // `git log --grep -5` searches commit messages for the literal
+        // string "-5"; it is not a request to limit output to 5 commits.
+        let args = vec!["--grep".to_string(), "-5".to_string()];
+        assert!(
+            !real_flag_args(&args)
+                .iter()
+                .any(|arg| arg.starts_with('-') && arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit())),
+            "-5 as the value of --grep should not be seen as a limit flag"
+        );
+        assert_eq!(
+            parse_user_limit(&args),
+            None,
+            "-5 as the value of --grep should not be parsed as a limit"
+        );
+    }
+
+    #[test]
+    fn test_grep_value_looking_like_format_flag_is_not_misdetected() {
+        // `git log --grep --pretty` searches for the literal string
+        // "--pretty"; git consumes it as --grep's value, not a format flag.
+        let args = vec!["--grep".to_string(), "--pretty".to_string()];
+        assert!(
+            !real_flag_args(&args)
+                .iter()
+                .any(|arg| arg.starts_with("--pretty")),
+            "--pretty as the value of --grep should not be seen as a format flag"
+        );
+    }
+
+    #[test]
+    fn test_grep_value_looking_like_merges_flag_is_not_misdetected() {
+        // `git log --grep --merges` searches for the literal string
+        // "--merges"; git consumes it as --grep's value, not --merges.
+        let args = vec!["--grep".to_string(), "--merges".to_string()];
+        assert!(
+            !real_flag_args(&args).contains(&"--merges"),
+            "--merges as the value of --grep should not be seen as the --merges flag"
+        );
+    }
+
+    #[test]
+    fn test_parse_user_limit_skips_foreign_option_values() {
+        // A real limit later in the args is still found after a
+        // value-taking option's value is skipped.
+        let args = vec![
+            "--grep".to_string(),
+            "-5".to_string(),
+            "-20".to_string(),
+        ];
+        assert_eq!(parse_user_limit(&args), Some(20));
+    }
+
+    #[test]
+    fn test_log_arg_tokens_stop_at_pathspec_separator() {
+        // `git log -- -5` means "history for the path literally named -5",
+        // not a limit flag — tokens after `--` must be ignored entirely.
+        let args = vec!["--".to_string(), "-5".to_string()];
+        assert!(
+            real_flag_args(&args).is_empty(),
+            "-5 after -- is a pathspec, not a flag"
+        );
+        assert_eq!(
+            parse_user_limit(&args),
+            None,
+            "-5 after -- should not be parsed as a limit"
+        );
     }
 
     #[test]
