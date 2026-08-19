@@ -180,8 +180,34 @@ fn parse_rtk_find_args(args: &[String]) -> Result<FindArgs> {
     Ok(parsed)
 }
 
+fn passthrough_raw_find(args: &[String], verbose: u8) -> Result<()> {
+    let timer = tracking::TimedExecution::start();
+    if verbose > 0 {
+        eprintln!("find: passthrough (flags rtk cannot filter)");
+    }
+    let mut cmd = crate::core::utils::resolved_command("find");
+    cmd.args(args);
+    let captured =
+        crate::core::stream::exec_capture(&mut cmd).context("Failed to execute find")?;
+    print!("{}", captured.stdout);
+    eprint!("{}", captured.stderr);
+    timer.track(
+        &format!("find {}", args.join(" ")),
+        "rtk find",
+        &captured.stdout,
+        &captured.stdout,
+    );
+    if captured.exit_code != 0 {
+        std::process::exit(captured.exit_code);
+    }
+    Ok(())
+}
+
 /// Entry point from main.rs — parses raw args then delegates to run().
 pub fn run_from_args(args: &[String], verbose: u8) -> Result<()> {
+    if has_unsupported_find_flags(args) {
+        return passthrough_raw_find(args, verbose);
+    }
     let parsed = parse_find_args(args)?;
     run(
         &parsed.pattern,
@@ -636,6 +662,20 @@ mod tests {
         // With max=2, should not error
         let result = run("*.rs", "src", 2, true, None, "f", false, 0);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn unsupported_flags_route_to_passthrough() {
+        for flag in ["-not", "!", "-o", "-exec", "-delete", "-mtime", "-regex"] {
+            assert!(has_unsupported_find_flags(&args(&[".", flag])), "{flag}");
+        }
+        assert!(has_unsupported_find_flags(&args(&[
+            ".", "-name", "*.rs", "-not", "-name", "*_test.rs"
+        ])));
+        assert!(!has_unsupported_find_flags(&args(&[
+            ".", "-name", "*.rs", "-type", "f", "-maxdepth", "2"
+        ])));
+        assert!(!has_unsupported_find_flags(&args(&["*.rs", "src", "-m", "10"])));
     }
 
     #[test]
