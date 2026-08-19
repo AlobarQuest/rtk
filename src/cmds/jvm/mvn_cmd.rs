@@ -767,15 +767,19 @@ impl FailingClassCap {
 /// Shared per-line front half of `filter_surefire_with_cap` and
 /// `filter_package_with_cap`: route the line to its lane, drive the lane's
 /// Surefire block machine, and commit/drop failing closes against the
-/// reactor-wide class cap. Returns `Some((lane index, core))` when the line
-/// fell through to the caller's outside-block keep-list; `None` when it was
-/// consumed — or preserved verbatim on ambiguous raw-line ownership.
+/// reactor-wide class cap. Returns `Some((lane index, core, keyed))` when
+/// the line fell through to the caller's outside-block keep-list — `keyed`
+/// is whether the line carried a module prefix (routed by key) or was raw
+/// (routed by ownership claim); callers must only disarm a lane's armed
+/// continuation on that lane's own keyed lines, since a raw line reached
+/// the lane *because of* the claim. `None` when the line was consumed — or
+/// preserved verbatim on ambiguous raw-line ownership.
 fn drive_surefire_line<'a>(
     lanes: &mut Lanes<'a>,
     line: &'a str,
     classes: &mut FailingClassCap,
     out: &mut String,
-) -> Option<(usize, &'a str)> {
+) -> Option<(usize, &'a str, bool)> {
     let (key, core) = split_lane(line);
     let idx = match lanes.route(key) {
         Some(i) => i,
@@ -814,7 +818,7 @@ fn drive_surefire_line<'a>(
             lanes.get(idx).keep_continuation = false;
             None
         }
-        SurefireStep::Passthrough => Some((idx, core)),
+        SurefireStep::Passthrough => Some((idx, core, key.is_some())),
     }
 }
 
@@ -844,10 +848,11 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
     let mut in_reactor_summary = false;
 
     for line in stripped.lines() {
-        let (idx, core) = match drive_surefire_line(&mut lanes, line, &mut classes, &mut out) {
-            Some(v) => v,
-            None => continue,
-        };
+        let (idx, core, keyed) =
+            match drive_surefire_line(&mut lanes, line, &mut classes, &mut out) {
+                Some(v) => v,
+                None => continue,
+            };
         if lanes.get(idx).keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
             out.push_str(line);
             out.push('\n');
@@ -873,23 +878,27 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
             out.push('\n');
             // The armed per-lane flag is an owner claim in its own right:
             // raw_owner routes (or verbatim-preserves) the raw indented
-            // continuations by scanning all lanes for it.
-            lanes.get(idx).keep_continuation = core.starts_with("[ERROR]")
-                && !core.starts_with("[ERROR] Tests run:")
-                && !core.starts_with("[ERROR] Failures:")
-                && !core.starts_with("[ERROR] Errors:");
+            // continuations by scanning all lanes for it. Only this lane's
+            // own keyed lines may rewrite the claim (a kept raw line can't
+            // arm anyway — starting with `[ERROR]` would have keyed it).
+            if keyed {
+                lanes.get(idx).keep_continuation = core.starts_with("[ERROR]")
+                    && !core.starts_with("[ERROR] Tests run:")
+                    && !core.starts_with("[ERROR] Failures:")
+                    && !core.starts_with("[ERROR] Errors:");
+            }
             continue;
         }
-        // Dropped line (e.g. help boilerplate): reset so a stale flag can't
-        // keep an indented line that follows a dropped `[ERROR]` line.
-        // Parity with filter_package's fall-through reset. Known limit: a raw
-        // non-indented stray line (another module's stdout) landing in the
-        // one-line window between arm and `symbol:` also resets — with
-        // nothing open it routes to the armed lane and falls through here.
-        // Sequentially this reset is load-bearing; the interleaved stray is
-        // rare and costs the remaining continuations, never the `[ERROR]`
-        // diagnostic line itself.
-        lanes.get(idx).keep_continuation = false;
+        // Dropped keyed line (e.g. help boilerplate): reset so a stale flag
+        // can't keep an indented line that follows a dropped `[ERROR]` line.
+        // Parity with filter_package's fall-through reset. Raw fall-through
+        // lines never disarm: a raw line only routed here *because of* the
+        // armed claim, so letting it clear that claim would drop the
+        // `symbol:` / `location:` continuations whenever another module's
+        // stray stdout lands in the arm window.
+        if keyed {
+            lanes.get(idx).keep_continuation = false;
+        }
     }
 
     lanes.finish(&mut out);
@@ -926,6 +935,7 @@ pub fn filter_compile(raw: &str) -> String {
         // Classify on the module-prefix-stripped view; emit the original so
         // module identity survives in mvnd parallel reactors.
         let (key, core) = split_lane(line);
+        let keyed = key.is_some();
         let idx = match lanes.route(key) {
             Some(i) => i,
             // Reachable when two modules are armed concurrently (a tie):
@@ -954,9 +964,12 @@ pub fn filter_compile(raw: &str) -> String {
             continue;
         }
         // Help boilerplate: drop before the `[ERROR]` catch-all (parity with
-        // keep_outside_block / filter_quiet).
+        // keep_outside_block / filter_quiet). Raw boilerplate must not
+        // disarm the claim that routed it here — see the fall-through reset.
         if is_boilerplate(core) {
-            lanes.get(idx).keep_continuation = false;
+            if keyed {
+                lanes.get(idx).keep_continuation = false;
+            }
             continue;
         }
         if core.starts_with("[ERROR]") {
@@ -982,8 +995,12 @@ pub fn filter_compile(raw: &str) -> String {
             lanes.get(idx).keep_continuation = false;
             continue;
         }
-        // Drop everything else
-        lanes.get(idx).keep_continuation = false;
+        // Drop everything else. Only keyed lines disarm: a raw stray only
+        // routed to this lane because of its armed claim, and clearing it
+        // would drop the `symbol:` / `location:` continuations that follow.
+        if keyed {
+            lanes.get(idx).keep_continuation = false;
+        }
     }
 
     out
@@ -1018,10 +1035,11 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
     let mut seen_warnings: HashSet<String> = HashSet::new();
 
     for line in stripped.lines() {
-        let (idx, core) = match drive_surefire_line(&mut lanes, line, &mut classes, &mut out) {
-            Some(v) => v,
-            None => continue,
-        };
+        let (idx, core, keyed) =
+            match drive_surefire_line(&mut lanes, line, &mut classes, &mut out) {
+                Some(v) => v,
+                None => continue,
+            };
         // Failures-summary cap (see filter_surefire_with_cap for details).
         if summary.handle_entry(lanes.get(idx).in_summary, core, line, &mut out) {
             continue;
@@ -1036,12 +1054,14 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
             summary.handle_header(core, &mut lanes.get(idx).in_summary);
             out.push_str(line);
             out.push('\n');
-            // Armed flag is an owner claim scanned by raw_owner — see
-            // filter_surefire_with_cap.
-            lanes.get(idx).keep_continuation = core.starts_with("[ERROR]")
-                && !core.starts_with("[ERROR] Tests run:")
-                && !core.starts_with("[ERROR] Failures:")
-                && !core.starts_with("[ERROR] Errors:");
+            // Armed flag is an owner claim scanned by raw_owner; only keyed
+            // lines rewrite it — see filter_surefire_with_cap.
+            if keyed {
+                lanes.get(idx).keep_continuation = core.starts_with("[ERROR]")
+                    && !core.starts_with("[ERROR] Tests run:")
+                    && !core.starts_with("[ERROR] Failures:")
+                    && !core.starts_with("[ERROR] Errors:");
+            }
             continue;
         }
         if lanes.get(idx).keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
@@ -1050,6 +1070,8 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
             continue;
         }
         if core.starts_with("[WARNING]") {
+            // `[WARNING]`-prefixed lines are always keyed (split_lane keys
+            // any `[`-initial log line), so this reset never hits a claim.
             let payload = core.strip_prefix("[WARNING] ").unwrap_or(core);
             let norm = FILE_COORD.replace_all(payload, "").to_string();
             if seen_warnings.insert(norm) {
@@ -1059,7 +1081,10 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
             lanes.get(idx).keep_continuation = false;
             continue;
         }
-        lanes.get(idx).keep_continuation = false;
+        // Raw fall-through lines never disarm — see filter_surefire_with_cap.
+        if keyed {
+            lanes.get(idx).keep_continuation = false;
+        }
     }
 
     lanes.finish(&mut out);
@@ -2005,6 +2030,39 @@ mod tests {
     #[test]
     fn mvnd_package_block_entry_retires_armed_claim() {
         assert_block_entry_retires_armed_claim(filter_package);
+    }
+
+    /// An unrelated raw stdout line (another module's, unprefixed) must not
+    /// disarm a pending continuation claim: raw fall-through lines never
+    /// reset `keep_continuation` — only a lane's own keyed lines do. Swept
+    /// through every position of the compile-error sequence, on all three
+    /// filter paths.
+    fn assert_raw_stray_does_not_disarm_continuation(filter: fn(&str) -> String) {
+        const STRAY: [&str; 1] = ["stray stdout from another reactor module"];
+        for (n, m) in merges(&SWEEP_COMPILE_A, &STRAY).iter().enumerate() {
+            let i = sweep_input(m);
+            let o = filter(&i);
+            assert!(
+                o.contains("symbol:   variable bar")
+                    && o.contains("location: class com.example.rtk.A"),
+                "stray at position #{n} disarmed the continuation;\ninput:\n{i}\noutput:\n{o}"
+            );
+        }
+    }
+
+    #[test]
+    fn mvnd_raw_stray_does_not_disarm_continuation() {
+        assert_raw_stray_does_not_disarm_continuation(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_package_raw_stray_does_not_disarm_continuation() {
+        assert_raw_stray_does_not_disarm_continuation(filter_package);
+    }
+
+    #[test]
+    fn mvnd_compile_raw_stray_does_not_disarm_continuation() {
+        assert_raw_stray_does_not_disarm_continuation(filter_compile);
     }
 
     // Snapshot regression tests locking the full filtered output of every
