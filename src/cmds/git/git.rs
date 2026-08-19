@@ -443,10 +443,12 @@ fn run_log(
     let mut cmd = git_cmd(global_args);
     cmd.arg("log");
 
-    // Only inspect tokens that are actually flags — a value belonging to
-    // --grep/--author/etc. (e.g. `--grep --pretty`) must not be misread as
-    // one of the flags below.
-    let flag_args = real_flag_args(args);
+    // Tokenize once and share it: flag-vs-value classification is reused
+    // below by both the flag-presence checks and the limit parsing, and a
+    // value belonging to --grep/--author/etc. (e.g. `--grep --pretty`) must
+    // not be misread as one of the flags below.
+    let tokens = log_arg_tokens(args);
+    let flag_args = flag_args_from_tokens(&tokens);
 
     // Check if user provided format flags
     let has_format_flag = flag_args.iter().any(|arg| {
@@ -470,7 +472,7 @@ fn run_log(
     // Determine limit: respect user's explicit -N flag, use sensible defaults otherwise
     let (limit, user_set_limit) = if has_limit_flag {
         // User explicitly passed -N / -n N / --max-count=N → respect their choice
-        let n = parse_user_limit(args).unwrap_or(10);
+        let n = parse_limit_from_tokens(&tokens).unwrap_or(10);
         (n, true)
     } else if has_format_flag {
         // --oneline / --pretty without -N: user wants compact output, allow more
@@ -598,7 +600,7 @@ fn log_arg_tokens(args: &[String]) -> Vec<LogArg<'_>> {
     let mut iter = args.iter().take_while(|arg| *arg != "--");
     while let Some(arg) = iter.next() {
         let arg_str = arg.as_str();
-        if arg_str == "-n" || arg_str == "--max-count" || consumes_next_token_as_value(arg_str) {
+        if arg_str == "--max-count" || consumes_next_token_as_value(arg_str) {
             if let Some(value) = iter.next() {
                 tokens.push(LogArg::Value {
                     flag: arg_str,
@@ -612,31 +614,67 @@ fn log_arg_tokens(args: &[String]) -> Vec<LogArg<'_>> {
     tokens
 }
 
-/// Filters `args` down to the tokens that are actual flags, dropping every
-/// token consumed as a value by the preceding option.
-fn real_flag_args(args: &[String]) -> Vec<&str> {
-    log_arg_tokens(args)
-        .into_iter()
+/// Filters `tokens` down to the flags themselves, dropping every value
+/// consumed by the preceding option.
+fn flag_args_from_tokens<'a>(tokens: &[LogArg<'a>]) -> Vec<&'a str> {
+    tokens
+        .iter()
         .map(|token| match token {
-            LogArg::Flag(flag) | LogArg::Value { flag, .. } => flag,
+            LogArg::Flag(flag) | LogArg::Value { flag, .. } => *flag,
         })
         .collect()
 }
 
-fn requests_raw_log_output(args: &[String]) -> bool {
-    log_arg_tokens(args).iter().any(|token| {
-        matches!(
-            token,
-            LogArg::Flag("-p" | "-u" | "--patch" | "--patch-with-raw" | "--patch-with-stat")
-        )
-    })
+/// Filters `args` down to the tokens that are actual flags, dropping every
+/// token consumed as a value by the preceding option. `run_log` shares a
+/// single tokenization via [`flag_args_from_tokens`] instead; this
+/// convenience wrapper exists for tests that only care about the flags.
+#[cfg(test)]
+fn real_flag_args(args: &[String]) -> Vec<&str> {
+    flag_args_from_tokens(&log_arg_tokens(args))
 }
 
-/// Filter git log output: truncate long messages, cap lines
+/// True for git log/diff flags that change the *shape* of git's raw output
+/// (patch text, diffstat, name lists) in a way RTK's injected
+/// `--pretty=format` + `---END---` markers can't coexist with — matching
+/// this must request the untouched passthrough path instead of RTK's
+/// filtered one (see [`requests_raw_log_output`]).
+fn requests_raw_diff_shape(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-p" | "-u"
+            | "--dirstat"
+            | "--name-only"
+            | "--name-status"
+            | "--numstat"
+            | "--patch"
+            | "--patch-with-raw"
+            | "--patch-with-stat"
+            | "--raw"
+            | "--shortstat"
+            | "--stat"
+            | "--summary"
+    ) || flag.starts_with("--stat=")
+        || flag.starts_with("--dirstat=")
+}
+
+fn requests_raw_log_output(args: &[String]) -> bool {
+    log_arg_tokens(args)
+        .iter()
+        .any(|token| matches!(token, LogArg::Flag(flag) if requests_raw_diff_shape(flag)))
+}
+
 /// Parse the user-specified limit from git log args.
 /// Handles: -20, -n 20, --max-count=20, --max-count 20
+/// `run_log` shares a single tokenization via [`parse_limit_from_tokens`]
+/// instead; this convenience wrapper exists for tests.
+#[cfg(test)]
 fn parse_user_limit(args: &[String]) -> Option<usize> {
-    for token in log_arg_tokens(args) {
+    parse_limit_from_tokens(&log_arg_tokens(args))
+}
+
+fn parse_limit_from_tokens(tokens: &[LogArg<'_>]) -> Option<usize> {
+    for token in tokens {
         match token {
             // -20 (combined digit form)
             LogArg::Flag(flag)
@@ -2904,13 +2942,49 @@ A  added.rs
 
     #[test]
     fn test_non_patch_log_flags_remain_filtered() {
-        for flag in ["--no-patch", "--stat", "--oneline", "--format=%H"] {
+        for flag in ["--no-patch", "--oneline", "--format=%H"] {
             let args = vec![flag.to_string()];
             assert!(
                 !requests_raw_log_output(&args),
                 "{flag} should remain on the filtered log path"
             );
         }
+    }
+
+    #[test]
+    fn test_diff_shape_flags_request_raw_output() {
+        // These change the shape of git's raw output (diffstat, name lists)
+        // the same way -p does — RTK's injected --pretty=format markers
+        // can't coexist with them, so they must stay on the raw path too.
+        for flag in [
+            "--dirstat",
+            "--dirstat=files",
+            "--name-only",
+            "--name-status",
+            "--numstat",
+            "--raw",
+            "--shortstat",
+            "--stat",
+            "--stat=80",
+            "--summary",
+        ] {
+            let args = vec![flag.to_string()];
+            assert!(
+                requests_raw_log_output(&args),
+                "{flag} changes output shape and should request raw output"
+            );
+        }
+    }
+
+    #[test]
+    fn test_diff_shape_flag_as_value_of_grep_is_not_misdetected() {
+        // `git log --grep --stat` searches for the literal string
+        // "--stat"; git consumes it as --grep's value, not the --stat flag.
+        let args = vec!["--grep".to_string(), "--stat".to_string()];
+        assert!(
+            !requests_raw_log_output(&args),
+            "--stat as the value of --grep should stay on the filtered path"
+        );
     }
 
     #[test]
