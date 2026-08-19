@@ -534,6 +534,8 @@ fn consumes_next_token_as_value(arg: &str) -> bool {
             | "--date"
             | "--decorate-refs"
             | "--decorate-refs-exclude"
+            | "--diff-algorithm"
+            | "--diff-filter"
             | "--diff-merges"
             | "--dst-prefix"
             | "--encoding"
@@ -2875,7 +2877,15 @@ A  added.rs
     fn test_patch_flag_as_value_of_grep_is_not_misdetected() {
         // `git log --grep -p` searches commit messages for the literal
         // string "-p"; git does not treat it as the patch flag.
-        for opt in ["--grep", "--author", "--committer", "-S", "-G"] {
+        for opt in [
+            "--author",
+            "--committer",
+            "--diff-algorithm",
+            "--diff-filter",
+            "--grep",
+            "-G",
+            "-S",
+        ] {
             let args = vec![opt.to_string(), "-p".to_string()];
             assert!(
                 !requests_raw_log_output(&args),
