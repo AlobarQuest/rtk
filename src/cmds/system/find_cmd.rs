@@ -32,6 +32,7 @@ struct FindArgs {
     pattern: String,
     path: String,
     max_results: usize,
+    max_explicit: bool,
     max_depth: Option<usize>,
     file_type: String,
     case_insensitive: bool,
@@ -43,6 +44,7 @@ impl Default for FindArgs {
             pattern: "*".to_string(),
             path: ".".to_string(),
             max_results: 50,
+            max_explicit: false,
             max_depth: None,
             file_type: "f".to_string(),
             case_insensitive: false,
@@ -162,6 +164,7 @@ fn parse_rtk_find_args(args: &[String]) -> Result<FindArgs> {
             "-m" | "--max" => {
                 if let Some(val) = next_arg(args, &mut i) {
                     parsed.max_results = val.parse().context("invalid --max value")?;
+                    parsed.max_explicit = true;
                 }
             }
             "-t" | "--file-type" => {
@@ -184,6 +187,7 @@ pub fn run_from_args(args: &[String], verbose: u8) -> Result<()> {
         &parsed.pattern,
         &parsed.path,
         parsed.max_results,
+        parsed.max_explicit,
         parsed.max_depth,
         &parsed.file_type,
         parsed.case_insensitive,
@@ -205,10 +209,12 @@ fn build_capped_listing(files: &[String], max_results: usize) -> String {
     listing
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     pattern: &str,
     path: &str,
     max_results: usize,
+    max_explicit: bool,
     max_depth: Option<usize>,
     file_type: &str,
     case_insensitive: bool,
@@ -388,12 +394,20 @@ pub fn run(
 
     let capped_raw = build_capped_listing(&files, max_results);
     let shown = never_worse(&capped_raw, &body);
-    print!("{}", shown);
+    let mut output = shown.to_string();
+    if displayed < total_files && !max_explicit {
+        if let Some(hint) =
+            crate::core::tee::force_tee_tail_hint(&raw_output, "find", displayed + 1)
+        {
+            output.push_str(&format!("{}\n", hint));
+        }
+    }
+    print!("{}", output);
     timer.track(
         &format!("find {} -name '{}'", path, effective_pattern),
         "rtk find",
         &raw_output,
-        shown,
+        &output,
     );
 
     Ok(())
@@ -584,14 +598,14 @@ mod tests {
     #[test]
     fn find_dotfile_pattern_includes_hidden() {
         // .gitignore exists at the repo root — must be found when using a dotfile pattern
-        let result = run(".gitignore", ".", 50, Some(1), "f", false, 0);
+        let result = run(".gitignore", ".", 50, true, Some(1), "f", false, 0);
         assert!(result.is_ok(), "run with dotfile pattern should not error");
     }
 
     #[test]
     fn find_regular_pattern_skips_hidden() {
         // Non-dot pattern should not error (hidden dirs remain skipped)
-        let result = run("*.rs", "src", 5, None, "f", false, 0);
+        let result = run("*.rs", "src", 5, true, None, "f", false, 0);
         assert!(result.is_ok());
     }
 
@@ -600,28 +614,50 @@ mod tests {
     #[test]
     fn find_rs_files_in_src() {
         // Should find .rs files without error
-        let result = run("*.rs", "src", 100, None, "f", false, 0);
+        let result = run("*.rs", "src", 100, true, None, "f", false, 0);
         assert!(result.is_ok());
     }
 
     #[test]
     fn find_dot_pattern_works() {
         // "." pattern should not error (was broken before)
-        let result = run(".", "src", 10, None, "f", false, 0);
+        let result = run(".", "src", 10, true, None, "f", false, 0);
         assert!(result.is_ok());
     }
 
     #[test]
     fn find_no_matches() {
-        let result = run("*.xyz_nonexistent", "src", 50, None, "f", false, 0);
+        let result = run("*.xyz_nonexistent", "src", 50, true, None, "f", false, 0);
         assert!(result.is_ok());
     }
 
     #[test]
     fn find_respects_max() {
         // With max=2, should not error
-        let result = run("*.rs", "src", 2, None, "f", false, 0);
+        let result = run("*.rs", "src", 2, true, None, "f", false, 0);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rtk_max_flag_marks_cap_explicit() {
+        let parsed = parse_find_args(&args(&["*.rs", "-m", "10"])).unwrap();
+        assert!(parsed.max_explicit);
+        let parsed = parse_find_args(&args(&["*.rs", "--max", "10"])).unwrap();
+        assert!(parsed.max_explicit);
+    }
+
+    #[test]
+    fn native_syntax_cap_stays_implicit() {
+        let parsed = parse_find_args(&args(&[".", "-name", "*.rs", "-type", "f"])).unwrap();
+        assert!(!parsed.max_explicit);
+    }
+
+    #[test]
+    fn default_cap_stays_implicit() {
+        let parsed = parse_find_args(&args(&[])).unwrap();
+        assert!(!parsed.max_explicit);
+        let parsed = parse_find_args(&args(&["*.rs", "src"])).unwrap();
+        assert!(!parsed.max_explicit);
     }
 
     #[test]
@@ -654,7 +690,7 @@ mod tests {
     #[test]
     fn find_gitignored_excluded() {
         // target/ is in .gitignore — files inside should not appear
-        let result = run("*", ".", 1000, None, "f", false, 0);
+        let result = run("*", ".", 1000, true, None, "f", false, 0);
         assert!(result.is_ok());
         // We can't easily capture stdout in unit tests, but at least
         // verify it runs without error. The smoke tests verify content.
