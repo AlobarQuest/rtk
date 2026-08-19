@@ -191,6 +191,20 @@ pub fn run_from_args(args: &[String], verbose: u8) -> Result<()> {
     )
 }
 
+fn build_capped_listing(files: &[String], max_results: usize) -> String {
+    let mut listing = files
+        .iter()
+        .take(max_results)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if files.len() > max_results {
+        listing.push_str(&format!("\n+{} more", files.len() - max_results));
+    }
+    listing.push('\n');
+    listing
+}
+
 pub fn run(
     pattern: &str,
     path: &str,
@@ -372,7 +386,8 @@ pub fn run(
         body.push_str(&format!("{}\n", ext_line));
     }
 
-    let shown = never_worse(&raw_output, &body);
+    let capped_raw = build_capped_listing(&files, max_results);
+    let shown = never_worse(&capped_raw, &body);
     print!("{}", shown);
     timer.track(
         &format!("find {} -name '{}'", path, effective_pattern),
@@ -607,6 +622,33 @@ mod tests {
         // With max=2, should not error
         let result = run("*.rs", "src", 2, None, "f", false, 0);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn capped_listing_no_truncation() {
+        let files = args(&["a.rs", "b.rs"]);
+        assert_eq!(build_capped_listing(&files, 10), "a.rs\nb.rs\n");
+    }
+
+    #[test]
+    fn capped_listing_truncates_with_marker() {
+        let files = args(&["a.rs", "b.rs", "c.rs", "d.rs"]);
+        assert_eq!(build_capped_listing(&files, 2), "a.rs\nb.rs\n+2 more\n");
+    }
+
+    #[test]
+    fn capped_listing_at_exact_max_has_no_marker() {
+        let files = args(&["a.rs", "b.rs"]);
+        assert_eq!(build_capped_listing(&files, 2), "a.rs\nb.rs\n");
+    }
+
+    #[test]
+    fn capped_baseline_beats_grouped_summary_on_tiny_result_sets() {
+        use crate::core::guard::never_worse;
+        let files = args(&["a.rs"]);
+        let capped = build_capped_listing(&files, 10);
+        let grouped = "1F 1D:\n\n./ a.rs\n\next: .rs(1)\n";
+        assert_eq!(never_worse(&capped, grouped), capped);
     }
 
     #[test]
