@@ -431,6 +431,12 @@ fn run_log(
     verbose: u8,
     global_args: &[String],
 ) -> Result<i32> {
+    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215):
+    // without this, `rtk git log -- -p` loses its literal "--" and
+    // `requests_raw_log_output`/`log_arg_tokens` can no longer tell that
+    // `-p` is a pathspec, not the real patch flag.
+    let args = &args_utils::restore_double_dash(args);
+
     if requests_raw_log_output(args) {
         let passthrough_args: Vec<OsString> = std::iter::once(OsString::from("log"))
             .chain(args.iter().map(OsString::from))
