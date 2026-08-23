@@ -312,6 +312,25 @@ pub fn open_private(
     Ok(file)
 }
 
+/// Pure core of `set_owner_only`'s "is a chmod even needed" check, taking the raw
+/// `st_mode` reading directly so it's deterministically testable without touching
+/// the filesystem (an unprivileged `chmod` setting setuid/setgid isn't reliably
+/// honored across every environment — e.g. some sandboxed/containerized
+/// filesystems silently drop it — so a test that round-trips through a real file
+/// would be flaky rather than actually exercising this logic).
+///
+/// Masks with `0o7777`, NOT `0o777`: setuid/setgid/sticky live in the `0o7000`
+/// range, above the rwx bits but below the file-type bits `st_mode` also carries.
+/// A `0o777` mask would strip those dangerous bits out of the comparison too, so
+/// a file with e.g. setuid set (`0o4600`) would read as "already correct" against
+/// a `target` of `0o600` and permanently skip the chmod that would clear it —
+/// defeating the self-heal `set_owner_only` exists to provide, for exactly the
+/// files (external tampering, restored backups) it's meant to catch.
+#[cfg(unix)]
+fn mode_already_correct(actual: u32, target: u32) -> bool {
+    actual & 0o7777 == target
+}
+
 #[cfg(unix)]
 fn set_owner_only(path: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
@@ -322,8 +341,9 @@ fn set_owner_only(path: &std::path::Path, mode: u32) {
     // budget, so a redundant chmod on the already-correct common case adds up.
     // Falls through to chmod on any metadata-read failure, erring toward
     // enforcing the permission rather than silently skipping it.
+    //
     if let Ok(meta) = fs::metadata(path) {
-        if meta.permissions().mode() & 0o777 == mode {
+        if mode_already_correct(meta.permissions().mode(), mode) {
             return;
         }
     }
@@ -1471,5 +1491,47 @@ mod tests {
         // Second call hits the already-correct fast path — must stay 0o600.
         restrict_file(&file);
         assert_eq!(mode_of(&file), 0o600);
+    }
+
+    // Regression: the fast-path comparison must mask with 0o7777 (including
+    // setuid/setgid/sticky), not 0o777 — a 0o777 mask would make a file with e.g.
+    // setuid set (0o4600) read as "already 0o600" and permanently skip the chmod
+    // that clears the dangerous bit. Tested against the pure mask logic directly
+    // (not round-tripped through a real chmod) since an unprivileged chmod setting
+    // setuid isn't reliably honored across every environment — some sandboxed/
+    // containerized filesystems silently drop it, which would make a
+    // filesystem-based version of this test flaky rather than exercise the logic.
+    #[test]
+    #[cfg(unix)]
+    fn test_mode_already_correct_rejects_setuid_bit() {
+        assert!(
+            !mode_already_correct(0o4600, 0o600),
+            "setuid set (0o4600) must not read as already-correct against target 0o600"
+        );
+        assert!(
+            !mode_already_correct(0o2600, 0o600),
+            "setgid set (0o2600) must not read as already-correct against target 0o600"
+        );
+        assert!(
+            !mode_already_correct(0o1600, 0o600),
+            "sticky bit set (0o1600) must not read as already-correct against target 0o600"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_mode_already_correct_accepts_exact_match() {
+        assert!(mode_already_correct(0o600, 0o600));
+        assert!(mode_already_correct(0o700, 0o700));
+        assert!(!mode_already_correct(0o644, 0o600));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_mode_already_correct_ignores_file_type_bits() {
+        // `st_mode` carries file-type bits (e.g. S_IFREG = 0o100000) above the
+        // 0o7777 permission range this function masks to — those must not affect
+        // the comparison either way.
+        assert!(mode_already_correct(0o100600, 0o600));
     }
 }

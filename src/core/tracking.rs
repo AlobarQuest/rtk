@@ -415,14 +415,25 @@ fn warn_if_missing_table(context: &str, err: &rusqlite::Error) {
     }
 }
 
-/// Pure core of `Tracker::maybe_cleanup_hook_decisions`'s sampling decision, taking
-/// the nanosecond reading directly so it's deterministically testable without
-/// waiting on a real 1-in-`rate` chance. Doesn't need to be cryptographically
-/// random, just cheap and not obviously correlated with call timing — reusing the
-/// wall-clock read the caller already pays for avoids pulling in a `rand`
-/// dependency just for a sampling backstop.
-fn should_sample_cleanup(nanos: u32, rate: u32) -> bool {
-    nanos.is_multiple_of(rate)
+/// Pure core of `Tracker::maybe_cleanup_hook_decisions`'s sampling decision.
+///
+/// Hashes `key` (the call's `tool_use_id`, always distinct per hook invocation)
+/// rather than reading the wall clock: a nanosecond-based sample (an earlier
+/// version of this used `Utc::now().timestamp_subsec_nanos() % rate`) silently
+/// breaks on any clock source whose resolution isn't fine enough to hit every
+/// residue mod `rate` — e.g. a coarse virtualized/Windows timer ticking in
+/// large, evenly-divisible steps could make the check fire on nearly 100% of
+/// calls (defeating the sampling entirely) or effectively 0% (undoing the
+/// backstop against unbounded growth), depending on the tick size, with no
+/// visible symptom short of profiling. Doesn't need to be cryptographically
+/// random, just cheap and evenly distributed across calls — `DefaultHasher`
+/// over an already-unique string avoids pulling in a `rand` dependency just for
+/// a sampling backstop.
+fn should_sample_cleanup(key: &str, rate: u32) -> bool {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish().is_multiple_of(rate as u64)
 }
 
 impl Tracker {
@@ -616,7 +627,7 @@ impl Tracker {
             ],
         )
         .inspect_err(|e| warn_if_missing_table("record_hook_decision", e))?;
-        self.maybe_cleanup_hook_decisions()?;
+        self.maybe_cleanup_hook_decisions(tool_use_id)?;
         Ok(())
     }
 
@@ -626,12 +637,9 @@ impl Tracker {
     /// commands are mostly `Deny`/`Defer`'d — and so rarely trigger `record()`'s or
     /// `record_parse_failure()`'s own cleanup — without paying a DELETE on every
     /// single hook invocation.
-    fn maybe_cleanup_hook_decisions(&self) -> Result<()> {
+    fn maybe_cleanup_hook_decisions(&self, tool_use_id: &str) -> Result<()> {
         const HOOK_DECISIONS_CLEANUP_SAMPLE_RATE: u32 = 500;
-        if !should_sample_cleanup(
-            Utc::now().timestamp_subsec_nanos(),
-            HOOK_DECISIONS_CLEANUP_SAMPLE_RATE,
-        ) {
+        if !should_sample_cleanup(tool_use_id, HOOK_DECISIONS_CLEANUP_SAMPLE_RATE) {
             return Ok(());
         }
         self.cleanup_hook_decisions()
@@ -1489,21 +1497,30 @@ fn open_and_prepare(mode: MigrationMode) -> Result<Connection> {
 
     // `create_private_dir` is cheap even when the directory already exists (its own
     // chmod is a no-op past the first call — see `utils::set_owner_only`), so it
-    // stays unconditional. The pre-create-and-chmod-the-file dance below is a
-    // genuinely separate open()/close() pair from the `Connection::open` right
-    // after it, so it's skipped once the file already exists — it only matters the
-    // *first* time the DB is ever created (so SQLite derives the -wal/-shm modes
-    // from an already-private DB instead of the umask). `Tracker::new()` is on the
+    // stays unconditional.
+    //
+    // For a brand-new DB, pre-create the file ourselves via `open_private` so
+    // SQLite derives the -wal/-shm modes from an already-private DB instead of the
+    // umask. For an already-existing DB, skip that pre-create's own redundant
+    // open()/close() pair (a second file open on top of the `Connection::open`
+    // right after it) — but still re-chmod the file *before* `Connection::open`
+    // via the now-cheap `restrict_file` (a no-op stat once permissions already
+    // match), rather than only healing it via `restrict_db_files` at the very
+    // end. Skipping the pre-open heal entirely would let `Connection::open` and
+    // any migration writes touch a file whose permissions had drifted (external
+    // tampering, restored backup) before anything corrected them — the same
+    // "chmod before SQLite ever opens it" invariant the original pre-create dance
+    // provided, just without paying its extra open. `Tracker::new()` is on the
     // hot path for every `rtk <cmd>` and, since rtk-ai/rtk#3206's hook_decisions
     // ground-truth logging, every single PreToolUse hook call (not just
-    // RTK-covered ones), so this redundant open on the already-set-up common case
-    // matters for the <10ms budget. `restrict_db_files` below still runs every
-    // time to self-heal a file whose permissions somehow drifted, but is itself
-    // now a cheap no-op stat once permissions are already correct.
+    // RTK-covered ones), so avoiding that redundant open on the already-set-up
+    // common case matters for the <10ms budget.
     if let Some(parent) = db_path.parent() {
         crate::core::utils::create_private_dir(parent)?;
     }
-    if !db_path.exists() {
+    if db_path.exists() {
+        crate::core::utils::restrict_file(&db_path);
+    } else {
         crate::core::utils::open_private(
             std::fs::OpenOptions::new().write(true).create(true),
             &db_path,
@@ -2301,11 +2318,20 @@ mod tests {
 
     #[test]
     fn test_should_sample_cleanup_pure() {
-        assert!(should_sample_cleanup(0, 500));
-        assert!(should_sample_cleanup(500, 500));
-        assert!(should_sample_cleanup(1000, 500));
-        assert!(!should_sample_cleanup(1, 500));
-        assert!(!should_sample_cleanup(499, 500));
+        // Deterministic for a given key (same tool_use_id always samples the same
+        // way), and observably not "always true"/"always false" across a spread of
+        // distinct keys — the actual hit rate isn't asserted (that would pin the
+        // hash implementation), just that it's a real subset.
+        let sampled: Vec<bool> = (0..2000)
+            .map(|i| should_sample_cleanup(&format!("toolu_{i}"), 500))
+            .collect();
+        assert!(sampled.iter().any(|&s| s), "some keys should sample");
+        assert!(sampled.iter().any(|&s| !s), "most keys should not sample");
+
+        // Same key, same rate → same decision every time.
+        let a = should_sample_cleanup("toolu_stable", 500);
+        let b = should_sample_cleanup("toolu_stable", 500);
+        assert_eq!(a, b);
     }
 
     #[test]
