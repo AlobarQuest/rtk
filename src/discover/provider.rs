@@ -64,9 +64,13 @@ impl ClaudeProvider {
             return Ok(Vec::new());
         }
 
+        // `days * 86400` can overflow u64 for a large user-supplied `--since` (same
+        // overflow class as `discover::hook_decisions_cutoff` fixes for the
+        // hook_decisions query) — use checked_mul and fall back to the epoch, which
+        // for "days ago" naturally means "no lower bound", instead of panicking.
         let cutoff = since_days.map(|days| {
-            SystemTime::now()
-                .checked_sub(Duration::from_secs(days * 86400))
+            days.checked_mul(86400)
+                .and_then(|secs| SystemTime::now().checked_sub(Duration::from_secs(secs)))
                 .unwrap_or(SystemTime::UNIX_EPOCH)
         });
 

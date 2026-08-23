@@ -111,8 +111,16 @@ pub struct DiscoverReport {
     pub unsupported: Vec<UnsupportedEntry>,
     pub parse_errors: usize,
     pub rtk_disabled_count: usize,
-    /// Subset of `rtk_disabled_count` from the estimate fallback rather than a
-    /// measured `hook_decisions` log entry — same caveat as `already_rtk_estimated`.
+    /// Always equal to `rtk_disabled_count`: unlike `already_rtk_estimated`, this can
+    /// never be a *strict* subset. An `RTK_DISABLED=` bypass makes the hook's own
+    /// logged decision `Defer` unconditionally (see `registry.rs` #345 / `get_rewritten`),
+    /// so a real `hook_decisions` row for a bypassed command never says "this would
+    /// have been covered" — it only ever confirms the hook stepped aside, which is
+    /// already known from the bypass itself. So `rtk_disabled_count` is always computed
+    /// from the current-state estimate, never the measured log, and this field mirrors
+    /// it 1:1. Kept as its own field (rather than folded away) so the report's JSON/text
+    /// output keeps disclosing "this bucket is an estimate" the same way
+    /// `already_rtk_estimated` does, instead of silently going quiet about it.
     pub rtk_disabled_estimated: usize,
     pub rtk_disabled_examples: Vec<String>,
     pub agent_status: AgentIntegrationStatus,
@@ -377,14 +385,21 @@ mod tests {
     }
 
     #[test]
-    fn test_format_text_omits_rtk_disabled_estimate_caveat_when_fully_measured() {
+    fn test_format_text_omits_rtk_disabled_estimate_caveat_when_zero() {
+        // `format_text` renders whatever it's given and doesn't enforce the
+        // rtk_disabled_estimated == rtk_disabled_count invariant `discover::run`
+        // now always produces (see the field doc on `DiscoverReport::
+        // rtk_disabled_estimated`: a bypassed command's hook decision is always
+        // `Defer`, so this bucket is never measured — `run` sets both counters
+        // together, never a count > 0 / estimated == 0 combination). This test is
+        // just exercising the renderer's zero-suppression on its own terms.
         let mut report = make_report(100, 10);
         report.supported = vec![dummy_supported_entry()];
-        report.rtk_disabled_count = 3;
+        report.rtk_disabled_count = 0;
         report.rtk_disabled_estimated = 0;
 
         let output = format_text(&report, 10, false);
-        assert!(output.contains("RTK_DISABLED BYPASS -- 3 commands"));
+        assert!(!output.contains("RTK_DISABLED BYPASS"));
         assert!(!output.contains("includes ~0 estimated"));
     }
 

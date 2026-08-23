@@ -63,6 +63,17 @@ struct PermissionRules {
 /// Determine whether `cmd` was (or, absent a log entry, likely would have been)
 /// routed through RTK by the installed PreToolUse hook.
 ///
+/// Do NOT call this for an `RTK_DISABLED=`-bypassed command — call
+/// `estimate_hook_coverage` directly instead. `hook_coverage` trusts a measured
+/// `hook_decisions` row as ground truth, but for a bypassed command the real logged
+/// decision is always `Defer` (see `registry.rs` #345 / `get_rewritten`), which only
+/// confirms the hook stepped aside — it says nothing about whether the command would
+/// have been covered absent the bypass, which is the actual question the
+/// RTK_DISABLED= bucket is answering. Consulting the measured log there made that
+/// bucket silently collapse to (near) zero once real `hook_decisions` rows
+/// accumulated (rtk-ai/rtk#3206 review) — the counterfactual can only ever be
+/// answered by the estimate.
+///
 /// Known imprecision: the caller splits a chained command (`a && b`) into parts
 /// and calls this once per part with the *same* `tool_use_id`, since Claude Code's
 /// PreToolUse hook fires once per tool call for the whole raw command. A `Deny`/
@@ -153,24 +164,6 @@ pub(crate) fn is_already_rtk(cmd: &str) -> bool {
     trimmed.starts_with("rtk ") && !trimmed.starts_with("rtk proxy")
 }
 
-/// Earliest timestamp to query `hook_decisions` for, given `--since <days>`.
-///
-/// `since_days` is user-supplied and unbounded; a huge value (e.g. `--since
-/// 100000000`) previously made `chrono::Duration::days` + subtraction from
-/// `Utc::now()` overflow and panic (rtk-ai/rtk#3206 review). Clamped in two
-/// places: `since_days` is capped to `i64::MAX` before the `as i64` cast (a
-/// `u64` past `i64::MAX` would otherwise reinterpret as negative, turning
-/// "look back" into "look forward"), and any remaining overflow building or
-/// applying the `Duration` falls back to `DateTime::<Utc>::MIN_UTC` — an
-/// arbitrarily distant cutoff means "no lower bound", which is exactly what
-/// an absurdly large `--since` should behave like instead of crashing.
-fn hook_decisions_cutoff(since_days: u64) -> DateTime<Utc> {
-    let days = since_days.min(i64::MAX as u64) as i64;
-    chrono::Duration::try_days(days)
-        .and_then(|d| Utc::now().checked_sub_signed(d))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
-}
-
 /// Aggregation bucket for supported commands.
 struct SupportedBucket {
     rtk_equivalent: &'static str,
@@ -237,7 +230,7 @@ pub fn run(
     let (deny, ask, allow) = permissions::load_rules_for(permissions::Host::Claude);
     let rules = PermissionRules { deny, ask, allow };
 
-    let cutoff = hook_decisions_cutoff(since_days);
+    let cutoff = crate::core::utils::days_ago_cutoff(since_days);
     let (hook_log, measured_since): (HashMap<String, HookDecisionRecord>, Option<DateTime<Utc>>) =
         Tracker::new()
             .map(|t| {
@@ -608,26 +601,6 @@ mod tests {
             &[],
             &[]
         ));
-    }
-
-    #[test]
-    fn test_hook_decisions_cutoff_normal_value_is_in_the_past() {
-        let cutoff = hook_decisions_cutoff(30);
-        assert!(cutoff < Utc::now());
-    }
-
-    #[test]
-    fn test_hook_decisions_cutoff_does_not_panic_on_huge_since_days() {
-        // rtk-ai/rtk#3206 review: `rtk discover --since 100000000` panicked with
-        // "DateTime - TimeDelta overflowed". Must clamp instead of crashing.
-        let cutoff = hook_decisions_cutoff(100_000_000);
-        assert_eq!(cutoff, DateTime::<Utc>::MIN_UTC);
-    }
-
-    #[test]
-    fn test_hook_decisions_cutoff_does_not_panic_on_u64_max() {
-        let cutoff = hook_decisions_cutoff(u64::MAX);
-        assert_eq!(cutoff, DateTime::<Utc>::MIN_UTC);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! - Command execution with error context
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde_json::Value;
 use std::fs;
@@ -13,6 +14,25 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::LazyLock;
 use std::sync::OnceLock;
+
+/// Compute `days` ago from now, clamped instead of panicking on overflow.
+///
+/// `days` is typically user-supplied (`--since <days>`) and unbounded. Naively
+/// building `chrono::Duration::days(days as i64)` and subtracting it from
+/// `Utc::now()` panics for a large enough value ("DateTime - TimeDelta
+/// overflowed") — this happened identically in `rtk discover --since` and `rtk
+/// hook audit --since` before both were routed through this helper. `days` is
+/// capped to `i64::MAX` before the `as i64` cast (a `u64` past `i64::MAX` would
+/// otherwise reinterpret as negative, turning "look back" into "look forward"),
+/// and any remaining overflow building or applying the `Duration` falls back to
+/// `DateTime::<Utc>::MIN_UTC` — an arbitrarily distant cutoff means "no lower
+/// bound", which is exactly what an absurdly large `--since` should behave like.
+pub fn days_ago_cutoff(days: u64) -> DateTime<Utc> {
+    let days = days.min(i64::MAX as u64) as i64;
+    chrono::Duration::try_days(days)
+        .and_then(|d| Utc::now().checked_sub_signed(d))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
 
 /// Truncates a string to `max_len` characters, appending `...` if needed.
 ///
@@ -684,6 +704,25 @@ mod tests {
     #[test]
     fn test_truncate_short_string() {
         assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_days_ago_cutoff_normal_value_is_in_the_past() {
+        let cutoff = days_ago_cutoff(30);
+        assert!(cutoff < Utc::now());
+    }
+
+    #[test]
+    fn test_days_ago_cutoff_does_not_panic_on_huge_since_days() {
+        // rtk-ai/rtk#3206 review: `rtk discover --since 100000000` and `rtk hook
+        // audit --since 100000000` both panicked with "DateTime - TimeDelta
+        // overflowed". Must clamp instead of crashing.
+        assert_eq!(days_ago_cutoff(100_000_000), DateTime::<Utc>::MIN_UTC);
+    }
+
+    #[test]
+    fn test_days_ago_cutoff_does_not_panic_on_u64_max() {
+        assert_eq!(days_ago_cutoff(u64::MAX), DateTime::<Utc>::MIN_UTC);
     }
 
     #[test]
