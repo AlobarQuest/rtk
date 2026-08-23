@@ -51,13 +51,27 @@ impl Coverage {
 /// Preloaded permission rules, read from disk once per `discover` run instead of
 /// once per command. `check_command_for` re-reads every settings file on disk on
 /// every call; over a large history (tens of thousands of commands) that dominated
-/// runtime (see rtk-ai/rtk#3206 review: 80s vs 2.5s on the measured path). Threaded
-/// through `hook_coverage`/`estimate_hook_coverage` so the estimate path reuses one
-/// in-memory snapshot instead of hitting the filesystem per command.
+/// runtime (see rtk-ai/rtk#3206 review: 80s vs 2.5s on the measured path).
 struct PermissionRules {
     deny: Vec<String>,
     ask: Vec<String>,
     allow: Vec<String>,
+}
+
+/// Everything `hook_coverage`/`estimate_hook_coverage` need to judge a command,
+/// besides the command (and `tool_use_id`) itself — built once per `discover` run
+/// and passed by reference to every per-command call.
+///
+/// Grouped into one struct rather than five individual positional params: with
+/// `excluded`/`transparent_prefixes` both `Vec<String>`, a swapped argument order
+/// at a call site would compile silently and misclassify RTK_DISABLED bypass
+/// coverage (code-review finding on rtk-ai/rtk#3206's fixup round).
+struct CoverageContext {
+    hook_log: HashMap<String, HookDecisionRecord>,
+    hook_installed: bool,
+    rules: PermissionRules,
+    excluded: Vec<String>,
+    transparent_prefixes: Vec<String>,
 }
 
 /// Determine whether `cmd` was (or, absent a log entry, likely would have been)
@@ -87,25 +101,11 @@ struct PermissionRules {
 /// transitional fallback for history that predates `hook_decisions` logging and
 /// naturally fades out as that log backfills — after ~90 days only `Measured`
 /// should remain in practice.
-fn hook_coverage(
-    cmd: &str,
-    tool_use_id: &str,
-    hook_log: &HashMap<String, HookDecisionRecord>,
-    hook_installed: bool,
-    rules: &PermissionRules,
-    excluded: &[String],
-    transparent_prefixes: &[String],
-) -> Coverage {
-    if let Some(record) = hook_log.get(tool_use_id) {
+fn hook_coverage(cmd: &str, tool_use_id: &str, ctx: &CoverageContext) -> Coverage {
+    if let Some(record) = ctx.hook_log.get(tool_use_id) {
         return Coverage::Measured(record.decision.is_covered());
     }
-    Coverage::Estimated(estimate_hook_coverage(
-        cmd,
-        hook_installed,
-        rules,
-        excluded,
-        transparent_prefixes,
-    ))
+    Coverage::Estimated(estimate_hook_coverage(cmd, ctx))
 }
 
 /// Best-effort guess at whether the *currently* installed hook would rewrite `cmd`,
@@ -117,24 +117,17 @@ fn hook_coverage(
 /// registry rewrite check on every single command in the scan (see
 /// rtk-ai/rtk#3206 review: 100s of wasted work on histories with no hook ever
 /// installed, since that case never had a chance to short-circuit before).
-fn estimate_hook_coverage(
-    cmd: &str,
-    hook_installed: bool,
-    rules: &PermissionRules,
-    excluded: &[String],
-    transparent_prefixes: &[String],
-) -> bool {
-    if !hook_installed {
+fn estimate_hook_coverage(cmd: &str, ctx: &CoverageContext) -> bool {
+    if !ctx.hook_installed {
         return false;
     }
-    let verdict = permissions::check_command_with_rules(cmd, &rules.deny, &rules.ask, &rules.allow);
-    estimate_hook_coverage_with_verdict(
+    let verdict = permissions::check_command_with_rules(
         cmd,
-        verdict,
-        hook_installed,
-        excluded,
-        transparent_prefixes,
-    )
+        &ctx.rules.deny,
+        &ctx.rules.ask,
+        &ctx.rules.allow,
+    );
+    estimate_hook_coverage_with_verdict(cmd, verdict, ctx)
 }
 
 /// Pure core of `estimate_hook_coverage`, taking the permission verdict directly so
@@ -145,14 +138,12 @@ fn estimate_hook_coverage(
 fn estimate_hook_coverage_with_verdict(
     cmd: &str,
     verdict: PermissionVerdict,
-    hook_installed: bool,
-    excluded: &[String],
-    transparent_prefixes: &[String],
+    ctx: &CoverageContext,
 ) -> bool {
-    hook_installed
+    ctx.hook_installed
         && verdict != PermissionVerdict::Deny
         && !lexer::contains_unattestable_construct(cmd)
-        && registry::rewrite_command(cmd, excluded, transparent_prefixes).is_some()
+        && registry::rewrite_command(cmd, &ctx.excluded, &ctx.transparent_prefixes).is_some()
 }
 
 /// Whether an already-`rtk`-prefixed command counts as coverage. `rtk proxy <cmd>`
@@ -240,6 +231,14 @@ pub fn run(
             })
             .unwrap_or_default();
 
+    let coverage_ctx = CoverageContext {
+        hook_log,
+        hook_installed,
+        rules,
+        excluded,
+        transparent_prefixes,
+    };
+
     let mut total_commands: usize = 0;
     let mut already_rtk: usize = 0;
     let mut already_rtk_estimated: usize = 0;
@@ -284,13 +283,7 @@ pub fn run(
                     // here would make this section report zero bypassed commands as soon as
                     // real hook-decision rows exist (rtk-ai/rtk#3206 review).
                     if let Classification::Supported { .. } = classify_command(actual_cmd) {
-                        if estimate_hook_coverage(
-                            actual_cmd,
-                            hook_installed,
-                            &rules,
-                            &excluded,
-                            &transparent_prefixes,
-                        ) {
+                        if estimate_hook_coverage(actual_cmd, &coverage_ctx) {
                             rtk_disabled_count += 1;
                             rtk_disabled_estimated += 1;
                             let display = truncate_command(actual_cmd);
@@ -307,15 +300,7 @@ pub fn run(
                         estimated_savings_pct,
                         status,
                     } => {
-                        let coverage = hook_coverage(
-                            part,
-                            &ext_cmd.tool_use_id,
-                            &hook_log,
-                            hook_installed,
-                            &rules,
-                            &excluded,
-                            &transparent_prefixes,
-                        );
+                        let coverage = hook_coverage(part, &ext_cmd.tool_use_id, &coverage_ctx);
 
                         if coverage.is_covered() {
                             // Hook already routed this through RTK at runtime — it's
@@ -532,33 +517,41 @@ mod tests {
         }
     }
 
+    /// Build a `CoverageContext` for tests, with an empty `hook_log` (so every
+    /// call falls through to the estimate) and no permission/exclusion rules
+    /// unless overridden by the caller after construction.
+    fn test_ctx(hook_installed: bool) -> CoverageContext {
+        CoverageContext {
+            hook_log: HashMap::new(),
+            hook_installed,
+            rules: empty_rules(),
+            excluded: vec![],
+            transparent_prefixes: vec![],
+        }
+    }
+
     #[test]
     fn test_estimate_hook_coverage_false_when_hook_not_installed() {
         // No hook installed → the raw command genuinely ran unfiltered; still a miss.
         assert!(!estimate_hook_coverage_with_verdict(
             "grep -n foo bar.py",
             PermissionVerdict::Default,
-            false,
-            &[],
-            &[]
+            &test_ctx(false),
         ));
     }
 
     #[test]
     fn test_estimate_hook_coverage_true_for_rewritable_command() {
+        let ctx = test_ctx(true);
         assert!(estimate_hook_coverage_with_verdict(
             "grep -n foo bar.py",
             PermissionVerdict::Default,
-            true,
-            &[],
-            &[]
+            &ctx,
         ));
         assert!(estimate_hook_coverage_with_verdict(
             "ls -la",
             PermissionVerdict::Allow,
-            true,
-            &[],
-            &[]
+            &ctx,
         ));
     }
 
@@ -569,9 +562,7 @@ mod tests {
         assert!(!estimate_hook_coverage_with_verdict(
             "git status $(rm -rf /tmp/x)",
             PermissionVerdict::Default,
-            true,
-            &[],
-            &[]
+            &test_ctx(true),
         ));
     }
 
@@ -579,13 +570,12 @@ mod tests {
     fn test_estimate_hook_coverage_false_when_excluded_by_config() {
         // Even with the hook installed, a command the user excluded via config
         // was never rewritten — the hook stepped aside, so it's a genuine miss.
-        let excluded = vec!["grep".to_string()];
+        let mut ctx = test_ctx(true);
+        ctx.excluded = vec!["grep".to_string()];
         assert!(!estimate_hook_coverage_with_verdict(
             "grep -n foo bar.py",
             PermissionVerdict::Default,
-            true,
-            &excluded,
-            &[]
+            &ctx,
         ));
     }
 
@@ -597,9 +587,7 @@ mod tests {
         assert!(!estimate_hook_coverage_with_verdict(
             "rm -rf /",
             PermissionVerdict::Deny,
-            true,
-            &[],
-            &[]
+            &test_ctx(true),
         ));
     }
 
@@ -624,18 +612,11 @@ mod tests {
     fn test_hook_coverage_prefers_measured_log_over_estimate() {
         // Even if the current hook state would estimate "not covered" (hook
         // uninstalled today), a real log row is ground truth and wins.
-        let mut log = HashMap::new();
-        log.insert("toolu_1".to_string(), record(HookOutcome::Allow));
+        let mut ctx = test_ctx(false);
+        ctx.hook_log
+            .insert("toolu_1".to_string(), record(HookOutcome::Allow));
 
-        let coverage = hook_coverage(
-            "git status",
-            "toolu_1",
-            &log,
-            false,
-            &empty_rules(),
-            &[],
-            &[],
-        );
+        let coverage = hook_coverage("git status", "toolu_1", &ctx);
         assert!(matches!(coverage, Coverage::Measured(true)));
         assert!(coverage.is_covered());
         assert!(!coverage.is_estimated());
@@ -643,10 +624,11 @@ mod tests {
 
     #[test]
     fn test_hook_coverage_measured_deny_is_a_genuine_miss() {
-        let mut log = HashMap::new();
-        log.insert("toolu_1".to_string(), record(HookOutcome::Deny));
+        let mut ctx = test_ctx(true);
+        ctx.hook_log
+            .insert("toolu_1".to_string(), record(HookOutcome::Deny));
 
-        let coverage = hook_coverage("rm -rf /", "toolu_1", &log, true, &empty_rules(), &[], &[]);
+        let coverage = hook_coverage("rm -rf /", "toolu_1", &ctx);
         assert!(matches!(coverage, Coverage::Measured(false)));
         assert!(!coverage.is_covered());
     }
@@ -655,17 +637,7 @@ mod tests {
     fn test_hook_coverage_falls_back_to_estimate_when_no_log_row() {
         // No log entry for this tool_use_id — predates logging (or non-Claude) —
         // falls back to the current-state heuristic, flagged as estimated.
-        let log = HashMap::new();
-
-        let coverage = hook_coverage(
-            "ls -la",
-            "toolu_missing",
-            &log,
-            true,
-            &empty_rules(),
-            &[],
-            &[],
-        );
+        let coverage = hook_coverage("ls -la", "toolu_missing", &test_ctx(true));
         assert!(coverage.is_estimated());
     }
 }
