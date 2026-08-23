@@ -315,6 +315,18 @@ pub fn open_private(
 #[cfg(unix)]
 fn set_owner_only(path: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
+    // Skip the chmod syscall once permissions already match. This runs on every
+    // `Tracker::new()` call, which is now on the PreToolUse hook's hot path for
+    // *every* Bash tool call (not just RTK-covered ones — see rtk-ai/rtk#3206's
+    // hook_decisions ground-truth logging), under the project's <10ms latency
+    // budget, so a redundant chmod on the already-correct common case adds up.
+    // Falls through to chmod on any metadata-read failure, erring toward
+    // enforcing the permission rather than silently skipping it.
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.permissions().mode() & 0o777 == mode {
+            return;
+        }
+    }
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
 }
 
@@ -1425,5 +1437,39 @@ mod tests {
                 bytes
             );
         }
+    }
+
+    // rtk-ai/rtk#3206 review: set_owner_only now skips the chmod syscall once
+    // permissions already match, since Tracker::new() (which calls this via
+    // create_private_dir/open_private/restrict_db_files) is on the PreToolUse
+    // hook's hot path for every Bash tool call. These don't observe the skipped
+    // syscall directly, but confirm the already-correct case stays correct
+    // (idempotent) across repeated calls, on both a directory and a file.
+
+    #[test]
+    #[cfg(unix)]
+    fn test_set_owner_only_idempotent_when_already_correct_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("already-private");
+        create_private_dir(&dir).unwrap();
+        assert_eq!(mode_of(&dir), 0o700);
+
+        // Second call hits the already-correct fast path — must stay 0o700.
+        create_private_dir(&dir).unwrap();
+        assert_eq!(mode_of(&dir), 0o700);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_restrict_file_idempotent_when_already_correct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("history.db");
+        fs::write(&file, b"x").unwrap();
+        restrict_file(&file);
+        assert_eq!(mode_of(&file), 0o600);
+
+        // Second call hits the already-correct fast path — must stay 0o600.
+        restrict_file(&file);
+        assert_eq!(mode_of(&file), 0o600);
     }
 }

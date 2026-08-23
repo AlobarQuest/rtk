@@ -415,6 +415,16 @@ fn warn_if_missing_table(context: &str, err: &rusqlite::Error) {
     }
 }
 
+/// Pure core of `Tracker::maybe_cleanup_hook_decisions`'s sampling decision, taking
+/// the nanosecond reading directly so it's deterministically testable without
+/// waiting on a real 1-in-`rate` chance. Doesn't need to be cryptographically
+/// random, just cheap and not obviously correlated with call timing — reusing the
+/// wall-clock read the caller already pays for avoids pulling in a `rand`
+/// dependency just for a sampling backstop.
+fn should_sample_cleanup(nanos: u32, rate: u32) -> bool {
+    nanos.is_multiple_of(rate)
+}
+
 impl Tracker {
     /// Create a new tracker instance.
     ///
@@ -571,11 +581,15 @@ impl Tracker {
 
     /// Record a PreToolUse hook decision at the moment the hook actually ran.
     ///
-    /// Deliberately does *not* run `cleanup_old()` — this fires on every single
-    /// Bash tool call (the hook's hot path, under the project's <10ms latency
-    /// budget), so a 3-table DELETE sweep here would tax every command, not just
-    /// RTK-covered ones. Retention for `hook_decisions` piggybacks on whatever
-    /// cadence `record()`/`record_parse_failure()` already run cleanup at.
+    /// Deliberately does *not* run the full `cleanup_old()` (which sweeps
+    /// `commands`/`parse_failures` too) unconditionally — this fires on every
+    /// single Bash tool call (the hook's hot path, under the project's <10ms
+    /// latency budget), so a 3-table DELETE sweep here would tax every command,
+    /// not just RTK-covered ones. Retention mostly piggybacks on whatever cadence
+    /// `record()`/`record_parse_failure()` already run cleanup at, but a user whose
+    /// commands are almost entirely `Deny`/`Defer`'d may rarely trigger either of
+    /// those, so `hook_decisions` alone still gets a `maybe_cleanup_hook_decisions`
+    /// sweep — sampled, not every call — as a backstop against unbounded growth.
     #[allow(clippy::too_many_arguments)]
     pub fn record_hook_decision(
         &self,
@@ -602,6 +616,36 @@ impl Tracker {
             ],
         )
         .inspect_err(|e| warn_if_missing_table("record_hook_decision", e))?;
+        self.maybe_cleanup_hook_decisions()?;
+        Ok(())
+    }
+
+    /// Sampled retention sweep for `hook_decisions` alone (not the full 3-table
+    /// `cleanup_old()`), run on roughly 1-in-`HOOK_DECISIONS_CLEANUP_SAMPLE_RATE`
+    /// calls to `record_hook_decision`. Bounds the table's growth for a user whose
+    /// commands are mostly `Deny`/`Defer`'d — and so rarely trigger `record()`'s or
+    /// `record_parse_failure()`'s own cleanup — without paying a DELETE on every
+    /// single hook invocation.
+    fn maybe_cleanup_hook_decisions(&self) -> Result<()> {
+        const HOOK_DECISIONS_CLEANUP_SAMPLE_RATE: u32 = 500;
+        if !should_sample_cleanup(
+            Utc::now().timestamp_subsec_nanos(),
+            HOOK_DECISIONS_CLEANUP_SAMPLE_RATE,
+        ) {
+            return Ok(());
+        }
+        self.cleanup_hook_decisions()
+    }
+
+    /// The actual `hook_decisions` DELETE sweep, split out from
+    /// `maybe_cleanup_hook_decisions` so it's directly callable (bypassing the
+    /// sampling gate) from tests without needing to hit the 1-in-N chance for real.
+    fn cleanup_hook_decisions(&self) -> Result<()> {
+        let cutoff = Utc::now() - chrono::Duration::days(DEFAULT_HISTORY_DAYS);
+        self.conn.execute(
+            "DELETE FROM hook_decisions WHERE timestamp < ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
         Ok(())
     }
 
@@ -1442,22 +1486,35 @@ enum MigrationMode {
 /// `ensure_schema_fresh` (`rtk init`, unconditional).
 fn open_and_prepare(mode: MigrationMode) -> Result<Connection> {
     let db_path = get_db_path()?;
+
+    // `create_private_dir` is cheap even when the directory already exists (its own
+    // chmod is a no-op past the first call — see `utils::set_owner_only`), so it
+    // stays unconditional. The pre-create-and-chmod-the-file dance below is a
+    // genuinely separate open()/close() pair from the `Connection::open` right
+    // after it, so it's skipped once the file already exists — it only matters the
+    // *first* time the DB is ever created (so SQLite derives the -wal/-shm modes
+    // from an already-private DB instead of the umask). `Tracker::new()` is on the
+    // hot path for every `rtk <cmd>` and, since rtk-ai/rtk#3206's hook_decisions
+    // ground-truth logging, every single PreToolUse hook call (not just
+    // RTK-covered ones), so this redundant open on the already-set-up common case
+    // matters for the <10ms budget. `restrict_db_files` below still runs every
+    // time to self-heal a file whose permissions somehow drifted, but is itself
+    // now a cheap no-op stat once permissions are already correct.
     if let Some(parent) = db_path.parent() {
         crate::core::utils::create_private_dir(parent)?;
     }
-
-    // Create the file ourselves so SQLite derives the -wal/-shm modes from
-    // an already-private DB instead of the umask.
-    crate::core::utils::open_private(
-        std::fs::OpenOptions::new().write(true).create(true),
-        &db_path,
-    )
-    .with_context(|| {
-        format!(
-            "Failed to pre-create private DB file: {}",
-            db_path.display()
+    if !db_path.exists() {
+        crate::core::utils::open_private(
+            std::fs::OpenOptions::new().write(true).create(true),
+            &db_path,
         )
-    })?;
+        .with_context(|| {
+            format!(
+                "Failed to pre-create private DB file: {}",
+                db_path.display()
+            )
+        })?;
+    }
 
     let conn = Connection::open(&db_path)?;
     // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
@@ -2234,5 +2291,69 @@ mod tests {
             .earliest_hook_decision_timestamp()
             .expect("query failed")
             .is_none());
+    }
+
+    // rtk-ai/rtk#3206 review: hook_decisions grows unbounded for a user whose
+    // commands are mostly Deny/Defer'd, since record_hook_decision deliberately
+    // skips the full cleanup_old() sweep and those decisions rarely trigger
+    // record()/record_parse_failure()'s own cleanup. maybe_cleanup_hook_decisions
+    // is a sampled backstop against that.
+
+    #[test]
+    fn test_should_sample_cleanup_pure() {
+        assert!(should_sample_cleanup(0, 500));
+        assert!(should_sample_cleanup(500, 500));
+        assert!(should_sample_cleanup(1000, 500));
+        assert!(!should_sample_cleanup(1, 500));
+        assert!(!should_sample_cleanup(499, 500));
+    }
+
+    #[test]
+    fn test_cleanup_hook_decisions_deletes_only_stale_rows() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create in-memory tracker");
+
+        // Recent row, via the real API.
+        tracker
+            .record_hook_decision(
+                "s",
+                "toolu_recent",
+                "",
+                "ls",
+                HookOutcome::Allow,
+                Some("rtk ls"),
+                "0.42.4",
+            )
+            .expect("Failed to record hook decision");
+
+        // Stale row, inserted directly: record_hook_decision always stamps
+        // Utc::now(), so there's no other way to get an old row into the table.
+        let stale_ts = (Utc::now() - chrono::Duration::days(DEFAULT_HISTORY_DAYS + 1)).to_rfc3339();
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO hook_decisions (timestamp, session_id, tool_use_id, project_path, raw_cmd, decision, rewritten_cmd, rtk_version)
+                 VALUES (?1, 's', 'toolu_stale', '', 'ls', 'allow', 'rtk ls', '0.42.4')",
+                params![stale_ts],
+            )
+            .expect("Failed to insert stale row");
+
+        // Call the sweep directly, bypassing maybe_cleanup_hook_decisions' sampling
+        // gate — this test isn't exercising the sampling decision, just the DELETE.
+        tracker
+            .cleanup_hook_decisions()
+            .expect("cleanup should succeed");
+
+        let far_past = DateTime::<Utc>::MIN_UTC;
+        let all = tracker
+            .hook_decisions_since(far_past)
+            .expect("query failed");
+        assert!(
+            all.contains_key("toolu_recent"),
+            "recent row should survive cleanup"
+        );
+        assert!(
+            !all.contains_key("toolu_stale"),
+            "stale row should be deleted by cleanup"
+        );
     }
 }
