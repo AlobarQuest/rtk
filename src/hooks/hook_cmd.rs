@@ -1574,10 +1574,7 @@ mod tests {
         match process_claude_payload_from_decision(
             &v,
             "git status",
-            HookDecision::AskRewrite {
-                rewritten: "rtk git status".to_string(),
-                explicit: true,
-            },
+            HookDecision::AskRewrite("rtk git status".to_string()),
         ) {
             PayloadAction::Rewrite { decision, .. } => assert_eq!(decision, HookOutcome::Ask),
             other => {

@@ -48,6 +48,18 @@ impl Coverage {
     }
 }
 
+/// Preloaded permission rules, read from disk once per `discover` run instead of
+/// once per command. `check_command_for` re-reads every settings file on disk on
+/// every call; over a large history (tens of thousands of commands) that dominated
+/// runtime (see rtk-ai/rtk#3206 review: 80s vs 2.5s on the measured path). Threaded
+/// through `hook_coverage`/`estimate_hook_coverage` so the estimate path reuses one
+/// in-memory snapshot instead of hitting the filesystem per command.
+struct PermissionRules {
+    deny: Vec<String>,
+    ask: Vec<String>,
+    allow: Vec<String>,
+}
+
 /// Determine whether `cmd` was (or, absent a log entry, likely would have been)
 /// routed through RTK by the installed PreToolUse hook.
 ///
@@ -69,6 +81,7 @@ fn hook_coverage(
     tool_use_id: &str,
     hook_log: &HashMap<String, HookDecisionRecord>,
     hook_installed: bool,
+    rules: &PermissionRules,
     excluded: &[String],
     transparent_prefixes: &[String],
 ) -> Coverage {
@@ -78,6 +91,7 @@ fn hook_coverage(
     Coverage::Estimated(estimate_hook_coverage(
         cmd,
         hook_installed,
+        rules,
         excluded,
         transparent_prefixes,
     ))
@@ -85,15 +99,24 @@ fn hook_coverage(
 
 /// Best-effort guess at whether the *currently* installed hook would rewrite `cmd`,
 /// used only when no `hook_decisions` log row exists for this exact invocation.
-/// Reads real permission config — see `estimate_hook_coverage_with_verdict` for the
-/// pure decision core.
+///
+/// Checks `hook_installed` before touching `rules`/the lexer/the registry: with no
+/// hook installed the answer is always "not covered", so there's no reason to pay
+/// for the permission-verdict lookup, the unattestable-construct scan, or the
+/// registry rewrite check on every single command in the scan (see
+/// rtk-ai/rtk#3206 review: 100s of wasted work on histories with no hook ever
+/// installed, since that case never had a chance to short-circuit before).
 fn estimate_hook_coverage(
     cmd: &str,
     hook_installed: bool,
+    rules: &PermissionRules,
     excluded: &[String],
     transparent_prefixes: &[String],
 ) -> bool {
-    let verdict = permissions::check_command_for(cmd, permissions::Host::Claude);
+    if !hook_installed {
+        return false;
+    }
+    let verdict = permissions::check_command_with_rules(cmd, &rules.deny, &rules.ask, &rules.allow);
     estimate_hook_coverage_with_verdict(
         cmd,
         verdict,
@@ -128,6 +151,24 @@ fn estimate_hook_coverage_with_verdict(
 pub(crate) fn is_already_rtk(cmd: &str) -> bool {
     let trimmed = cmd.trim();
     trimmed.starts_with("rtk ") && !trimmed.starts_with("rtk proxy")
+}
+
+/// Earliest timestamp to query `hook_decisions` for, given `--since <days>`.
+///
+/// `since_days` is user-supplied and unbounded; a huge value (e.g. `--since
+/// 100000000`) previously made `chrono::Duration::days` + subtraction from
+/// `Utc::now()` overflow and panic (rtk-ai/rtk#3206 review). Clamped in two
+/// places: `since_days` is capped to `i64::MAX` before the `as i64` cast (a
+/// `u64` past `i64::MAX` would otherwise reinterpret as negative, turning
+/// "look back" into "look forward"), and any remaining overflow building or
+/// applying the `Duration` falls back to `DateTime::<Utc>::MIN_UTC` — an
+/// arbitrarily distant cutoff means "no lower bound", which is exactly what
+/// an absurdly large `--since` should behave like instead of crashing.
+fn hook_decisions_cutoff(since_days: u64) -> DateTime<Utc> {
+    let days = since_days.min(i64::MAX as u64) as i64;
+    chrono::Duration::try_days(days)
+        .and_then(|d| Utc::now().checked_sub_signed(d))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
 /// Aggregation bucket for supported commands.
@@ -192,7 +233,11 @@ pub fn run(
     let hook_installed = hook_status() != HookStatus::Missing;
     let (excluded, transparent_prefixes) = crate::core::config::hook_rewrite_params();
 
-    let cutoff = Utc::now() - chrono::Duration::days(since_days as i64);
+    // Loaded once up front (see `PermissionRules`), not once per command.
+    let (deny, ask, allow) = permissions::load_rules_for(permissions::Host::Claude);
+    let rules = PermissionRules { deny, ask, allow };
+
+    let cutoff = hook_decisions_cutoff(since_days);
     let (hook_log, measured_since): (HashMap<String, HookDecisionRecord>, Option<DateTime<Utc>>) =
         Tracker::new()
             .map(|t| {
@@ -236,20 +281,25 @@ pub fn run(
                     // hook would actually have covered it — otherwise RTK_DISABLED=
                     // bypassed nothing (hook wasn't installed / excluded / would defer
                     // / would deny), and flagging it as a "bypass" would be false advice.
+                    //
+                    // Deliberately always the *estimate*, never `hook_coverage`'s measured
+                    // log: `RTK_DISABLED=` makes `get_rewritten` return `None` unconditionally
+                    // (registry.rs #345), so the real logged decision for a bypassed command
+                    // is always `Defer` (never `Allow`/`Ask`) — that's the hook correctly
+                    // recording that it stepped aside, not evidence about whether the command
+                    // would have been covered absent the bypass. Consulting the measured log
+                    // here would make this section report zero bypassed commands as soon as
+                    // real hook-decision rows exist (rtk-ai/rtk#3206 review).
                     if let Classification::Supported { .. } = classify_command(actual_cmd) {
-                        let coverage = hook_coverage(
+                        if estimate_hook_coverage(
                             actual_cmd,
-                            &ext_cmd.tool_use_id,
-                            &hook_log,
                             hook_installed,
+                            &rules,
                             &excluded,
                             &transparent_prefixes,
-                        );
-                        if coverage.is_covered() {
+                        ) {
                             rtk_disabled_count += 1;
-                            if coverage.is_estimated() {
-                                rtk_disabled_estimated += 1;
-                            }
+                            rtk_disabled_estimated += 1;
                             let display = truncate_command(actual_cmd);
                             *rtk_disabled_cmds.entry(display).or_insert(0) += 1;
                         }
@@ -269,6 +319,7 @@ pub fn run(
                             &ext_cmd.tool_use_id,
                             &hook_log,
                             hook_installed,
+                            &rules,
                             &excluded,
                             &transparent_prefixes,
                         );
@@ -480,6 +531,14 @@ mod tests {
         HookDecisionRecord { decision }
     }
 
+    fn empty_rules() -> PermissionRules {
+        PermissionRules {
+            deny: vec![],
+            ask: vec![],
+            allow: vec![],
+        }
+    }
+
     #[test]
     fn test_estimate_hook_coverage_false_when_hook_not_installed() {
         // No hook installed → the raw command genuinely ran unfiltered; still a miss.
@@ -552,6 +611,26 @@ mod tests {
     }
 
     #[test]
+    fn test_hook_decisions_cutoff_normal_value_is_in_the_past() {
+        let cutoff = hook_decisions_cutoff(30);
+        assert!(cutoff < Utc::now());
+    }
+
+    #[test]
+    fn test_hook_decisions_cutoff_does_not_panic_on_huge_since_days() {
+        // rtk-ai/rtk#3206 review: `rtk discover --since 100000000` panicked with
+        // "DateTime - TimeDelta overflowed". Must clamp instead of crashing.
+        let cutoff = hook_decisions_cutoff(100_000_000);
+        assert_eq!(cutoff, DateTime::<Utc>::MIN_UTC);
+    }
+
+    #[test]
+    fn test_hook_decisions_cutoff_does_not_panic_on_u64_max() {
+        let cutoff = hook_decisions_cutoff(u64::MAX);
+        assert_eq!(cutoff, DateTime::<Utc>::MIN_UTC);
+    }
+
+    #[test]
     fn test_is_already_rtk_plain_rewrite() {
         assert!(is_already_rtk("rtk grep -n foo bar.py"));
     }
@@ -575,7 +654,15 @@ mod tests {
         let mut log = HashMap::new();
         log.insert("toolu_1".to_string(), record(HookOutcome::Allow));
 
-        let coverage = hook_coverage("git status", "toolu_1", &log, false, &[], &[]);
+        let coverage = hook_coverage(
+            "git status",
+            "toolu_1",
+            &log,
+            false,
+            &empty_rules(),
+            &[],
+            &[],
+        );
         assert!(matches!(coverage, Coverage::Measured(true)));
         assert!(coverage.is_covered());
         assert!(!coverage.is_estimated());
@@ -586,7 +673,7 @@ mod tests {
         let mut log = HashMap::new();
         log.insert("toolu_1".to_string(), record(HookOutcome::Deny));
 
-        let coverage = hook_coverage("rm -rf /", "toolu_1", &log, true, &[], &[]);
+        let coverage = hook_coverage("rm -rf /", "toolu_1", &log, true, &empty_rules(), &[], &[]);
         assert!(matches!(coverage, Coverage::Measured(false)));
         assert!(!coverage.is_covered());
     }
@@ -597,7 +684,15 @@ mod tests {
         // falls back to the current-state heuristic, flagged as estimated.
         let log = HashMap::new();
 
-        let coverage = hook_coverage("ls -la", "toolu_missing", &log, true, &[], &[]);
+        let coverage = hook_coverage(
+            "ls -la",
+            "toolu_missing",
+            &log,
+            true,
+            &empty_rules(),
+            &[],
+            &[],
+        );
         assert!(coverage.is_estimated());
     }
 }
