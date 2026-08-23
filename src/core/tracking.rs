@@ -131,16 +131,24 @@ impl HookOutcome {
     pub fn is_covered(self) -> bool {
         matches!(self, HookOutcome::Allow | HookOutcome::Ask)
     }
-}
 
-impl std::fmt::Display for HookOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
+    /// The `'static` string this variant serializes to in the `hook_decisions`
+    /// table. Exists so `record_hook_decision` can bind it directly as a param
+    /// (rusqlite accepts `&str`) instead of heap-allocating via `.to_string()` on
+    /// every single hook invocation for what's always one of four literals.
+    fn as_str(self) -> &'static str {
+        match self {
             HookOutcome::Allow => "allow",
             HookOutcome::Ask => "ask",
             HookOutcome::Deny => "deny",
             HookOutcome::Defer => "defer",
-        })
+        }
+    }
+}
+
+impl std::fmt::Display for HookOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -621,13 +629,22 @@ impl Tracker {
                 tool_use_id,
                 project_path,
                 raw_cmd,
-                decision.to_string(),
+                decision.as_str(),
                 rewritten_cmd,
                 rtk_version,
             ],
         )
         .inspect_err(|e| warn_if_missing_table("record_hook_decision", e))?;
-        self.maybe_cleanup_hook_decisions(tool_use_id)?;
+
+        // The INSERT above already committed as its own autocommit statement —
+        // whatever happens to the retention sweep must not be reported as if it
+        // were *this* write failing (a caller like `log_hook_decision` prints
+        // "hook_decisions logging failed" on `Err`, which would be a lie here:
+        // the decision genuinely was recorded and is readable by `rtk discover`).
+        // Best-effort only, same as the rest of this best-effort side channel.
+        if let Err(e) = self.maybe_cleanup_hook_decisions(tool_use_id) {
+            eprintln!("rtk: warning: hook_decisions retention sweep failed: {e}");
+        }
         Ok(())
     }
 
@@ -671,14 +688,16 @@ impl Tracker {
              FROM hook_decisions
              WHERE timestamp >= ?1",
         )?;
-        let rows = stmt
-            .query_map(params![cutoff.to_rfc3339()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt.query_map(params![cutoff.to_rfc3339()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
 
-        let mut out = HashMap::with_capacity(rows.len());
-        for (tool_use_id, decision) in rows {
+        // Single pass: insert directly instead of collecting into an intermediate
+        // Vec first and looping over that separately — this scales with
+        // hook_decisions table size and runs once per `rtk discover` invocation.
+        let mut out = HashMap::new();
+        for row in rows {
+            let (tool_use_id, decision) = row?;
             // Skip rows with an unrecognized decision string (e.g. written by a
             // future rtk version with a decision this build doesn't know) rather
             // than failing the whole query — `discover` just falls back to its
@@ -690,10 +709,17 @@ impl Tracker {
         Ok(out)
     }
 
-    /// Earliest timestamp any hook decision was logged, if any exist.
+    /// Earliest timestamp among *currently-retained* hook decision rows, if any
+    /// exist. NOT the date logging first began: `hook_decisions` is pruned by the
+    /// same `DEFAULT_HISTORY_DAYS` window as the rest of the tracking DB (see
+    /// `cleanup_hook_decisions`), so this rolls forward over time — on a
+    /// long-running install it settles at roughly "now minus `DEFAULT_HISTORY_DAYS`",
+    /// not the true install date.
     ///
-    /// Used to tell `rtk discover` where the "measured" window starts — any scan
-    /// range before this point falls back to the estimate-based heuristic.
+    /// Used to tell `rtk discover` where the "measured" window currently starts —
+    /// any scan range before this point falls back to the estimate-based heuristic,
+    /// permanently (not just transitionally), since retention keeps pruning the
+    /// tail as new rows come in.
     pub fn earliest_hook_decision_timestamp(&self) -> Result<Option<DateTime<Utc>>> {
         let ts: Option<String> =
             self.conn
@@ -1469,11 +1495,19 @@ pub(crate) fn get_db_path() -> Result<PathBuf> {
         return Ok(PathBuf::from(custom_path));
     }
 
-    // Priority 2: Configuration file
-    if let Ok(config) = crate::core::config::Config::load() {
-        if let Some(db_path) = config.tracking.database_path {
-            return Ok(db_path);
-        }
+    // Priority 2: Configuration file. Reads the process-wide cached config (see
+    // `config::cached_config`), not a fresh `Config::load()`: this runs inside
+    // `Tracker::new()`, which `log_hook_decision` now calls on every single
+    // PreToolUse hook invocation — `hook_rewrite_params()` (called earlier in the
+    // same hook invocation, via `get_rewritten`) already reads config too, so
+    // without caching that's two full disk-read-plus-TOML-parse round trips per
+    // Bash tool call instead of one.
+    if let Some(db_path) = crate::core::config::cached_config()
+        .tracking
+        .database_path
+        .clone()
+    {
+        return Ok(db_path);
     }
 
     // Priority 3: Default platform-specific location

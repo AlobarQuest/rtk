@@ -97,42 +97,59 @@ struct CoverageContext {
 /// accumulated (rtk-ai/rtk#3206 review) — the counterfactual can only ever be
 /// answered by the estimate.
 ///
-/// Known imprecision: the caller splits a chained command (`a && b`) into parts
-/// and calls this once per part with the *same* `tool_use_id`, since Claude Code's
-/// PreToolUse hook fires once per tool call for the whole raw command. A `Deny`/
-/// `Ask` verdict genuinely is chain-wide (`permissions::check_command_with_rules`
-/// denies/asks the entire chain if any segment matches), but the real rewrite
-/// (`registry::rewrite_command`) is best-effort *per segment* — it can rewrite
-/// just `a` and leave an unsupported `b` untouched. Neither `Measured` (one
+/// The caller splits a chained command (`a && b`) into parts and calls this once
+/// per part with the *same* `tool_use_id`, since Claude Code's PreToolUse hook
+/// fires once per tool call for the whole raw command. `raw_cmd` MUST be the full,
+/// unsplit original command line (`ExtractedCommand::command`) even though this is
+/// being asked about one `part` of it — passing an isolated segment here would
+/// silently blind the `Deny`/`Ask` permission check to sibling segments (a
+/// chain-wide deny rule matching only `a` would go undetected when checking `b` in
+/// isolation, since `permissions::check_command_with_rules` only re-derives the
+/// chain from whatever string it's given). The real rewrite (`registry::
+/// rewrite_command`) genuinely is best-effort *per segment* though — it can
+/// rewrite just `a` and leave an unsupported `b` untouched — so `rewrite_cmd` is
+/// deliberately the isolated `part`, not `raw_cmd`. Neither `Measured` (one
 /// `hook_decisions` row per `tool_use_id`, no per-segment detail) nor `Estimated`
-/// re-derives that per-segment split, so a segment can be reported covered/missed
-/// based on a sibling segment's fate. Not worth chasing further: `Estimated` is a
-/// transitional fallback for history that predates `hook_decisions` logging and
-/// naturally fades out as that log backfills — after ~90 days only `Measured`
-/// should remain in practice.
-fn hook_coverage(cmd: &str, tool_use_id: &str, ctx: &CoverageContext) -> Coverage {
+/// re-derives the rewrite's per-segment split, so a segment can still be reported
+/// covered/missed based on a sibling segment's rewrite fate — that residual
+/// imprecision is unavoidable without per-segment hook logging and isn't worth
+/// chasing further. `Estimated` is the fallback for history that predates
+/// `hook_decisions` logging — but note it does NOT simply fade out over time:
+/// `hook_decisions` rows are pruned by the same `DEFAULT_HISTORY_DAYS` retention
+/// window as the rest of the tracking DB (see `Tracker::cleanup_hook_decisions`),
+/// so any `--since` reaching further back than that window permanently needs
+/// `Estimated`, indefinitely, not just during an initial backfill period.
+fn hook_coverage(
+    raw_cmd: &str,
+    rewrite_cmd: &str,
+    tool_use_id: &str,
+    ctx: &CoverageContext,
+) -> Coverage {
     if let Some(record) = ctx.hook_log.get(tool_use_id) {
         return Coverage::Measured(record.decision.is_covered());
     }
-    Coverage::Estimated(estimate_hook_coverage(cmd, cmd, ctx))
+    Coverage::Estimated(estimate_hook_coverage(raw_cmd, rewrite_cmd, ctx))
 }
 
 /// Best-effort guess at whether the *currently* installed hook would rewrite this
 /// command, used only when no `hook_decisions` log row exists for this exact
 /// invocation.
 ///
-/// Takes two forms of the command because the RTK_DISABLED= bypass call site
-/// (`run`) needs them to differ: `permission_cmd` is checked against permission
-/// rules and scanned for unattestable constructs, and MUST be the exact string
-/// the real hook would have seen — including any `RTK_DISABLED=` prefix — since
-/// that's what Claude Code's permission engine actually evaluates against
-/// (`hooks::hook_cmd::decide_hook_action` never strips it). `rewrite_cmd` is
-/// passed to `registry::rewrite_command`, which itself detects and refuses an
-/// `RTK_DISABLED=` prefix (registry.rs #345) — so for the bypass call site this
-/// must be the already-*stripped* command, or every bypassed command would
-/// register as never-covered regardless of whether it's otherwise supported,
-/// defeating the point of the RTK_DISABLED bucket entirely. For the ordinary
-/// (non-bypass) call site both are simply the same string.
+/// Takes two forms of the command because callers generally need them to differ:
+/// `permission_cmd` is checked against permission rules and scanned for
+/// unattestable constructs, and MUST be the exact full string the real hook would
+/// have seen — the whole raw command line, chain operators and any
+/// `RTK_DISABLED=` prefix intact — since that's what Claude Code's permission
+/// engine actually evaluates (`hooks::hook_cmd::decide_hook_action` never splits
+/// or strips it; see `hook_coverage`'s doc comment for why an isolated chain
+/// segment would blind the deny/ask check to sibling segments). `rewrite_cmd` is
+/// passed to `registry::rewrite_command`, which is genuinely best-effort
+/// *per segment* — pass the isolated segment being evaluated. For the RTK_DISABLED=
+/// bypass call site specifically, `rewrite_cmd` must also have the prefix already
+/// *stripped*, since `rewrite_command` itself detects and refuses a raw
+/// `RTK_DISABLED=` prefix (registry.rs #345) — passing it unstripped there would
+/// make every bypassed command register as never-covered regardless of whether
+/// it's otherwise supported, defeating the point of the RTK_DISABLED bucket.
 ///
 /// Checks `hook_installed` before touching `rules`/the lexer/the registry: with no
 /// hook installed the answer is always "not covered", so there's no reason to pay
@@ -191,10 +208,14 @@ fn estimate_hook_coverage_with_verdict(
 /// silently collapse to (near) zero once real `hook_decisions` rows accumulated
 /// (rtk-ai/rtk#3206 review) — only the estimate can ever answer this.
 ///
-/// `raw_cmd` (with the prefix intact) is what the real hook's permission check
-/// would have seen; `stripped_cmd` (prefix removed) is what `registry::
-/// rewrite_command` needs, since it refuses a raw `RTK_DISABLED=`-prefixed string
-/// on its own — see `estimate_hook_coverage`'s doc comment for the full reasoning.
+/// `raw_cmd` must be the *full, unsplit* original command line
+/// (`ExtractedCommand::command`), prefix and any sibling chain segments intact —
+/// what the real hook's permission check would have seen (see `hook_coverage`'s
+/// doc comment for why an isolated segment would blind the deny/ask check to
+/// siblings). `stripped_cmd` is the isolated, prefix-*removed* segment being
+/// evaluated, which is what `registry::rewrite_command` needs since it refuses a
+/// raw `RTK_DISABLED=`-prefixed string on its own — see `estimate_hook_coverage`'s
+/// doc comment for the full reasoning.
 fn would_be_covered_without_bypass(
     raw_cmd: &str,
     stripped_cmd: &str,
@@ -358,24 +379,45 @@ pub fn run(
 
                 // Detect RTK_DISABLED= bypass before classification
                 let (env_prefix, actual_cmd) = strip_disabled_prefix(part);
-                if prefix_contains_rtk_disabled(env_prefix) {
-                    // Only count if the underlying command is one RTK supports, AND the
-                    // hook would actually have covered it — otherwise RTK_DISABLED=
-                    // bypassed nothing (hook wasn't installed / excluded / would defer
-                    // / would deny), and flagging it as a "bypass" would be false advice.
-                    //
-                    // See `would_be_covered_without_bypass`'s doc comment for why this must
-                    // never go through `hook_coverage`'s measured-log path.
-                    if let Classification::Supported { .. } = classify_command(actual_cmd) {
-                        if would_be_covered_without_bypass(part, actual_cmd, &coverage_ctx) {
-                            rtk_disabled_count += 1;
-                            rtk_disabled_estimated += 1;
-                            let display = truncate_command(actual_cmd);
-                            *rtk_disabled_cmds.entry(display).or_insert(0) += 1;
+                let part = if prefix_contains_rtk_disabled(env_prefix) {
+                    match classify_command(actual_cmd) {
+                        Classification::Supported { .. } => {
+                            // Only count as a "bypass" if the hook would actually have
+                            // covered it absent the bypass — otherwise RTK_DISABLED=
+                            // bypassed nothing (hook wasn't installed / excluded / would
+                            // defer / would deny), and flagging it as a "bypass" would be
+                            // false advice. See `would_be_covered_without_bypass`'s doc
+                            // comment for why this must never go through `hook_coverage`'s
+                            // measured-log path.
+                            if would_be_covered_without_bypass(
+                                &ext_cmd.command,
+                                actual_cmd,
+                                &coverage_ctx,
+                            ) {
+                                rtk_disabled_count += 1;
+                                rtk_disabled_estimated += 1;
+                                let display = truncate_command(actual_cmd);
+                                *rtk_disabled_cmds.entry(display).or_insert(0) += 1;
+                                continue;
+                            }
+                            // Genuinely never had a chance regardless of the bypass (no
+                            // hook installed / excluded by config / etc.) — a real
+                            // missed-savings opportunity like any other command, not a
+                            // "bypass" of anything. Fall through to the normal
+                            // classification below (using the env-stripped command)
+                            // instead of vanishing from the whole report — previously
+                            // this case was counted only in `total_commands` and nowhere
+                            // else (rtk-ai/rtk#3206 review).
+                            actual_cmd
                         }
+                        // Unsupported/Ignored under RTK_DISABLED= isn't interesting
+                        // either way — rtk was never going to touch it regardless of
+                        // the bypass.
+                        _ => continue,
                     }
-                    continue;
-                }
+                } else {
+                    part
+                };
 
                 match classify_command(part) {
                     Classification::Supported {
@@ -384,7 +426,12 @@ pub fn run(
                         estimated_savings_pct,
                         status,
                     } => {
-                        let coverage = hook_coverage(part, &ext_cmd.tool_use_id, &coverage_ctx);
+                        let coverage = hook_coverage(
+                            &ext_cmd.command,
+                            part,
+                            &ext_cmd.tool_use_id,
+                            &coverage_ctx,
+                        );
 
                         if coverage.is_covered() {
                             // Hook already routed this through RTK at runtime — it's
@@ -704,6 +751,35 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_hook_coverage_sees_chain_wide_deny_from_full_raw_command() {
+        // Regression: check_command_with_rules re-derives the chain from whatever
+        // string it's handed, so a deny rule matching only a *sibling* segment
+        // (e.g. "cd /sensitive" in "cd /sensitive && grep -rn foo .") is invisible
+        // if the isolated segment being evaluated ("grep -rn foo .") is what gets
+        // passed as the permission-check command — exactly what the real hook
+        // would NOT do (it always evaluates the whole raw line). Must pass the
+        // full, unsplit command as `raw_cmd`, not the isolated `rewrite_cmd`.
+        let mut ctx = test_ctx(true);
+        ctx.rules.deny = vec!["cd /sensitive".to_string()];
+        let full_chain = "cd /sensitive && grep -rn foo .";
+        let isolated_segment = "grep -rn foo .";
+
+        assert!(
+            !estimate_hook_coverage(full_chain, isolated_segment, &ctx),
+            "a deny rule matching a sibling chain segment must still deny the whole chain"
+        );
+
+        // Sanity check demonstrating the bug this guards against: checking
+        // permissions against the isolated segment alone (instead of the full
+        // chain) misses the sibling's deny match entirely.
+        assert!(
+            estimate_hook_coverage(isolated_segment, isolated_segment, &ctx),
+            "checking the isolated segment alone should miss the sibling's deny rule \
+             (demonstrates why raw_cmd must be the full chain, not a segment)"
+        );
+    }
+
+    #[test]
     fn test_is_already_rtk_plain_rewrite() {
         assert!(is_already_rtk("rtk grep -n foo bar.py"));
     }
@@ -728,7 +804,7 @@ mod tests {
         ctx.hook_log
             .insert("toolu_1".to_string(), record(HookOutcome::Allow));
 
-        let coverage = hook_coverage("git status", "toolu_1", &ctx);
+        let coverage = hook_coverage("git status", "git status", "toolu_1", &ctx);
         assert!(matches!(coverage, Coverage::Measured(true)));
         assert!(coverage.is_covered());
         assert!(!coverage.is_estimated());
@@ -740,7 +816,7 @@ mod tests {
         ctx.hook_log
             .insert("toolu_1".to_string(), record(HookOutcome::Deny));
 
-        let coverage = hook_coverage("rm -rf /", "toolu_1", &ctx);
+        let coverage = hook_coverage("rm -rf /", "rm -rf /", "toolu_1", &ctx);
         assert!(matches!(coverage, Coverage::Measured(false)));
         assert!(!coverage.is_covered());
     }
@@ -749,7 +825,7 @@ mod tests {
     fn test_hook_coverage_falls_back_to_estimate_when_no_log_row() {
         // No log entry for this tool_use_id — predates logging (or non-Claude) —
         // falls back to the current-state heuristic, flagged as estimated.
-        let coverage = hook_coverage("ls -la", "toolu_missing", &test_ctx(true));
+        let coverage = hook_coverage("ls -la", "ls -la", "toolu_missing", &test_ctx(true));
         assert!(coverage.is_estimated());
     }
 }

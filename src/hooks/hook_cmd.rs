@@ -735,15 +735,29 @@ pub fn run_claude() -> Result<()> {
             decision,
             output,
         } => {
+            // Write the response Claude Code is synchronously blocked on FIRST.
+            // `log_hook_decision` is a best-effort side channel (see its own doc
+            // comment: "a tracking failure must never affect the hook's real
+            // output") that opens a SQLite connection with a 5s busy_timeout — on
+            // lock contention (concurrent hook invocations sharing the default
+            // history.db) that write can block for real seconds. Since this fires
+            // on every single Bash tool call now (not just RTK-covered ones), that
+            // latency must never sit in front of the response, or it directly
+            // stalls the tool call it's supposedly just logging.
+            let _ = writeln!(io::stdout(), "{output}");
             audit_log("rewrite", &cmd, &rewritten);
             log_hook_decision(&v, &cmd, decision, Some(&rewritten));
-            let _ = writeln!(io::stdout(), "{output}");
         }
         PayloadAction::Skip { decision, cmd } => {
             // `rtk hook audit`'s skip-breakdown groups by a "skip:<reason>" prefix
             // (see hook_audit_cmd.rs) — Skip is only ever reached via Deny/Defer,
             // so map those to the reasons it expects rather than the bare
             // HookOutcome::Display used for the Rewrite/tracking-DB paths.
+            //
+            // Skip has no stdout response to write (Claude Code falls through to
+            // its own native handling), but log_hook_decision is still deferred to
+            // last for the same reason as the Rewrite arm above: it must never be
+            // what a Bash tool call is waiting on.
             let audit_action = match decision {
                 HookOutcome::Deny => "skip:deny_rule",
                 HookOutcome::Defer => "skip:defer",
@@ -1525,8 +1539,26 @@ mod tests {
     #[test]
     fn test_hook_log_fields_none_without_tool_use_id() {
         // Older/foreign payload shapes without a tool_use_id must not be logged —
-        // there's no join key to match it back to a transcript entry.
+        // there's no join key to match it back to a transcript entry. Uses the
+        // real claude_input() fixture, which also lacks session_id — see the
+        // isolated variant below for a payload that has session_id present but
+        // tool_use_id specifically absent.
         let v: Value = serde_json::from_str(&claude_input("git status")).unwrap();
+        assert!(hook_log_fields(&v).is_none());
+    }
+
+    #[test]
+    fn test_hook_log_fields_none_with_session_id_but_no_tool_use_id() {
+        // hook_log_fields checks session_id first and short-circuits via `?`, so
+        // the fixture above (missing both fields) can't tell us whether
+        // tool_use_id extraction specifically works — it passes even if that
+        // check were completely broken. This isolates tool_use_id: session_id
+        // present, tool_use_id absent.
+        let v = json!({
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": { "command": "git status" }
+        });
         assert!(hook_log_fields(&v).is_none());
     }
 

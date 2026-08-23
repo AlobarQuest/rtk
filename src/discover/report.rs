@@ -102,9 +102,15 @@ pub struct DiscoverReport {
     /// rather than a measured `hook_decisions` log entry — i.e. history that
     /// predates hook-decision logging (or isn't Claude Code).
     pub already_rtk_estimated: usize,
-    /// Date (`YYYY-MM-DD`) the earliest `hook_decisions` log entry was recorded, if
-    /// any exist. `None` means no measured data at all — every coverage number in
-    /// this report is an estimate.
+    /// Date (`YYYY-MM-DD`) of the *oldest currently-retained* `hook_decisions` log
+    /// entry, if any exist. `None` means no measured data at all — every coverage
+    /// number in this report is an estimate.
+    ///
+    /// NOT an install date: `hook_decisions` rows are pruned by the same
+    /// `DEFAULT_HISTORY_DAYS` retention window as the rest of the tracking DB
+    /// (`Tracker::cleanup_hook_decisions`), so this date is a rolling boundary —
+    /// on a machine with months of real usage it still reads as "~90 days ago",
+    /// not the date logging actually began.
     pub measured_since: Option<String>,
     pub since_days: u64,
     pub supported: Vec<SupportedEntry>,
@@ -162,7 +168,7 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
     if report.already_rtk_estimated > 0 {
         match &report.measured_since {
             Some(date) => out.push_str(&format!(
-                "  includes ~{} estimated from current hook/config state (measured hook-decision logging began {date}; older history is estimated and may not reflect what was actually installed at the time)\n",
+                "  includes ~{} estimated from current hook/config state (measured data covers {date} onward; older history is estimated and may not reflect what was actually installed at the time)\n",
                 report.already_rtk_estimated
             )),
             None => out.push_str(&format!(
@@ -172,7 +178,16 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
         }
     }
 
-    if report.supported.is_empty() && report.unsupported.is_empty() {
+    // The RTK_DISABLED bypass section below is unconditional on `rtk_disabled_count`
+    // alone (it doesn't touch `supported`/`unsupported`), so this early return must
+    // also check it — otherwise a user whose *every* RTK-supported command ran as
+    // `RTK_DISABLED=1 <cmd>` never populates `supported`/`unsupported` at all, and
+    // this would print "RTK usage looks good!" while hiding that 100% of their
+    // commands ran unfiltered.
+    if report.supported.is_empty()
+        && report.unsupported.is_empty()
+        && report.rtk_disabled_count == 0
+    {
         out.push_str("\nNo missed savings found. RTK usage looks good!\n");
         append_agent_notes(&mut out, report.agent_status);
         return out;
@@ -344,7 +359,7 @@ mod tests {
 
         let output = format_text(&report, 10, false);
         assert!(output.contains("includes ~4 estimated from current hook/config state"));
-        assert!(output.contains("measured hook-decision logging began 2026-07-20"));
+        assert!(output.contains("measured data covers 2026-07-20 onward"));
     }
 
     #[test]
@@ -372,8 +387,6 @@ mod tests {
 
     #[test]
     fn test_format_text_shows_rtk_disabled_estimate_caveat() {
-        // The RTK_DISABLED block only renders past the "no missed savings" early
-        // return, so this needs at least one supported entry to reach it.
         let mut report = make_report(100, 10);
         report.supported = vec![dummy_supported_entry()];
         report.rtk_disabled_count = 3;
@@ -382,6 +395,26 @@ mod tests {
         let output = format_text(&report, 10, false);
         assert!(output.contains("RTK_DISABLED BYPASS -- 3 commands"));
         assert!(output.contains("includes ~2 estimated from current hook/config state"));
+    }
+
+    #[test]
+    fn test_format_text_rtk_disabled_section_survives_empty_supported_and_unsupported() {
+        // Regression: a user whose *every* RTK-supported command ran as
+        // `RTK_DISABLED=1 <cmd>` never populates supported/unsupported at all — the
+        // early "no missed savings" return must not fire just because those two are
+        // empty when rtk_disabled_count says otherwise, or the report would falsely
+        // claim "RTK usage looks good!" while hiding that every command ran
+        // unfiltered.
+        let mut report = make_report(100, 10);
+        report.rtk_disabled_count = 5;
+        report.rtk_disabled_estimated = 5;
+
+        let output = format_text(&report, 10, false);
+        assert!(
+            !output.contains("No missed savings found"),
+            "must not claim things look good when rtk_disabled_count > 0: {output}"
+        );
+        assert!(output.contains("RTK_DISABLED BYPASS -- 5 commands"));
     }
 
     #[test]
