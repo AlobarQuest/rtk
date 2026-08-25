@@ -188,7 +188,7 @@ fn passthrough_raw_find(args: &[String], verbose: u8) -> Result<()> {
     let mut cmd = crate::core::utils::resolved_command("find");
     cmd.args(args);
     let captured =
-        crate::core::stream::exec_capture(&mut cmd).context("Failed to execute find")?;
+        crate::core::stream::exec_capture_stdin(&mut cmd).context("Failed to execute find")?;
     print!("{}", captured.stdout);
     eprint!("{}", captured.stderr);
     timer.track_passthrough(&format!("find {}", args.join(" ")), "rtk find (passthrough)");
