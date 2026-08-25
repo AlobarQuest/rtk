@@ -191,12 +191,7 @@ fn passthrough_raw_find(args: &[String], verbose: u8) -> Result<()> {
         crate::core::stream::exec_capture(&mut cmd).context("Failed to execute find")?;
     print!("{}", captured.stdout);
     eprint!("{}", captured.stderr);
-    timer.track(
-        &format!("find {}", args.join(" ")),
-        "rtk find",
-        &captured.stdout,
-        &captured.stdout,
-    );
+    timer.track_passthrough(&format!("find {}", args.join(" ")), "rtk find (passthrough)");
     if captured.exit_code != 0 {
         std::process::exit(captured.exit_code);
     }
