@@ -216,6 +216,41 @@ pub fn run_from_args(args: &[String], verbose: u8) -> Result<()> {
     )
 }
 
+fn group_by_dir(files: &[String]) -> HashMap<String, Vec<String>> {
+    let mut by_dir: HashMap<String, Vec<String>> = HashMap::new();
+    for file in files {
+        let p = Path::new(file);
+        let dir = p
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        let dir = if dir.is_empty() { ".".to_string() } else { dir };
+        let filename = p
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        by_dir.entry(dir).or_default().push(filename);
+    }
+    by_dir
+}
+
+fn display_ordered(files: &[String]) -> Vec<String> {
+    let by_dir = group_by_dir(files);
+    let mut dirs: Vec<_> = by_dir.keys().cloned().collect();
+    dirs.sort();
+    let mut ordered = Vec::with_capacity(files.len());
+    for dir in &dirs {
+        for filename in &by_dir[dir] {
+            if dir == "." {
+                ordered.push(filename.clone());
+            } else {
+                ordered.push(format!("{}/{}", dir, filename));
+            }
+        }
+    }
+    ordered
+}
+
 fn build_capped_listing(files: &[String], max_results: usize) -> String {
     let mut listing = files
         .iter()
@@ -329,23 +364,9 @@ pub fn run(
         return Ok(());
     }
 
-    // Group by directory
-    let mut by_dir: HashMap<String, Vec<String>> = HashMap::new();
+    let ordered = display_ordered(&files);
 
-    for file in &files {
-        let p = Path::new(file);
-        let dir = p
-            .parent()
-            .map(|d| d.to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string());
-        let dir = if dir.is_empty() { ".".to_string() } else { dir };
-        let filename = p
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
-        by_dir.entry(dir).or_default().push(filename);
-    }
-
+    let by_dir = group_by_dir(&files);
     let mut dirs: Vec<_> = by_dir.keys().cloned().collect();
     dirs.sort();
     let dirs_count = dirs.len();
@@ -413,12 +434,12 @@ pub fn run(
         body.push_str(&format!("{}\n", ext_line));
     }
 
-    let capped_raw = build_capped_listing(&files, max_results);
+    let capped_raw = build_capped_listing(&ordered, max_results);
     let shown = never_worse(&capped_raw, &body);
     let mut output = shown.to_string();
     if displayed < total_files && !max_explicit {
         if let Some(hint) =
-            crate::core::tee::force_tee_tail_hint(&raw_output, "find", displayed + 1)
+            crate::core::tee::force_tee_tail_hint(&ordered.join("\n"), "find", displayed + 1)
         {
             output.push_str(&format!("{}\n", hint));
         }
@@ -693,6 +714,36 @@ mod tests {
         assert!(!parsed.max_explicit);
         let parsed = parse_find_args(&args(&["*.rs", "src"])).unwrap();
         assert!(!parsed.max_explicit);
+    }
+
+    #[test]
+    fn tee_remainder_matches_hidden_files_when_dir_sort_diverges() {
+        // "logs-old/f01" < "logs/f01" in flat path sort ('-' < '/'), but the
+        // display sorts by dir name where "logs" < "logs-old". The tee must
+        // follow display order or tail returns already-shown files.
+        let mut files: Vec<String> = Vec::new();
+        for i in 1..=30 {
+            files.push(format!("logs/f{:02}.txt", i));
+            files.push(format!("logs-old/f{:02}.txt", i));
+        }
+        files.sort();
+        assert!(files[0].starts_with("logs-old/"));
+
+        let ordered = display_ordered(&files);
+        assert!(ordered[0].starts_with("logs/"));
+        assert_eq!(ordered.len(), 60);
+
+        let hidden = &ordered[50..];
+        assert_eq!(hidden.first().unwrap(), "logs-old/f21.txt");
+        assert_eq!(hidden.last().unwrap(), "logs-old/f30.txt");
+        assert!(hidden.iter().all(|f| f.starts_with("logs-old/")));
+    }
+
+    #[test]
+    fn display_ordered_keeps_root_files_in_root_group() {
+        let files: Vec<String> = args(&["zebra.txt", "logs/a.txt", "alpha.txt"]);
+        let ordered = display_ordered(&files);
+        assert_eq!(ordered, args(&["zebra.txt", "alpha.txt", "logs/a.txt"]));
     }
 
     #[test]
