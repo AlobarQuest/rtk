@@ -654,7 +654,8 @@ mod tests {
 
     #[test]
     fn bare_directory_positional_is_a_path() {
-        for a in [&["src"][..], &["src/"], &["./src"], &["/tmp"], &["."]] {
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        for a in [&["src"][..], &["src/"], &["./src"], &[tmp.as_str()], &["."]] {
             let p = parse_find_args(&args(a)).unwrap();
             assert_eq!(p.path, a[0], "{a:?}");
             assert_eq!(p.pattern, "*", "{a:?}");
