@@ -726,12 +726,11 @@ mod tests {
 
     #[test]
     fn long_unicode_dir_label_does_not_panic() {
-        let root = std::env::temp_dir().join(format!("rtk-find-unicode-{}", std::process::id()));
-        let dir = root.join("é".repeat(30));
+        let root = tempfile::TempDir::new().unwrap();
+        let dir = root.path().join("é".repeat(30));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("f.txt"), "").unwrap();
-        let result = run("*.txt", root.to_str().unwrap(), 50, true, None, "f", false, 0);
-        let _ = std::fs::remove_dir_all(&root);
+        let result = run("*.txt", root.path().to_str().unwrap(), 50, true, None, "f", false, 0);
         assert!(result.is_ok());
     }
 
