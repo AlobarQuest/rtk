@@ -5,6 +5,7 @@ use crate::core::tracking;
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 
 /// Match a filename against a glob pattern (supports `*` and `?`).
@@ -186,14 +187,18 @@ fn passthrough_raw_find(args: &[String], verbose: u8) -> Result<()> {
         eprintln!("find: passthrough (flags rtk cannot filter)");
     }
     let mut cmd = crate::core::utils::resolved_command("find");
-    cmd.args(args);
-    let captured =
-        crate::core::stream::exec_capture_stdin(&mut cmd).context("Failed to execute find")?;
-    print!("{}", captured.stdout);
-    eprint!("{}", captured.stderr);
+    cmd.args(args).stdin(std::process::Stdio::inherit());
+    let output = cmd.output().context("Failed to execute find")?;
+    let exit_code = crate::core::utils::exit_code_from_output(&output, "find");
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&output.stdout)?;
+    stdout.flush()?;
+    let mut stderr = std::io::stderr().lock();
+    stderr.write_all(&output.stderr)?;
+    stderr.flush()?;
     timer.track_passthrough(&format!("find {}", args.join(" ")), "rtk find (passthrough)");
-    if captured.exit_code != 0 {
-        std::process::exit(captured.exit_code);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
     Ok(())
 }
