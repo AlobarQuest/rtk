@@ -18,10 +18,22 @@ static LS_DATE_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+fn is_short_flag(arg: &str) -> bool {
+    arg.starts_with('-') && !arg.starts_with("--")
+}
+
+/// `-a`/`--all` and `-A`/`--almost-all` both make ls print dotfiles;
+/// in either case RTK must show everything the child listed.
+fn shows_dotfiles(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        (is_short_flag(a) && a.chars().any(|c| matches!(c, 'a' | 'A')))
+            || a == "--all"
+            || a == "--almost-all"
+    })
+}
+
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
-    let show_all = args
-        .iter()
-        .any(|a| (a.starts_with('-') && !a.starts_with("--") && a.contains('a')) || a == "--all");
+    let show_all = shows_dotfiles(args);
 
     // Per `man ls`, the long listing is triggered by `-l` and also implied by
     // `-g`, `-n`, `-o`, `--full-time` or GNU `--format=long` and `--format=verbose`.
@@ -49,7 +61,10 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 
     let mut cmd = resolved_command("ls");
     cmd.env("LC_ALL", "C");
-    cmd.arg(if show_all { "-la" } else { "-l" });
+    let wants_all = args
+        .iter()
+        .any(|a| (is_short_flag(a) && a.contains('a')) || a == "--all");
+    cmd.arg(if wants_all { "-la" } else { "-l" });
     for flag in &flags {
         if flag.starts_with("--") {
             if *flag != "--all" {
@@ -75,18 +90,18 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         }
     }
 
-    let target_display = if paths.is_empty() {
+    let label = if args.is_empty() {
         ".".to_string()
     } else {
-        paths.join(" ")
+        args.join(" ")
     };
 
     runner::run_filtered(
         cmd,
         "ls",
-        &format!("-la {}", target_display),
+        &label,
         |raw| {
-            let (entries, parsed_count, truncated, noise) = compact_ls(raw, show_all, show_long);
+            let (entries, parsed_count, truncated, filtered) = compact_ls(raw, show_all, show_long);
 
             // If no lines were parsed (e.g., unrecognized locale), fall back to raw output.
             // This is safer than returning "(empty)" for a non-empty directory.
@@ -97,26 +112,26 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
                 return raw.to_string();
             }
 
-            let mut filtered = entries;
+            let mut out = entries;
 
-            if let Some(hint) = hidden_hint(&truncated, &noise) {
-                filtered.push_str(&hint);
-                filtered.push('\n');
+            if let Some(hint) = hidden_hint(&truncated, &filtered) {
+                out.push_str(&hint);
+                out.push('\n');
             }
 
             if verbose > 0 {
                 eprintln!(
                     "Chars: {} → {} ({}% reduction)",
                     raw.len(),
-                    filtered.len(),
+                    out.len(),
                     if !raw.is_empty() {
-                        100 - (filtered.len() * 100 / raw.len())
+                        100 - (out.len() * 100 / raw.len())
                     } else {
                         0
                     }
                 );
             }
-            filtered
+            out
         },
         RunOptions::stdout_only()
             .early_exit_on_failure()
@@ -265,8 +280,8 @@ fn perms_to_octal(perms: &str) -> Option<String> {
 /// parsed_count tracks how many non-header lines were successfully parsed.
 /// truncated holds compact lines beyond the CAP_INVENTORY display cap.
 /// filtered holds the display name of each entry RTK removed from view
-/// (non-dot noise dirs without -a as `name/`, plus raw unparsable
-/// non-dotdir lines).
+/// (noise dirs without -a/-A as `name/`, plus raw unparsable non-dotdir
+/// lines).
 /// If parsed_count == 0 but raw had content, caller should fall back to raw output.
 fn compact_ls(
     raw: &str,
@@ -278,7 +293,7 @@ fn compact_ls(
     let mut lines_seen: usize = 0;
     let mut parsed_count: usize = 0;
     let mut dotdirs: usize = 0;
-    let mut hidden: Vec<String> = Vec::new();
+    let mut filtered: Vec<String> = Vec::new();
 
     for line in raw.lines() {
         if line.starts_with("total ") || line.is_empty() {
@@ -290,19 +305,16 @@ fn compact_ls(
             if is_dotdir(line) {
                 dotdirs += 1;
             } else {
-                hidden.push(line.trim().to_string());
+                filtered.push(line.trim().to_string());
             }
             continue;
         };
         parsed_count += 1;
 
-        // Filter noise dirs unless -a
+        // Filter noise dirs unless dotfiles were requested; every entry the
+        // child printed and RTK drops is recorded so the hint can recover it.
         if !show_all && NOISE_DIRS.iter().any(|noise| name == *noise) {
-            // Dot-prefixed entries are hidden by standard ls without -a
-            // anyway — only record what RTK itself removes from view.
-            if !name.starts_with('.') {
-                hidden.push(format!("{}/", name));
-            }
+            filtered.push(format!("{}/", name));
             continue;
         }
 
@@ -332,8 +344,8 @@ fn compact_ls(
             return (String::new(), 0, Vec::new(), Vec::new());
         }
         // Everything parsed was filtered out (e.g., only noise dirs) —
-        // keep hidden so the caller can still emit a recovery hint.
-        return ("(empty)\n".to_string(), parsed_count, Vec::new(), hidden);
+        // keep filtered so the caller can still emit a recovery hint.
+        return ("(empty)\n".to_string(), parsed_count, Vec::new(), filtered);
     }
 
     // Dirs first, then files — one compact line each
@@ -364,7 +376,7 @@ fn compact_ls(
         entries.push('\n');
     }
 
-    (entries, parsed_count, truncated, hidden)
+    (entries, parsed_count, truncated, filtered)
 }
 
 #[cfg(test)]
@@ -419,8 +431,8 @@ mod tests {
         let (_entries, _parsed, _truncated, hidden) = compact_ls(input, false, false);
         assert_eq!(
             hidden,
-            vec!["node_modules/", "target/"],
-            "non-dot noise dirs are RTK-filtered; .git is standard ls hidden"
+            vec!["node_modules/", ".git/", "target/"],
+            "every noise dir the child printed is recorded"
         );
 
         let (_entries, _parsed, _truncated, hidden_all) = compact_ls(input, true, false);
@@ -452,14 +464,38 @@ mod tests {
     fn test_compact_only_noise_dirs_keeps_hidden() {
         // Directory containing only noise dirs: output collapses to (empty),
         // but RTK-filtered entries must survive so the agent knows they exist.
-        // .git is standard ls hidden (dot-prefixed), not RTK's filtering.
         let input = "total 8\n\
                      drwxr-xr-x  2 user  staff  64 Jan  1 12:00 node_modules\n\
                      drwxr-xr-x  2 user  staff  64 Jan  1 12:00 .git\n";
         let (entries, parsed, _truncated, hidden) = compact_ls(input, false, false);
         assert_eq!(entries, "(empty)\n");
         assert_eq!(parsed, 2);
-        assert_eq!(hidden, vec!["node_modules/"]);
+        assert_eq!(hidden, vec!["node_modules/", ".git/"]);
+    }
+
+    #[test]
+    fn test_shows_dotfiles_flags() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(shows_dotfiles(&s(&["-a"])));
+        assert!(shows_dotfiles(&s(&["-A"])));
+        assert!(shows_dotfiles(&s(&["-lA", "."])));
+        assert!(shows_dotfiles(&s(&["--all"])));
+        assert!(shows_dotfiles(&s(&["--almost-all"])));
+        assert!(!shows_dotfiles(&s(&["-l", "."])));
+        assert!(!shows_dotfiles(&s(&["--author"])));
+    }
+
+    #[test]
+    fn test_compact_records_dot_noise_dir_when_child_printed_it() {
+        // Child ran with -A but RTK was told not to show all: the dot noise
+        // dir must be recorded, never silently vanish.
+        let input = "total 8\n\
+                     drwxr-xr-x  2 user  staff  64 Jan  1 12:00 .git\n\
+                     drwxr-xr-x  2 user  staff  64 Jan  1 12:00 node_modules\n\
+                     -rw-r--r--  1 user  staff  100 Jan  1 12:00 README.md\n";
+        let (entries, _parsed, _truncated, filtered) = compact_ls(input, false, false);
+        assert!(!entries.contains(".git"));
+        assert_eq!(filtered, vec![".git/", "node_modules/"]);
     }
 
     #[test]
