@@ -60,45 +60,129 @@ fn next_arg(args: &[String], i: &mut usize) -> Option<String> {
     args.get(*i).cloned()
 }
 
-/// Check if args contain native find flags (-name, -type, -maxdepth, etc.)
-fn has_native_find_flags(args: &[String]) -> bool {
-    args.iter()
-        .any(|a| a == "-name" || a == "-type" || a == "-maxdepth" || a == "-iname")
-}
+const RTK_FLAGS: &[&str] = &["-m", "--max", "-t", "--file-type"];
 
-/// Native find flags that RTK cannot handle correctly.
-/// These involve compound predicates, actions, or semantics we don't support.
-const UNSUPPORTED_FIND_FLAGS: &[&str] = &[
-    "-not", "!", "-or", "-o", "-and", "-a", "-exec", "-execdir", "-delete", "-print0", "-newer",
-    "-perm", "-size", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-empty", "-link",
-    "-regex", "-iregex",
+const VERBATIM_ACTIONS: &[&str] = &[
+    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-print", "-print0", "-printf", "-fprint",
+    "-fprint0", "-fprintf", "-ls", "-fls",
 ];
 
-fn has_unsupported_find_flags(args: &[String]) -> bool {
-    args.iter()
-        .any(|a| UNSUPPORTED_FIND_FLAGS.contains(&a.as_str()))
+enum Dispatch {
+    Native(FindArgs),
+    Compress {
+        paths: Vec<String>,
+        expr: Vec<String>,
+        max_results: usize,
+        max_explicit: bool,
+    },
+    Verbatim,
 }
 
-/// Parse arguments from raw args vec, supporting both native find and RTK syntax.
-///
-/// Native find syntax: `find . -name "*.rs" -type f -maxdepth 3`
-/// RTK syntax: `find *.rs [path] [-m max] [-t type]`
-fn parse_find_args(args: &[String]) -> Result<FindArgs> {
+fn is_expression_token(token: &str) -> bool {
+    token.starts_with('-') || token == "!" || token == "(" || token == ")"
+}
+
+fn has_glob_meta(token: &str) -> bool {
+    token.contains('*') || token.contains('?')
+}
+
+fn subset_only(expr: &[String]) -> bool {
+    let mut i = 0;
+    while i < expr.len() {
+        match expr[i].as_str() {
+            "-name" | "-iname" => match expr.get(i + 1) {
+                Some(v) if !v.contains('[') => i += 2,
+                _ => return false,
+            },
+            "-type" => match expr.get(i + 1).map(String::as_str) {
+                Some("f") | Some("d") => i += 2,
+                _ => return false,
+            },
+            "-maxdepth" => match expr.get(i + 1) {
+                Some(v) if v.parse::<usize>().is_ok() => i += 2,
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Native find syntax: `find [paths...] [expression]` (paths end at the first
+/// token starting with `-`, `!` or a parenthesis, exactly like find).
+/// RTK syntax (first token contains `*` or `?`): `find <pattern> [path] [-m max] [-t type]`
+fn dispatch(args: &[String]) -> Result<Dispatch> {
     if args.is_empty() {
-        return Ok(FindArgs::default());
+        return Ok(Dispatch::Native(FindArgs::default()));
+    }
+    if !is_expression_token(&args[0]) && has_glob_meta(&args[0]) {
+        return parse_rtk_find_args(args).map(Dispatch::Native);
     }
 
-    if has_unsupported_find_flags(args) {
-        anyhow::bail!(
-            "rtk find does not support compound predicates or actions (e.g. -not, -exec). Use `find` directly."
-        );
+    let split = args
+        .iter()
+        .position(|t| is_expression_token(t))
+        .unwrap_or(args.len());
+    let paths = args[..split].to_vec();
+    let expr = &args[split..];
+
+    if expr.iter().any(|t| VERBATIM_ACTIONS.contains(&t.as_str())) {
+        if expr.iter().any(|t| RTK_FLAGS.contains(&t.as_str())) {
+            anyhow::bail!(
+                "rtk find: -m/-t cannot be combined with find actions (-exec, -delete, -print0, ...)"
+            );
+        }
+        return Ok(Dispatch::Verbatim);
     }
 
-    if has_native_find_flags(args) {
-        parse_native_find_args(args)
-    } else {
-        parse_rtk_find_args(args)
+    let mut find_expr: Vec<String> = Vec::new();
+    let mut max_results = FindArgs::default().max_results;
+    let mut max_explicit = false;
+    let mut rtk_type: Option<String> = None;
+    let mut i = 0;
+    while i < expr.len() {
+        match expr[i].as_str() {
+            "-m" | "--max" => {
+                let v = expr.get(i + 1).context("missing value for --max")?;
+                max_results = v.parse().context("invalid --max value")?;
+                max_explicit = true;
+                i += 2;
+            }
+            "-t" | "--file-type" => {
+                let v = expr.get(i + 1).context("missing value for --file-type")?;
+                rtk_type = Some(v.clone());
+                i += 2;
+            }
+            _ => {
+                find_expr.push(expr[i].clone());
+                i += 1;
+            }
+        }
     }
+    if let Some(t) = rtk_type {
+        find_expr.push("-type".to_string());
+        find_expr.push(t);
+    }
+
+    if paths.len() <= 1 && subset_only(&find_expr) {
+        let mut native_args = paths.clone();
+        native_args.extend(find_expr.iter().cloned());
+        let mut parsed = if native_args.is_empty() {
+            FindArgs::default()
+        } else {
+            parse_native_find_args(&native_args)?
+        };
+        parsed.max_results = max_results;
+        parsed.max_explicit = max_explicit;
+        return Ok(Dispatch::Native(parsed));
+    }
+
+    Ok(Dispatch::Compress {
+        paths,
+        expr: find_expr,
+        max_results,
+        max_explicit,
+    })
 }
 
 /// Parse native find syntax: `find [path] -name "*.rs" -type f -maxdepth 3`
@@ -173,7 +257,12 @@ fn parse_rtk_find_args(args: &[String]) -> Result<FindArgs> {
                     parsed.file_type = val;
                 }
             }
-            _ => {}
+            other => anyhow::bail!(
+                "rtk find: '{}' is not supported after a pattern; use find syntax: find <path> -name '{}' {} ...",
+                other,
+                parsed.pattern,
+                other
+            ),
         }
         i += 1;
     }
@@ -181,10 +270,10 @@ fn parse_rtk_find_args(args: &[String]) -> Result<FindArgs> {
     Ok(parsed)
 }
 
-fn passthrough_raw_find(args: &[String], verbose: u8) -> Result<()> {
+fn run_verbatim(args: &[String], verbose: u8) -> Result<()> {
     let timer = tracking::TimedExecution::start();
     if verbose > 0 {
-        eprintln!("find: passthrough (flags rtk cannot filter)");
+        eprintln!("find: verbatim (find actions produce non-listing output)");
     }
     let mut cmd = crate::core::utils::resolved_command("find");
     cmd.args(args).stdin(std::process::Stdio::inherit());
@@ -203,22 +292,82 @@ fn passthrough_raw_find(args: &[String], verbose: u8) -> Result<()> {
     Ok(())
 }
 
-/// Entry point from main.rs — parses raw args then delegates to run().
-pub fn run_from_args(args: &[String], verbose: u8) -> Result<()> {
-    if has_unsupported_find_flags(args) {
-        return passthrough_raw_find(args, verbose);
+fn run_compress(
+    paths: &[String],
+    expr: &[String],
+    max_results: usize,
+    max_explicit: bool,
+    verbose: u8,
+) -> Result<()> {
+    let timer = tracking::TimedExecution::start();
+    if verbose > 0 {
+        eprintln!("find: results from find, compressed by rtk");
     }
-    let parsed = parse_find_args(args)?;
-    run(
-        &parsed.pattern,
-        &parsed.path,
-        parsed.max_results,
-        parsed.max_explicit,
-        parsed.max_depth,
-        &parsed.file_type,
-        parsed.case_insensitive,
-        verbose,
-    )
+    let mut cmd = crate::core::utils::resolved_command("find");
+    cmd.args(paths);
+    if !expr.is_empty() {
+        cmd.arg("(");
+        cmd.args(expr);
+        cmd.arg(")");
+    }
+    cmd.arg("-print0").stdin(std::process::Stdio::inherit());
+    let output = cmd.output().context("Failed to execute find")?;
+    let exit_code = crate::core::utils::exit_code_from_output(&output, "find");
+    {
+        let mut stderr = std::io::stderr().lock();
+        stderr.write_all(&output.stderr)?;
+        stderr.flush()?;
+    }
+    let entries: Vec<&[u8]> = output
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let track_cmd = format!("find {} {}", paths.join(" "), expr.join(" "));
+    if entries.iter().any(|e| std::str::from_utf8(e).is_err()) {
+        let raw: Vec<u8> = entries.iter().flat_map(|e| [*e, b"\n"].concat()).collect();
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&raw)?;
+        stdout.flush()?;
+        timer.track_passthrough(&track_cmd, "rtk find (passthrough)");
+    } else {
+        let files: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                let s = String::from_utf8_lossy(e);
+                s.strip_prefix("./").unwrap_or(&s).to_string()
+            })
+            .collect();
+        let raw_output = files.join("\n");
+        render(files, max_results, max_explicit, &track_cmd, &raw_output, &timer);
+    }
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+/// Entry point from main.rs — dispatches on find's grammar then delegates.
+pub fn run_from_args(args: &[String], verbose: u8) -> Result<()> {
+    match dispatch(args)? {
+        Dispatch::Native(parsed) => run(
+            &parsed.pattern,
+            &parsed.path,
+            parsed.max_results,
+            parsed.max_explicit,
+            parsed.max_depth,
+            &parsed.file_type,
+            parsed.case_insensitive,
+            verbose,
+        ),
+        Dispatch::Compress {
+            paths,
+            expr,
+            max_results,
+            max_explicit,
+        } => run_compress(&paths, &expr, max_results, max_explicit, verbose),
+        Dispatch::Verbatim => run_verbatim(args, verbose),
+    }
 }
 
 fn group_by_dir(files: &[String]) -> HashMap<String, Vec<String>> {
@@ -292,6 +441,11 @@ pub fn run(
 
     let want_dirs = file_type == "d";
 
+    if !Path::new(path).exists() {
+        eprintln!("find: '{}': No such file or directory", path);
+        std::process::exit(1);
+    }
+
     // When the pattern targets dotfiles (e.g. -name ".claude.json"), we must walk hidden
     // entries; otherwise skip them to keep results tidy (#1101).
     let search_hidden = effective_pattern.starts_with('.');
@@ -352,21 +506,41 @@ pub fn run(
 
         if !display_path.is_empty() {
             files.push(display_path);
+        } else if !is_dir {
+            files.push(path.to_string());
         }
     }
 
+    let raw_output = {
+        let mut sorted = files.clone();
+        sorted.sort();
+        sorted.join("\n")
+    };
+    render(
+        files,
+        max_results,
+        max_explicit,
+        &format!("find {} -name '{}'", path, effective_pattern),
+        &raw_output,
+        &timer,
+    );
+
+    Ok(())
+}
+
+fn render(
+    mut files: Vec<String>,
+    max_results: usize,
+    max_explicit: bool,
+    track_cmd: &str,
+    raw_output: &str,
+    timer: &tracking::TimedExecution,
+) {
     files.sort();
 
-    let raw_output = files.join("\n");
-
     if files.is_empty() {
-        timer.track(
-            &format!("find {} -name '{}'", path, effective_pattern),
-            "rtk find",
-            &raw_output,
-            "",
-        );
-        return Ok(());
+        timer.track(track_cmd, "rtk find", raw_output, "");
+        return;
     }
 
     let ordered = display_ordered(&files);
@@ -389,8 +563,9 @@ pub fn run(
         }
 
         let files_in_dir = &by_dir[dir];
-        let dir_display = if dir.len() > 50 {
-            format!("...{}", &dir[dir.len() - 47..])
+        let dir_display = if dir.chars().count() > 50 {
+            let tail: String = dir.chars().rev().take(47).collect::<Vec<_>>().into_iter().rev().collect();
+            format!("...{}", tail)
         } else {
             dir.clone()
         };
@@ -450,14 +625,7 @@ pub fn run(
         }
     }
     print!("{}", output);
-    timer.track(
-        &format!("find {} -name '{}'", path, effective_pattern),
-        "rtk find",
-        &raw_output,
-        &output,
-    );
-
-    Ok(())
+    timer.track(track_cmd, "rtk find", raw_output, &output);
 }
 
 #[cfg(test)]
@@ -467,6 +635,119 @@ mod tests {
     /// Convert string slices to Vec<String> for test convenience.
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn parse_find_args(a: &[String]) -> Result<FindArgs> {
+        match dispatch(a)? {
+            Dispatch::Native(p) => Ok(p),
+            Dispatch::Compress { .. } => anyhow::bail!("dispatched to compress"),
+            Dispatch::Verbatim => anyhow::bail!("dispatched to verbatim"),
+        }
+    }
+
+    fn class(a: &[&str]) -> &'static str {
+        match dispatch(&args(a)) {
+            Ok(Dispatch::Native(_)) => "native",
+            Ok(Dispatch::Compress { .. }) => "compress",
+            Ok(Dispatch::Verbatim) => "verbatim",
+            Err(_) => "error",
+        }
+    }
+
+    #[test]
+    fn bare_directory_positional_is_a_path() {
+        for a in [&["src"][..], &["src/"], &["./src"], &["/tmp"], &["."]] {
+            let p = parse_find_args(&args(a)).unwrap();
+            assert_eq!(p.path, a[0], "{a:?}");
+            assert_eq!(p.pattern, "*", "{a:?}");
+        }
+    }
+
+    #[test]
+    fn leading_glob_token_is_rtk_pattern_syntax() {
+        let p = parse_find_args(&args(&["*.rs", "src", "-m", "5"])).unwrap();
+        assert_eq!(p.pattern, "*.rs");
+        assert_eq!(p.path, "src");
+        assert_eq!(p.max_results, 5);
+        assert!(p.max_explicit);
+    }
+
+    #[test]
+    fn rtk_pattern_syntax_rejects_find_predicates() {
+        assert_eq!(class(&["*.rs", "src", "-m", "5", "-mtime", "+7"]), "error");
+        assert_eq!(class(&["*.rs", "-exec", "rm", "{}", ";"]), "error");
+    }
+
+    #[test]
+    fn subset_expressions_stay_native() {
+        assert_eq!(class(&[".", "-name", "*.rs", "-type", "f", "-maxdepth", "2"]), "native");
+        assert_eq!(class(&["-name", "*.rs"]), "native");
+        assert_eq!(class(&["src", "-iname", "README*"]), "native");
+        assert_eq!(class(&[".", "-type", "d"]), "native");
+        assert_eq!(class(&[".", "-name", "*.rs", "-m", "10"]), "native");
+    }
+
+    #[test]
+    fn unmodeled_listing_predicates_compress_via_find() {
+        assert_eq!(class(&["-mindepth", "2"]), "compress");
+        assert_eq!(class(&[".", "-path", "*/target/*", "-name", "*.rs"]), "compress");
+        assert_eq!(class(&[".", "-type", "l"]), "compress");
+        assert_eq!(class(&[".", "-name", "[ab]*.txt"]), "compress");
+        assert_eq!(class(&[".", "-name", "a", "-o", "-name", "b"]), "compress");
+        assert_eq!(class(&[".", "-not", "-name", "*.rs"]), "compress");
+        assert_eq!(class(&[".", "-mtime", "-7"]), "compress");
+        assert_eq!(class(&[".", "src"]), "compress");
+        assert_eq!(class(&[".", "-name"]), "compress");
+        assert_eq!(class(&[".", "-maxdepth", "abc"]), "compress");
+        assert_eq!(class(&[".", "-prune"]), "compress");
+    }
+
+    #[test]
+    fn actions_and_output_formats_run_verbatim() {
+        for a in [
+            &[".", "-name", "*.rs", "-exec", "cat", "{}", ";"][..],
+            &[".", "-delete"],
+            &[".", "-print0"],
+            &[".", "-printf", "%p\n"],
+            &[".", "-ls"],
+            &[".", "-ok", "rm", "{}", ";"],
+        ] {
+            assert_eq!(class(a), "verbatim", "{a:?}");
+        }
+    }
+
+    #[test]
+    fn rtk_flags_with_actions_is_an_error() {
+        assert_eq!(class(&[".", "-name", "*.rs", "-m", "5", "-exec", "cat", "{}", ";"]), "error");
+    }
+
+    #[test]
+    fn rtk_flags_are_stripped_before_find_in_compress_mode() {
+        match dispatch(&args(&[".", "-mtime", "-7", "-m", "5", "-t", "d"])).unwrap() {
+            Dispatch::Compress {
+                paths,
+                expr,
+                max_results,
+                max_explicit,
+            } => {
+                assert_eq!(paths, args(&["."]));
+                assert_eq!(expr, args(&["-mtime", "-7", "-type", "d"]));
+                assert_eq!(max_results, 5);
+                assert!(max_explicit);
+            }
+            _ => panic!("expected compress"),
+        }
+    }
+
+    #[test]
+    fn long_unicode_dir_label_does_not_panic() {
+        let root = std::env::temp_dir().join(format!("rtk-find-unicode-{}", std::process::id()));
+        let dir = root.join("é".repeat(30));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "").unwrap();
+        let result = run("*.txt", root.to_str().unwrap(), 50, true, None, "f", false, 0);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(result.is_ok());
     }
 
     // --- glob_match unit tests ---
@@ -572,17 +853,13 @@ mod tests {
     // --- parse_find_args: unsupported flags ---
 
     #[test]
-    fn parse_native_find_rejects_not() {
-        let result = parse_find_args(&args(&[".", "-name", "*.rs", "-not", "-name", "*_test.rs"]));
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("compound predicates"));
+    fn parse_native_find_not_is_not_native() {
+        assert_eq!(class(&[".", "-name", "*.rs", "-not", "-name", "*_test.rs"]), "compress");
     }
 
     #[test]
-    fn parse_native_find_rejects_exec() {
-        let result = parse_find_args(&args(&[".", "-name", "*.tmp", "-exec", "rm", "{}", ";"]));
-        assert!(result.is_err());
+    fn parse_native_find_exec_is_not_native() {
+        assert_eq!(class(&[".", "-name", "*.tmp", "-exec", "rm", "{}", ";"]), "verbatim");
     }
 
     // --- parse_find_args: RTK syntax ---
@@ -683,20 +960,6 @@ mod tests {
         // With max=2, should not error
         let result = run("*.rs", "src", 2, true, None, "f", false, 0);
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn unsupported_flags_route_to_passthrough() {
-        for flag in ["-not", "!", "-o", "-exec", "-delete", "-mtime", "-regex"] {
-            assert!(has_unsupported_find_flags(&args(&[".", flag])), "{flag}");
-        }
-        assert!(has_unsupported_find_flags(&args(&[
-            ".", "-name", "*.rs", "-not", "-name", "*_test.rs"
-        ])));
-        assert!(!has_unsupported_find_flags(&args(&[
-            ".", "-name", "*.rs", "-type", "f", "-maxdepth", "2"
-        ])));
-        assert!(!has_unsupported_find_flags(&args(&["*.rs", "src", "-m", "10"])));
     }
 
     #[test]
