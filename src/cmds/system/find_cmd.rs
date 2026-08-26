@@ -526,23 +526,9 @@ fn render(
         }
 
         let files_in_dir = &by_dir[dir];
-        let dir_display = if dir.chars().count() > 50 {
-            let tail: String = dir
-                .chars()
-                .rev()
-                .take(47)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            format!("...{}", tail)
-        } else {
-            dir.clone()
-        };
-
         let remaining_budget = max_results - displayed;
         if files_in_dir.len() <= remaining_budget {
-            body.push_str(&format!("{}/ {}\n", dir_display, files_in_dir.join(" ")));
+            body.push_str(&format!("{}/ {}\n", dir, files_in_dir.join(" ")));
             displayed += files_in_dir.len();
         } else {
             // Partial display: show only what fits in budget
@@ -551,7 +537,7 @@ fn render(
                 .take(remaining_budget)
                 .cloned()
                 .collect();
-            body.push_str(&format!("{}/ {}\n", dir_display, partial.join(" ")));
+            body.push_str(&format!("{}/ {}\n", dir, partial.join(" ")));
             displayed += partial.len();
             break;
         }
