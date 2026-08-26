@@ -19,6 +19,12 @@ import type {
 const REWRITE_TIMEOUT_MS = 2_000
 const MIN_SUPPORTED_RTK_MINOR = 23
 
+// Local reimplementation of the package's `isToolCallEventType("bash", event)` type
+// guard. That helper is a value export, so importing it pulls in the whole
+// `@earendil-works/pi-coding-agent` barrel at extension load — profiled at ~250ms
+// warmed, vs ~10ms for a type-only import. `BashToolCallEvent`/`ToolCallEvent`
+// below are type-only imports and are erased at compile time, so they carry none
+// of that cost. See #2753.
 function isBashToolCallEvent(event: ToolCallEvent): event is BashToolCallEvent {
   return event.toolName === "bash"
 }
