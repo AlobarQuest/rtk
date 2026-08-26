@@ -137,10 +137,13 @@ fn parse_subset(paths: &[String], expr: &[String]) -> Option<FindArgs> {
 
 /// find syntax: `find [options] [paths...] [expression]` — paths end at the first
 /// token starting with `-`, `!` or a parenthesis, exactly like find.
-/// RTK syntax (first token contains `*` or `?`): `find <pattern> [path] [-m max] [-t type]`
+/// RTK syntax: `find <pattern> [path] [-m max] [-t type]` — used when the first
+/// token contains `*` or `?`, or is not an existing directory.
 fn dispatch(original: &[String]) -> Result<Dispatch> {
     let (args, max, file_type) = peel_trailing_rtk_flags(original);
-    let legacy = !args.is_empty() && !is_expression_token(&args[0]) && has_glob_meta(&args[0]);
+    let legacy = !args.is_empty()
+        && !is_expression_token(&args[0])
+        && (has_glob_meta(&args[0]) || !Path::new(&args[0]).is_dir());
     let args = if legacy {
         legacy_to_find_syntax(&args)
     } else {
@@ -466,12 +469,17 @@ pub fn run(
             continue;
         }
 
-        if entry_path == Path::new(path) && is_dir {
-            continue;
+        let display_path = entry_path
+            .strip_prefix(path)
+            .unwrap_or(entry_path)
+            .to_string_lossy()
+            .to_string();
+
+        if !display_path.is_empty() {
+            files.push(display_path);
+        } else if !is_dir {
+            files.push(path.to_string());
         }
-        let display_path = entry_path.to_string_lossy();
-        let display_path = display_path.strip_prefix("./").unwrap_or(&display_path);
-        files.push(display_path.to_string());
     }
 
     let raw_output = {
@@ -526,9 +534,23 @@ fn render(
         }
 
         let files_in_dir = &by_dir[dir];
+        let dir_display = if dir.chars().count() > 50 {
+            let tail: String = dir
+                .chars()
+                .rev()
+                .take(47)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("...{}", tail)
+        } else {
+            dir.clone()
+        };
+
         let remaining_budget = max_results - displayed;
         if files_in_dir.len() <= remaining_budget {
-            body.push_str(&format!("{}/ {}\n", dir, files_in_dir.join(" ")));
+            body.push_str(&format!("{}/ {}\n", dir_display, files_in_dir.join(" ")));
             displayed += files_in_dir.len();
         } else {
             // Partial display: show only what fits in budget
@@ -537,7 +559,7 @@ fn render(
                 .take(remaining_budget)
                 .cloned()
                 .collect();
-            body.push_str(&format!("{}/ {}\n", dir, partial.join(" ")));
+            body.push_str(&format!("{}/ {}\n", dir_display, partial.join(" ")));
             displayed += partial.len();
             break;
         }
@@ -637,6 +659,18 @@ mod tests {
             assert_eq!(p.path, a[0], "{a:?}");
             assert_eq!(p.pattern, "*", "{a:?}");
         }
+    }
+
+    #[test]
+    fn literal_name_that_is_not_a_directory_stays_a_pattern() {
+        let p = parse_find_args(&args(&["Cargo.toml"])).unwrap();
+        assert_eq!(p.pattern, "Cargo.toml");
+        assert_eq!(p.path, ".");
+        let p = parse_find_args(&args(&["no_such_dir_xyz"])).unwrap();
+        assert_eq!(p.pattern, "no_such_dir_xyz");
+        let p = parse_find_args(&args(&["README.md", "src"])).unwrap();
+        assert_eq!(p.pattern, "README.md");
+        assert_eq!(p.path, "src");
     }
 
     #[test]
