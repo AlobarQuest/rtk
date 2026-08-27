@@ -125,7 +125,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
                     raw.len(),
                     out.len(),
                     if !raw.is_empty() {
-                        100 - (out.len() * 100 / raw.len())
+                        100usize.saturating_sub(out.len() * 100 / raw.len())
                     } else {
                         0
                     }
