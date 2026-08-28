@@ -349,8 +349,7 @@ pub const RULES: &[RtkRule] = &[
         rewrite_prefixes: &["ctest"],
         category: "Tests",
         savings_pct: 80.0,
-        subcmd_savings: &[],
-        subcmd_status: &[],
+        ..RtkRule::DEFAULT
     },
     RtkRule {
         pattern: r"^((p?np(m|x)|p?npm\s+(exec|run|run-script)|npm\s+(rum|urn|x)|pnpm\s+dlx)\s+)?playwright",
