@@ -7,22 +7,24 @@ use std::ffi::OsString;
 use std::sync::LazyLock;
 
 use crate::core::runner::{self, RunOptions};
-use crate::core::truncate::{CAP_LIST, CAP_WARNINGS};
+use crate::core::truncate::{self, CAP_LIST, CAP_WARNINGS};
 use crate::core::utils::{resolved_command, strip_ansi};
 
 const MAX_SLOWEST: usize = 3;
 const MAX_RESULT_CONTINUATION_LINES: usize = 8;
 const MAX_FAILURE_LINES: usize = CAP_WARNINGS;
+const MAX_FAILURE_HEAD_LINES: usize = 2;
 const MAX_FAILED_LIST_LINES: usize = CAP_LIST;
 
 static TEST_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?s)^\s*\d+/\d+\s+Test\s+#\d+:\s+(.+?)\s+\.{2,}\s*(?:\*{3})?\s*(.+?)\s+([\d.]+)\s+sec\s*$",
+        r"(?s)^\s*(?:\d+/\d+\s+)?Test\s+#(\d+):\s+(.+?)\s+\.{2,}\s*(?:\*{3})?\s*(.+?)\s+([\d.]+)\s+sec\s*$",
     )
     .expect("invalid ctest result regex")
 });
 static RESULT_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*\d+/\d+\s+Test\s+#\d+:").expect("invalid ctest result prefix regex")
+    Regex::new(r"^\s*(?:\d+/\d+\s+)?Test\s+#\d+:")
+        .expect("invalid ctest result prefix regex")
 });
 static RESULT_TERMINATOR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[\d.]+\s+sec\s*$").expect("invalid ctest result terminator regex")
@@ -40,6 +42,7 @@ static TIME_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 #[derive(Debug, Clone)]
 struct TestCase {
+    number: u32,
     name: String,
     status: String,
     reason: Option<String>,
@@ -145,12 +148,15 @@ pub(crate) fn filter_ctest_output(output: &str) -> String {
         return trimmed.to_string();
     }
 
-    let failed_tests: Vec<&TestCase> = tests.iter().filter(|test| test.is_failure()).collect();
-    if failed_tests.is_empty() && summary.map_or(0, |s| s.failed) == 0 {
-        return format_success(&tests, summary, total_time);
+    let has_failures = summary.map_or_else(
+        || tests.iter().any(TestCase::is_failure),
+        |summary| summary.failed > 0,
+    );
+    if has_failures {
+        return format_failure(&lines, &tests, summary, total_time);
     }
 
-    format_failure(&lines, &tests, summary, total_time)
+    format_success(&tests, summary, total_time)
 }
 
 impl TestCase {
@@ -219,21 +225,32 @@ fn is_no_tests_line(line: &str) -> bool {
 }
 
 fn parse_tests(lines: &[String]) -> Vec<TestCase> {
-    lines
-        .iter()
-        .enumerate()
-        .filter_map(|(line_index, line)| parse_test_line(line, line_index))
-        .collect()
+    let mut tests: Vec<TestCase> = Vec::new();
+    for (line_index, line) in lines.iter().enumerate() {
+        let Some(test) = parse_test_line(line, line_index) else {
+            continue;
+        };
+        if let Some(existing) = tests
+            .iter_mut()
+            .find(|existing| existing.number == test.number)
+        {
+            *existing = test;
+        } else {
+            tests.push(test);
+        }
+    }
+    tests
 }
 
 fn parse_test_line(line: &str, line_index: usize) -> Option<TestCase> {
     let caps = TEST_RE.captures(line.trim_end())?;
-    let (status, reason) = split_status_reason(caps.get(2)?.as_str());
+    let (status, reason) = split_status_reason(caps.get(3)?.as_str());
     Some(TestCase {
-        name: caps.get(1)?.as_str().trim().to_string(),
+        number: caps.get(1)?.as_str().parse().ok()?,
+        name: caps.get(2)?.as_str().trim().to_string(),
         status,
         reason,
-        duration: caps.get(3)?.as_str().parse().ok()?,
+        duration: caps.get(4)?.as_str().parse().ok()?,
         line_index,
     })
 }
@@ -334,36 +351,45 @@ fn format_failure(
     }
     out.push_str(&format_meta(total_time));
     if !failed_tests.is_empty() {
-        out.push_str("\nfailed:");
-        for test in &failed_tests {
-            out.push_str(&format!(
-                "\n  {} ({}, {})",
-                test.name,
-                test.status,
-                format_seconds(test.duration)
-            ));
-        }
+        out.push('\n');
+        out.push_str(&format_failed_section(lines, &failed_tests));
     }
     append_skipped_list(&mut out, tests);
 
-    let details = failure_details(lines, &failed_tests);
-    if !details.is_empty() {
+    let trailer = collect_failed_trailer(lines);
+    if !trailer.is_empty() {
         out.push_str("\n\n");
-        out.push_str(&details.join("\n\n"));
+        out.push_str(&trailer.join("\n"));
     }
 
     out
 }
 
 fn append_skipped_list(out: &mut String, tests: &[TestCase]) {
-    let skipped_tests: Vec<&TestCase> = tests.iter().filter(|test| test.is_skipped()).collect();
-    if skipped_tests.is_empty() {
+    let skipped_names: Vec<&str> = tests
+        .iter()
+        .filter(|test| test.is_skipped())
+        .map(|test| test.name.as_str())
+        .collect();
+    if skipped_names.is_empty() {
         return;
     }
 
     out.push_str("\nskipped:");
-    for test in skipped_tests {
-        out.push_str(&format!("\n  {}", test.name));
+    for name in skipped_names.iter().take(MAX_FAILED_LIST_LINES) {
+        out.push_str(&format!("\n  {name}"));
+    }
+    if skipped_names.len() > MAX_FAILED_LIST_LINES {
+        let hidden = skipped_names.len() - MAX_FAILED_LIST_LINES;
+        out.push_str(&format!("\n  ... +{hidden} more skipped"));
+        let all_names = skipped_names.join("\n");
+        if let Some(hint) = crate::core::tee::force_tee_tail_hint(
+            &all_names,
+            "ctest-skipped",
+            MAX_FAILED_LIST_LINES + 1,
+        ) {
+            out.push_str(&format!("\n  {hint}"));
+        }
     }
 }
 
@@ -389,35 +415,65 @@ fn slowest_tests(tests: &[TestCase]) -> Vec<&TestCase> {
     slowest
 }
 
-fn failure_details(lines: &[String], failed_tests: &[&TestCase]) -> Vec<String> {
-    let mut blocks: Vec<String> = failed_tests
+fn format_failed_section(lines: &[String], failed_tests: &[&TestCase]) -> String {
+    let entries: Vec<String> = failed_tests
         .iter()
-        .filter_map(|test| collect_failure_block(lines, test))
+        .map(|test| format_failed_entry(lines, test))
         .collect();
-
-    if let Some(section) = collect_failed_section(lines) {
-        blocks.push(section);
+    let mut full_section = String::from("failed:");
+    for entry in &entries {
+        full_section.push('\n');
+        full_section.push_str(entry);
+    }
+    if entries.len() <= MAX_FAILED_LIST_LINES {
+        return full_section;
     }
 
-    blocks
+    let mut rendered = String::from("failed:");
+    for entry in entries.iter().take(MAX_FAILED_LIST_LINES) {
+        rendered.push('\n');
+        rendered.push_str(entry);
+    }
+    let hidden = entries.len() - MAX_FAILED_LIST_LINES;
+    rendered.push_str(&format!("\n  ... +{hidden} more failed"));
+    if let Some(hint) = crate::core::tee::force_tee_hint(&full_section, "ctest-failed") {
+        rendered.push_str(&format!("\n  {hint}"));
+    }
+    rendered
 }
 
-fn collect_failure_block(lines: &[String], test: &TestCase) -> Option<String> {
+fn format_failed_entry(lines: &[String], test: &TestCase) -> String {
+    let mut entry = format!(
+        "  #{} {} ({}, {})",
+        test.number,
+        test.name,
+        test.status,
+        format_seconds(test.duration)
+    );
+    for detail in collect_failure_block(lines, test) {
+        entry.push_str("\n    ");
+        entry.push_str(&detail);
+    }
+    entry
+}
+
+fn collect_failure_block(lines: &[String], test: &TestCase) -> Vec<String> {
     let mut block = Vec::new();
     let result_index = test.line_index;
-    let before_result = lines[..result_index]
+    let boundary = lines[..result_index]
         .iter()
-        .rposition(|line| START_RE.is_match(line))
-        .map_or(result_index, |index| index + 1);
+        .rposition(|line| is_ctest_boundary(line));
 
-    block.extend(
-        lines[before_result..result_index]
-            .iter()
-            .map(|line| line.trim_end().to_string()),
-    );
+    // Under -j, lines following another result belong to that completed test.
+    if let Some(start) = boundary.filter(|index| START_RE.is_match(&lines[*index])) {
+        block.extend(
+            lines[start + 1..result_index]
+                .iter()
+                .map(|line| line.trim_end().to_string()),
+        );
+    }
 
     let mut index = result_index + 1;
-
     while index < lines.len() {
         let line = &lines[index];
         if is_ctest_boundary(line) {
@@ -436,8 +492,11 @@ fn collect_failure_block(lines: &[String], test: &TestCase) -> Option<String> {
     if block.len() > MAX_FAILURE_LINES {
         let hidden = block.len() - MAX_FAILURE_LINES;
         let full_block = block.join("\n");
+        // Preserve setup context at the head and assertion evidence at the tail.
+        let tail_lines = truncate::reduced(MAX_FAILURE_LINES, MAX_FAILURE_HEAD_LINES);
+        rendered.extend(block.iter().take(MAX_FAILURE_HEAD_LINES).cloned());
         rendered.push(format!("... +{hidden} more lines"));
-        rendered.extend(block[block.len() - MAX_FAILURE_LINES..].iter().cloned());
+        rendered.extend(block[block.len() - tail_lines..].iter().cloned());
         if let Some(hint) = crate::core::tee::force_tee_hint(&full_block, "ctest-failure") {
             rendered.push(hint);
         }
@@ -445,44 +504,23 @@ fn collect_failure_block(lines: &[String], test: &TestCase) -> Option<String> {
         rendered.extend(block);
     }
 
-    (!rendered.is_empty()).then(|| rendered.join("\n"))
+    rendered
 }
 
-fn collect_failed_section(lines: &[String]) -> Option<String> {
-    let start = lines
+fn collect_failed_trailer(lines: &[String]) -> Vec<String> {
+    let Some(start) = lines
         .iter()
-        .position(|line| line.trim() == "The following tests FAILED:")?;
-    let mut block: Vec<String> = lines[start..]
+        .position(|line| line.trim() == "The following tests FAILED:")
+    else {
+        return Vec::new();
+    };
+    let mut trailer: Vec<String> = lines[start + 1..]
         .iter()
+        .filter(|line| !line.starts_with('\t'))
         .map(|line| line.trim_end().to_string())
         .collect();
-
-    trim_blank_edges(&mut block);
-    let entry_count = block
-        .iter()
-        .skip(1)
-        .take_while(|line| line.starts_with('\t'))
-        .count();
-    if entry_count <= MAX_FAILED_LIST_LINES {
-        return (!block.is_empty()).then(|| block.join("\n"));
-    }
-
-    let entries = &block[1..1 + entry_count];
-    let hidden = entry_count - MAX_FAILED_LIST_LINES;
-    let mut rendered = vec![block[0].clone()];
-    rendered.extend(entries.iter().take(MAX_FAILED_LIST_LINES).cloned());
-    rendered.push(format!("... +{hidden} more lines"));
-    let all_entries = entries.join("\n");
-    if let Some(hint) = crate::core::tee::force_tee_tail_hint(
-        &all_entries,
-        "ctest-failed",
-        MAX_FAILED_LIST_LINES + 1,
-    ) {
-        rendered.push(hint);
-    }
-    rendered.extend(block[1 + entry_count..].iter().cloned());
-
-    Some(rendered.join("\n"))
+    trim_blank_edges(&mut trailer);
+    trailer
 }
 
 fn is_ctest_boundary(line: &str) -> bool {
@@ -557,13 +595,10 @@ Use "--rerun-failed --output-on-failure" to re-run the failed cases verbosely.
             filtered,
             r#"ctest: 1/2 passed, 1 failed (0.03 sec)
 failed:
-  failing_case (Failed, 0.02 sec)
+  #2 failing_case (Failed, 0.02 sec)
+    expected: 42
+    actual:   41
 
-expected: 42
-actual:   41
-
-The following tests FAILED:
-	  2 - failing_case (Failed)
 Errors while running CTest
 Use "--rerun-failed --output-on-failure" to re-run the failed cases verbosely."#
         );
@@ -597,16 +632,11 @@ Errors while running CTest
             filtered,
             r#"ctest: 1/3 passed, 2 failed (1.03 sec)
 failed:
-  timeout_case (Timeout, 1.00 sec)
-  segfault_case (Exception: SegFault, 0.02 sec)
+  #2 timeout_case (Timeout, 1.00 sec)
+    timeout diagnostics
+  #3 segfault_case (Exception: SegFault, 0.02 sec)
+    fatal signal details
 
-timeout diagnostics
-
-fatal signal details
-
-The following tests FAILED:
-	  2 - timeout_case (Timeout)
-	  3 - segfault_case (SEGFAULT)
 Errors while running CTest"#
         );
     }
@@ -645,15 +675,11 @@ Errors while running CTest
             filtered,
             r#"ctest: 1/3 passed, 2 failed, 1 disabled (0.15 sec)
 failed:
-  missing_case (Not Run, 0.00 sec)
-  timeout_case (Timeout, 0.14 sec)
+  #3 missing_case (Not Run, 0.00 sec)
+    Could not find executable missing-command
+    Looked in: Debug/missing-command
+  #4 timeout_case (Timeout, 0.14 sec)
 
-Could not find executable missing-command
-Looked in: Debug/missing-command
-
-The following tests FAILED:
-	  3 - missing_case (Not Run)
-	  4 - timeout_case (Timeout)
 Unable to find executable: missing-command
 Errors while running CTest"#
         );
@@ -707,7 +733,9 @@ Total Test time (real) =   0.01 sec
         output
             .lines()
             .filter(|line| {
-                !line.starts_with("[full output:") && !line.starts_with("[see remaining:")
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("[full output:")
+                    && !trimmed.starts_with("[see remaining:")
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -733,13 +761,10 @@ Total Test time (real) =   0.01 sec
             filter_ctest_output(input),
             r#"ctest: 1/2 passed, 1 failed (0.01 sec)
 failed:
-  regex_fail (Failed, 0.00 sec)
+  #4 regex_fail (Failed, 0.00 sec)
+    Required regular expression not found. Regex=[expected-token]
+    nope
 
-Required regular expression not found. Regex=[expected-token]
-nope
-
-The following tests FAILED:
-	  4 - regex_fail (Failed)
 Errors while running CTest"#
         );
     }
@@ -761,6 +786,19 @@ slowest:
     }
 
     #[test]
+    fn parses_repeat_until_pass_fixture() {
+        let input = include_str!("../../../tests/fixtures/ctest_repeat_until_pass_raw.txt");
+
+        assert_eq!(
+            filter_ctest_output(input),
+            r#"ctest: 2/2 passed (0.01 sec)
+slowest:
+  flaky_case 0.00 sec
+  pass_fast 0.00 sec"#
+        );
+    }
+
+    #[test]
     fn keeps_failure_output_that_mentions_no_tests_found() {
         let input = include_str!(
             "../../../tests/fixtures/ctest_discovery_fail_output_on_failure_raw.txt"
@@ -770,19 +808,16 @@ slowest:
             filter_ctest_output(input),
             r#"ctest: 1/2 passed, 1 failed (0.01 sec)
 failed:
-  discovery_fail (Failed, 0.00 sec)
+  #11 discovery_fail (Failed, 0.00 sec)
+    ERROR: No tests were found in the discovery phase
+    assertion failed at bar.cpp:3
 
-ERROR: No tests were found in the discovery phase
-assertion failed at bar.cpp:3
-
-The following tests FAILED:
-	 11 - discovery_fail (Failed)
 Errors while running CTest"#
         );
     }
 
     #[test]
-    fn tail_caps_noisy_failure_fixture() {
+    fn caps_noisy_failure_output_head_and_tail() {
         let input =
             include_str!("../../../tests/fixtures/ctest_noisy_fail_output_on_failure_raw.txt");
 
@@ -790,22 +825,19 @@ Errors while running CTest"#
             without_tee_hints(&filter_ctest_output(input)),
             r#"ctest: 1/2 passed, 1 failed (0.01 sec)
 failed:
-  noisy_fail (Failed, 0.00 sec)
+  #10 noisy_fail (Failed, 0.01 sec)
+    noise line 1
+    noise line 2
+    ... +110 more lines
+    noise line 113
+    noise line 114
+    noise line 115
+    noise line 116
+    noise line 117
+    noise line 118
+    noise line 119
+    noise line 120
 
-... +110 more lines
-noise line 111
-noise line 112
-noise line 113
-noise line 114
-noise line 115
-noise line 116
-noise line 117
-noise line 118
-noise line 119
-noise line 120
-
-The following tests FAILED:
-	 10 - noisy_fail (Failed)
 Errors while running CTest"#
         );
     }
@@ -816,42 +848,124 @@ Errors while running CTest"#
 
         assert_eq!(
             without_tee_hints(&filter_ctest_output(input)),
-            r#"ctest: 3/10 passed, 6 failed, 1 skipped, 1 disabled (1.55 sec)
+            r#"ctest: 3/10 passed, 6 failed, 1 skipped, 1 disabled (1.52 sec)
 failed:
-  regex_fail (Failed, 0.02 sec)
-  missing_case (Not Run, 0.00 sec)
-  timeout_case (Timeout, 1.06 sec)
-  plain_fail (Failed, 0.00 sec)
-  noisy_fail (Failed, 0.00 sec)
-  discovery_fail (Failed, 0.00 sec)
+  #4 regex_fail (Failed, 0.01 sec)
+    Required regular expression not found. Regex=[expected-token]
+  #7 missing_case (Not Run, 0.00 sec)
+    Could not find executable missing-command
+    Looked in the following places:
+    ... +6 more lines
+    MinSizeRel/missing-command
+    MinSizeRel/missing-command
+    RelWithDebInfo/missing-command
+    RelWithDebInfo/missing-command
+    Deployment/missing-command
+    Deployment/missing-command
+    Development/missing-command
+    Development/missing-command
+  #8 timeout_case (Timeout, 1.06 sec)
+  #9 plain_fail (Failed, 0.00 sec)
+  #10 noisy_fail (Failed, 0.00 sec)
+  #11 discovery_fail (Failed, 0.00 sec)
 skipped:
   skipped_case
 
-Required regular expression not found. Regex=[expected-token]
-
-... +7 more lines
-Debug/missing-command
-MinSizeRel/missing-command
-MinSizeRel/missing-command
-RelWithDebInfo/missing-command
-RelWithDebInfo/missing-command
-Deployment/missing-command
-Deployment/missing-command
-Development/missing-command
-Development/missing-command
 Unable to find executable: missing-command
-
-The following tests FAILED:
-	  4 - regex_fail (Failed)
-	  7 - missing_case (Not Run)
-	  8 - timeout_case (Timeout)
-	  9 - plain_fail (Failed)
-	 10 - noisy_fail (Failed)
-	 11 - discovery_fail (Failed)
 Errors while running CTest
 Output from these tests are in: /tmp/build/Testing/Temporary/LastTest.log
 Use "--rerun-failed --output-on-failure" to re-run the failed cases verbosely."#
         );
+    }
+
+    #[test]
+    fn filters_parallel_fixture_without_cross_test_attribution() {
+        let input =
+            include_str!("../../../tests/fixtures/ctest_parallel_output_on_failure_raw.txt");
+
+        assert_eq!(
+            without_tee_hints(&filter_ctest_output(input)),
+            r#"ctest: 3/10 passed, 6 failed, 1 skipped, 1 disabled (1.09 sec)
+failed:
+  #10 discovery_fail (Failed, 0.00 sec)
+    ERROR: No tests were found in the discovery phase
+    assertion failed at bar.cpp:3
+  #11 flaky_case (Failed, 0.01 sec)
+    first try
+  #4 regex_fail (Failed, 0.00 sec)
+    Required regular expression not found. Regex=[expected-token]
+    nope
+  #7 missing_case (Not Run, 0.00 sec)
+    Could not find executable missing-command
+    Looked in the following places:
+    ... +6 more lines
+    MinSizeRel/missing-command
+    MinSizeRel/missing-command
+    RelWithDebInfo/missing-command
+    RelWithDebInfo/missing-command
+    Deployment/missing-command
+    Deployment/missing-command
+    Development/missing-command
+    Development/missing-command
+  #9 plain_fail (Failed, 0.00 sec)
+    assertion failed at foo.cpp:12
+  #8 timeout_case (Timeout, 1.08 sec)
+skipped:
+  skipped_case
+
+Unable to find executable: missing-command
+Errors while running CTest"#
+        );
+    }
+
+    #[test]
+    fn caps_failed_test_entries_with_recovery_hint() {
+        let mut input = String::from("Test project /tmp/build\n");
+        for number in 1..=25 {
+            input.push_str(&format!(
+                "    Start {number}: failing_{number}\n{number}/25 Test #{number}: failing_{number} ................***Failed    0.00 sec\n"
+            ));
+        }
+        input.push_str(
+            "\n0% tests passed, 25 tests failed out of 25\n\nTotal Test time (real) =   0.01 sec\n",
+        );
+
+        let filtered = filter_ctest_output(&input);
+
+        assert_eq!(
+            filtered
+                .lines()
+                .filter(|line| line.starts_with("  #"))
+                .count(),
+            MAX_FAILED_LIST_LINES
+        );
+        assert!(filtered.contains("  ... +5 more failed"));
+        assert!(filtered.contains("  [full output:"));
+    }
+
+    #[test]
+    fn caps_skipped_test_entries_with_recovery_hint() {
+        let mut input = String::from("Test project /tmp/build\n");
+        for number in 1..=25 {
+            input.push_str(&format!(
+                "    Start {number}: skipped_{number}\n{number}/25 Test #{number}: skipped_{number} ................***Skipped   0.00 sec\n"
+            ));
+        }
+        input.push_str(
+            "\n100% tests passed, 0 tests failed out of 25\n\nTotal Test time (real) =   0.01 sec\n",
+        );
+
+        let filtered = filter_ctest_output(&input);
+
+        assert_eq!(
+            filtered
+                .lines()
+                .filter(|line| line.starts_with("  skipped_"))
+                .count(),
+            MAX_FAILED_LIST_LINES
+        );
+        assert!(filtered.contains("  ... +5 more skipped"));
+        assert!(filtered.contains("  [see remaining:"));
     }
 
     #[test]
@@ -875,6 +989,19 @@ Use "--rerun-failed --output-on-failure" to re-run the failed cases verbosely."#
             savings >= 60.0,
             "ctest green skipped: expected >=60% savings, got {savings:.1}%"
         );
+    }
+
+    #[test]
+    fn repeat_result_replaces_the_earlier_state_in_place() {
+        let output = r#"1/1 Test #12: flaky_case .......................***Failed    0.00 sec
+    Test #12: flaky_case .......................   Passed    0.00 sec
+"#;
+
+        let tests = parse_tests(&build_logical_lines(output));
+
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].number, 12);
+        assert_eq!(tests[0].status, "Passed");
     }
 
     #[test]

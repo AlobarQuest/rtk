@@ -6,7 +6,7 @@ Test project /tmp/build
     Start 3: pass_medium
 3/5 Test #3: pass_medium ......................   Passed    0.12 sec
     Start 5: skipped_case
-4/5 Test #5: skipped_case .....................***Skipped   0.02 sec
+4/5 Test #5: skipped_case .....................***Skipped   0.01 sec
     Start 6: disabled_case
 5/5 Test #6: disabled_case ....................***Not Run (Disabled)   0.00 sec
 
