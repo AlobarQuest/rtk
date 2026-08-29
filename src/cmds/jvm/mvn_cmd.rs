@@ -20,6 +20,14 @@ use std::sync::LazyLock;
 /// entries — test-failure cap class, same binding as pytest/rspec/rake/runner.
 const MAX_MVN_FAILING_CLASSES: usize = CAP_WARNINGS;
 
+/// Hard cap on [`Lanes`] growth. Real reactors have a bounded module count
+/// (dozens, not thousands); 256 is generous headroom above any real build.
+/// Invariant: `Lanes::route`'s linear scan is O(`MAX_LANES`), never
+/// O(distinct tags seen) — once the cap is hit, no further tag mints a new
+/// lane, so neither the lane count nor the per-line scan can grow with a
+/// pathological input (e.g. thousands of uniquely-tagged log lines).
+const MAX_LANES: usize = 256;
+
 // ── Shared regex patterns ────────────────────────────────────────────────────
 
 /// `[INFO] Running com.example.app.FooTest`
@@ -169,18 +177,42 @@ fn is_blank_separator(line: &str) -> bool {
 /// `mvnd_reactor_fail_raw.txt`). Classification must therefore happen on the
 /// prefix-stripped view, and Surefire block state must be tracked per module.
 ///
-/// Returns `(Some(key), core)` for log-level lines — `key` is the module tag
-/// (`""` for unprefixed reactor-level lines) and `core` is the line with the
-/// module prefix stripped, for classification — or `(None, line)` for raw
-/// lines (stack traces, stray stdout), whose owning lane is resolved by
-/// [`Lanes::raw_owner`] (unique owner, or preserved verbatim).
+/// Exhaustive contract, in order:
 ///
-/// Residual seam: a raw line of shape `[tag] text` where `tag` is not a log
-/// level and `text` doesn't start with `[` (e.g. slf4j's `[main] INFO …` on
-/// test stdout) keys to the root lane rather than classifying as raw, so
-/// inside a trail it bypasses trail handling and falls to the root
-/// keep-list. Real Surefire trail lines start with an FQCN, `at `,
-/// `Caused by:`, or whitespace, so no realistic diagnostic takes this path.
+/// - `[tag] [LEVEL] …` (tag non-empty and not itself a level, second bracket
+///   a genuine level) → `(Some(tag), core)`, lane-keyed. An *empty* tag
+///   (`[] [LEVEL] …`) is excluded and falls to the raw case below — `""` is
+///   the root lane's reserved key ([`Lanes::new`] seeds it there), so an
+///   empty tag would impersonate root-keyed routing and bypass `raw_owner`
+///   the same way the non-level-shaped cases below do; mvnd never emits an
+///   empty module tag. Real mvnd module tags are
+///   followed by `[INFO]`/`[ERROR]`/etc. That alone doesn't rule out
+///   look-alikes: application logging shaped `[main] [INFO] started …` (a
+///   thread-name tag followed by a level bracket) is syntactically identical
+///   to a real `[module] [INFO] …` mvnd line — no per-line check can tell
+///   them apart. [`Lanes::route`] resolves the ambiguity using state this
+///   function doesn't have: a **never-seen** tag is only admitted as a new
+///   lane when its line is also a genuine module-establishing line
+///   ([`is_lane_opener`]); otherwise it falls back to ownership rules like a
+///   raw line.
+/// - `[LEVEL] …` (single bracket, Maven's own unprefixed output — the tag
+///   itself is the level, with more content after it) → `(Some(""), line)`,
+///   root-keyed.
+/// - bare `[LEVEL]` (trailing whitespace tolerated; no `"] "` substring at
+///   all — the daemon-prefixed trail terminator, e.g. `[INFO] ` or, once
+///   `"] "` is absent, just `[INFO]`) → `(Some(""), line)`, root-keyed.
+///   Keeps the root lane's blank-terminator contract (`is_blank_separator`)
+///   intact.
+/// - any other `[`-leading line (bracket-shaped but neither of the above —
+///   e.g. `[boom] weird bracket assertion line`, `[1, 2] != [1, 3]`, or a
+///   bare `[1, 2]`/`[boom]` with no `"] "` substring at all — a
+///   bracket-leading fragment of a multi-line assertion message, not
+///   Maven's own output) → `(None, line)`, raw. `Lanes::raw_owner` decides
+///   ownership like any other raw line, instead of unconditionally landing
+///   on the root keep-list (root-keyed bypasses `raw_owner` entirely, so
+///   such a line inside a *tagged* lane's active failure trail/block was
+///   dropped: it never reached the trail-keeping logic).
+/// - non-bracket-leading line → `(None, line)`, raw (checked first, below).
 fn split_lane(line: &str) -> (Option<&str>, &str) {
     if !line.starts_with('[') {
         return (None, line);
@@ -188,12 +220,86 @@ fn split_lane(line: &str) -> (Option<&str>, &str) {
     if let Some(end) = line.find("] ") {
         let tag = &line[1..end];
         let rest = &line[end + 2..];
-        if !matches!(tag, "INFO" | "ERROR" | "WARNING" | "DEBUG" | "FATAL") && rest.starts_with('[')
-        {
-            return (Some(tag), rest);
+        if tag.is_empty() {
+            // `""` is the root lane's reserved key (`Lanes::new` seeds it
+            // there) — an empty tag would impersonate root-keyed routing
+            // and bypass `raw_owner` entirely. mvnd never emits an empty
+            // module tag, so `[] [LEVEL] …` is raw, not root-keyed.
+            return (None, line);
         }
+        if !is_log_level(tag) {
+            if lane_rest_level(rest).is_some() {
+                return (Some(tag), rest);
+            }
+            return (None, line);
+        }
+        return (Some(""), line);
     }
-    (Some(""), line)
+    // No "] " substring: root-key only Maven's own bare `[LEVEL]` blank
+    // (the daemon-prefixed trail terminator, trailing whitespace tolerated)
+    // — everything else `[`-leading with no "] " (e.g. `[1, 2]`, `[boom]`,
+    // a bracketed fragment of a multi-line assertion diff) is raw, not
+    // Maven's own output, so `Lanes::raw_owner` decides ownership.
+    let bare = line.trim_end();
+    if bare
+        .strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .is_some_and(is_log_level)
+    {
+        return (Some(""), line);
+    }
+    (None, line)
+}
+
+fn is_log_level(tag: &str) -> bool {
+    matches!(tag, "INFO" | "ERROR" | "WARNING" | "DEBUG" | "FATAL")
+}
+
+/// The bracketed tag at the start of `rest`, if it's a real log level —
+/// i.e. `rest` looks like `[LEVEL] …` or (the no-trailing-space blank
+/// spelling, `[tag] [INFO]` with nothing after) exactly `[LEVEL]`. Used to
+/// confirm a candidate lane tag is genuinely followed by a level bracket,
+/// not just any `[...]` — both spellings must be recognized so
+/// `is_blank_separator`'s `[INFO]`-blank contract holds for a tagged lane
+/// regardless of whether the daemon's trailing space survived.
+fn lane_rest_level(rest: &str) -> Option<&str> {
+    let rest = rest.strip_prefix('[')?;
+    let level = match rest.find("] ") {
+        Some(end) => &rest[..end],
+        None => rest.strip_suffix(']')?,
+    };
+    is_log_level(level).then_some(level)
+}
+
+/// Whether `core` (the tag-stripped remainder of a candidate lane-keyed
+/// line) is a genuine Maven/mvnd module-establishing line: a test class
+/// starting (`RUNNING`), a plugin or module banner, a `Building` line, a
+/// per-class result (`CLOSE`), or an `[ERROR]` diagnostic (compiler errors
+/// are always the first line mvnd emits for a module that fails to
+/// compile — there is no `RUNNING`/`Building` line first). `[tag] [LEVEL] …`
+/// is syntactically identical whether `tag` is a real mvnd module or an
+/// application thread/timestamp caught in test-captured stdout (see
+/// `split_lane`); this heuristic only narrows the `[INFO]`-shaped case
+/// (e.g. `[main] [INFO] …`), which is the common one in practice — real
+/// module tags are always *introduced* by one of these lines before any
+/// other content appears under them, so this is the signal
+/// [`Lanes::route`] uses to admit a never-seen tag as a new lane rather
+/// than falling back to raw-line ownership. An `[ERROR]`-shaped app log on
+/// a never-seen tag (e.g. `[Server] [ERROR] connection refused`) still
+/// mints a lane — but that lane is inert: a continuation claim only ever
+/// arms on a genuine compiler diagnostic (see the `FILE_COORD` guard at
+/// each `keep_continuation` arm site), so a one-off log line can open a
+/// lane without ever contesting routing for it. Lane growth itself is
+/// bounded by [`MAX_LANES`], so an adversarial run of uniquely-tagged
+/// `[ERROR]` lines can mint at most that many lanes, keeping `route`'s scan
+/// O(`MAX_LANES`) regardless of how many distinct tags the input contains.
+fn is_lane_opener(core: &str) -> bool {
+    RUNNING.is_match(core)
+        || CLOSE.is_match(core)
+        || MODULE_BANNER.is_match(core)
+        || PLUGIN_BANNER.is_match(core)
+        || core.starts_with("[INFO] Building ")
+        || core.starts_with("[ERROR]")
 }
 
 /// `[ERROR] FQN.method -- Time elapsed: 0.030 s <<< FAILURE!` (or `<<< ERROR!`).
@@ -339,13 +445,31 @@ impl<'a> SurefireBlock<'a> {
     /// Matching is done on `core` (the module-prefix-stripped view of the
     /// line — identical to `line` outside mvnd parallel reactors); `line` is
     /// the original, which is what gets buffered and emitted so module
-    /// identity survives in the output.
-    fn step(&mut self, line: &'a str, core: &str, keyed: bool, out: &mut String) -> SurefireStep<'a> {
-        if PLUGIN_BANNER.is_match(core) {
+    /// identity survives in the output. `keyed` is whether this line was
+    /// routed by its own module tag (see [`Lanes::route`]) rather than
+    /// falling back to ownership rules; `is_root` is whether this lane is
+    /// the root (untagged) lane, the only one plain `mvn` ever uses.
+    fn step(
+        &mut self,
+        line: &'a str,
+        core: &str,
+        keyed: bool,
+        is_root: bool,
+        out: &mut String,
+    ) -> SurefireStep<'a> {
+        // PLUGIN_BANNER/RUNNING/CLOSE only mean anything as *this lane's own*
+        // state transitions. A fallback-routed line (keyed == false) landed
+        // here via raw-line ownership rules, not because it's genuinely
+        // this lane's banner/class-start/class-end — treating its core as
+        // one anyway (e.g. a lane-cap-overflow module's own `Running`/close
+        // line, misrouted to an unrelated lane) would flush or discard that
+        // lane's real open block, or open a block that never closes. Not
+        // keyed: fall through and treat it as ordinary content instead.
+        if keyed && PLUGIN_BANNER.is_match(core) {
             return SurefireStep::Consumed;
         }
 
-        if RUNNING.is_match(core) {
+        if keyed && RUNNING.is_match(core) {
             if self.in_block {
                 self.flush_open_block_as_keep(out);
             }
@@ -360,30 +484,42 @@ impl<'a> SurefireBlock<'a> {
         }
 
         if self.in_block {
-            if let Some(caps) = CLOSE.captures(core) {
-                let fail = caps.get(1).map(|m| m.as_str() != "0").unwrap_or(false);
-                let err = caps.get(2).map(|m| m.as_str() != "0").unwrap_or(false);
-                if fail || err {
-                    let lines = std::mem::take(&mut self.block_lines);
-                    let running = self.block_running.take();
+            if keyed {
+                if let Some(caps) = CLOSE.captures(core) {
+                    let fail = caps.get(1).map(|m| m.as_str() != "0").unwrap_or(false);
+                    let err = caps.get(2).map(|m| m.as_str() != "0").unwrap_or(false);
+                    if fail || err {
+                        let lines = std::mem::take(&mut self.block_lines);
+                        let running = self.block_running.take();
+                        self.in_block = false;
+                        return SurefireStep::FailingClose {
+                            running,
+                            lines,
+                            close: line,
+                        };
+                    }
+                    self.block_lines.clear();
+                    self.block_running = None;
                     self.in_block = false;
-                    return SurefireStep::FailingClose {
-                        running,
-                        lines,
-                        close: line,
-                    };
+                    return SurefireStep::Consumed;
                 }
-                self.block_lines.clear();
-                self.block_running = None;
-                self.in_block = false;
-                return SurefireStep::Consumed;
             }
             self.block_lines.push(line);
             return SurefireStep::Consumed;
         }
 
         if self.failure_trail {
-            if is_blank_separator(core) {
+            // Invariant: a trail terminates on a blank line only when that
+            // blank is genuinely this lane's own — keyed (a tagged lane's
+            // `[tag] [INFO] ` blank, or any other keyed line reaching here)
+            // or the root lane (plain `mvn`'s terminator is *always* a raw,
+            // unkeyed empty line — mvnd is the only binary that prefixes
+            // blanks, so a tagged lane's real terminator is always keyed).
+            // A raw blank landing in a *tagged* lane's trail is foreign
+            // (another module's stray blank println, or a blank line inside
+            // a multi-line assertion message) and must not end the trail —
+            // it's just more trail content.
+            if is_blank_separator(core) && (keyed || is_root) {
                 if !self.drop_trail {
                     out.push('\n');
                 }
@@ -517,21 +653,35 @@ impl<'a> SurefireBlock<'a> {
 /// [`MAX_MVN_FAILING_CLASSES`] and emit `\n… +N more failures\n` immediately
 /// before the `Tests run:` aggregate when entries were dropped.
 ///
-/// The budget is **reactor-wide**, not per module: a parallel reactor emits one
-/// summary block per failing module, so each lane keeps its own `in_summary`
-/// flag ([`SurefireLane::in_summary`]) while the entry count is shared. The
-/// budget spans the whole filter invocation and never resets — whether module
-/// summaries interleave or run back-to-back, the run keeps at most `cap`
-/// entries total, never `modules × cap`. `dropped` alone resets when a tail is
-/// emitted, so each `… +N more` reports the drops since the previous tail.
-/// This also means a `verify` run whose Surefire and Failsafe phases each emit
-/// a summary shares one budget across both — the second summary can get zero
-/// entries, with the tail still reporting every drop. That is the documented
-/// semantics: at most `cap` entries per run.
+/// The budget is **reactor-wide within one generation**, not per module: a
+/// parallel reactor emits one summary block per failing module, and each
+/// module's *first* summary in a generation shares that generation's one
+/// running budget — a 20-module reactor still keeps at most `cap` entries
+/// total for that pass, never `modules × cap`, whether the modules'
+/// summaries interleave or run back-to-back. But `mvn verify`/`install` runs
+/// Surefire's summary then Failsafe's as two independent generations over
+/// the *same* lanes — a lane's second `[ERROR] Failures:`/`Errors:` header
+/// starts a new generation, not a continuation, so it gets a fresh `cap`.
+/// Invariant: **each summary block keeps at most `cap` entries; entries
+/// beyond that collapse to `… +N more failures`** — a generation's budget is
+/// shared reactor-wide the first time each lane opens a summary in it, and a
+/// new generation begins (with a fresh budget) exactly once per repeat
+/// header, on whichever lane's header repeats first; every other lane's
+/// header that then interleaves before the reset lane's `AGG` is treated as
+/// that lane's first sighting *in the new generation* (no second reset) —
+/// otherwise an interleaved reactor could double-reset mid-generation and
+/// let one still-open block emit up to `2 × cap` entries. `dropped` alone
+/// additionally resets when a tail is emitted, so each `… +N more` reports
+/// the drops since the previous tail.
 struct FailuresSummaryCap {
     cap: usize,
     emitted: usize,
     dropped: usize,
+    /// Lanes that have opened a summary block in the *current generation*.
+    /// Cleared and re-seeded with just the triggering lane when the first
+    /// repeat header of a generation starts a new one — see
+    /// [`FailuresSummaryCap::handle_header`].
+    seen_lanes: HashSet<usize>,
 }
 
 impl FailuresSummaryCap {
@@ -540,6 +690,7 @@ impl FailuresSummaryCap {
             cap,
             emitted: 0,
             dropped: 0,
+            seen_lanes: HashSet::new(),
         }
     }
 
@@ -562,13 +713,41 @@ impl FailuresSummaryCap {
         true
     }
 
-    /// Detect the `[ERROR] Failures:` header so subsequent `[ERROR]   ` lines
-    /// get capped. Caller is responsible for writing the header to `out`.
-    fn handle_header(&mut self, line: &str, in_summary: &mut bool) {
-        if !line.starts_with("[ERROR] Failures:") || *in_summary {
+    /// Detect the `[ERROR] Failures:` or `[ERROR] Errors:` header so
+    /// subsequent `[ERROR]   ` lines get capped — a run whose failures are
+    /// all thrown exceptions (no assertion failures) gets an `Errors:`-only
+    /// summary with no `Failures:` header at all, and must be capped the
+    /// same way. Caller is responsible for writing the header to `out`.
+    /// `lane` is the opening lane's index.
+    ///
+    /// Generation semantics: `seen_lanes` tracks lanes that have opened a
+    /// summary in the *current* generation (phase). A lane's first header in
+    /// a generation shares that generation's running budget (reactor-wide,
+    /// same as before). The first lane whose header repeats within the
+    /// current generation is the signal a new generation has begun (e.g.
+    /// Failsafe's summary following Surefire's): that starts a fresh
+    /// generation — `seen_lanes` is cleared (and re-seeded with just this
+    /// lane) and `emitted` resets once. Any *other* lane's header that then
+    /// interleaves before this lane's `AGG` line is a first sighting in the
+    /// new generation too (its `insert` succeeds), so it shares the new
+    /// generation's budget without triggering a second reset — otherwise an
+    /// interleaved reactor could reset `emitted` twice per generation and
+    /// let one lane's still-open block emit up to `2 × cap` entries. The
+    /// `*in_summary` guard above already prevents a mid-block `Errors:`
+    /// header (Maven can emit `Failures:` then `Errors:` as two sections of
+    /// one summary) from being treated as a new generation at all.
+    fn handle_header(&mut self, line: &str, in_summary: &mut bool, lane: usize) {
+        let is_header =
+            line.starts_with("[ERROR] Failures:") || line.starts_with("[ERROR] Errors:");
+        if !is_header || *in_summary {
             return;
         }
         *in_summary = true;
+        if !self.seen_lanes.insert(lane) {
+            self.seen_lanes.clear();
+            self.seen_lanes.insert(lane);
+            self.emitted = 0;
+        }
     }
 
     /// Pre-emit the `… +N more failures` tail when the aggregate
@@ -631,6 +810,10 @@ struct Lanes<'a> {
     hot: usize,
 }
 
+/// Index of the root (untagged, `""`) lane — always 0, by construction of
+/// [`Lanes::new`]; never reassigned since lanes are only ever appended.
+const ROOT_LANE: usize = 0;
+
 impl<'a> Lanes<'a> {
     fn new() -> Self {
         Self {
@@ -643,20 +826,51 @@ impl<'a> Lanes<'a> {
         &mut self.lanes[idx].1
     }
 
-    /// Lane index for a line: by module key for log-level lines (creating the
-    /// lane on first sight), by ownership rules for raw lines. `None` means a
-    /// raw line's ownership is genuinely ambiguous and the caller must
-    /// preserve it verbatim rather than guess a lane that may drop it.
-    fn route(&mut self, key: Option<&'a str>) -> Option<usize> {
+    /// Lane index for a line, plus whether it was routed *by its own key*
+    /// (`true`) or fell back to ownership rules (`false`) — the latter must
+    /// be treated exactly like a raw line by callers (it may disarm a claim
+    /// or re-enter a trail only a genuinely keyed line for that lane may
+    /// touch). Keyed routing creates the lane on first sight, but only for a
+    /// tag whose line is a genuine module-establishing line per
+    /// [`is_lane_opener`] *and* only while under [`MAX_LANES`]; a never-seen
+    /// tag on an ordinary line falls back to ownership rules, since it may
+    /// be an application log line whose bracketed thread/timestamp only
+    /// looks like a module tag. `None` means the line's ownership is
+    /// genuinely ambiguous (a raw line with no unique claimant, or a
+    /// confirmed new module that can't be routed because the lane cap is
+    /// full) and the caller must preserve it verbatim rather than guess a
+    /// lane that may drop or corrupt it.
+    fn route(&mut self, key: Option<&'a str>, core: &str) -> Option<(usize, bool)> {
         match key {
-            Some(k) => Some(match self.lanes.iter().position(|(t, _)| *t == k) {
-                Some(i) => i,
-                None => {
-                    self.lanes.push((k, SurefireLane::new()));
-                    self.lanes.len() - 1
+            Some(k) => {
+                if let Some(i) = self.lanes.iter().position(|(t, _)| *t == k) {
+                    return Some((i, true));
                 }
-            }),
-            None => self.raw_owner(),
+                if !is_lane_opener(core) {
+                    // Never-seen tag on an ordinary line: not a confirmed
+                    // module — fall back to ownership rules instead of
+                    // minting a phantom lane that would divert this line
+                    // away from whichever lane's block/trail it actually
+                    // belongs to.
+                    return self.raw_owner().map(|i| (i, false));
+                }
+                if self.lanes.len() < MAX_LANES {
+                    self.lanes.push((k, SurefireLane::new()));
+                    return Some((self.lanes.len() - 1, true));
+                }
+                // A confirmed new module, but the lane cap is already full:
+                // preserve verbatim rather than guess an owner via
+                // raw_owner. Unlike the phantom-tag case above, this line's
+                // core genuinely looks like a state transition (`Running`,
+                // a close, a banner) — routing it onto an unrelated
+                // existing lane would corrupt that lane's block/trail, not
+                // just misattribute a bystander line. Ceiling cost: a 257th
+                // genuine module's own lines are preserved but ungrouped
+                // (over-keep), never dropped or misattributed onto another
+                // module's block (never data loss).
+                None
+            }
+            None => self.raw_owner().map(|i| (i, false)),
         }
     }
 
@@ -781,8 +995,9 @@ impl FailingClassCap {
 /// Surefire block machine, and commit/drop failing closes against the
 /// reactor-wide class cap. Returns `Some((lane index, core, keyed))` when
 /// the line fell through to the caller's outside-block keep-list — `keyed`
-/// is whether the line carried a module prefix (routed by key) or was raw
-/// (routed by ownership claim); callers must only disarm a lane's armed
+/// is whether the line was routed *by its own module tag* (see
+/// [`Lanes::route`]) or fell back to ownership rules, whether raw or a
+/// never-established tag; callers must only disarm a lane's armed
 /// continuation on that lane's own keyed lines, since a raw line reached
 /// the lane *because of* the claim. `None` when the line was consumed — or
 /// preserved verbatim on ambiguous raw-line ownership.
@@ -793,8 +1008,8 @@ fn drive_surefire_line<'a>(
     out: &mut String,
 ) -> Option<(usize, &'a str, bool)> {
     let (key, core) = split_lane(line);
-    let idx = match lanes.route(key) {
-        Some(i) => i,
+    let (idx, keyed) = match lanes.route(key, core) {
+        Some(v) => v,
         None => {
             // Ambiguous ownership: preserve rather than risk dropping a
             // failing module's diagnostics into a passing block.
@@ -804,7 +1019,7 @@ fn drive_surefire_line<'a>(
         }
     };
 
-    let step = lanes.get(idx).block.step(line, core, key.is_some(), out);
+    let step = lanes.get(idx).block.step(line, core, keyed, idx == ROOT_LANE, out);
     // A lane inside a Surefire block has no pending javac continuations:
     // entering a block retires any stale armed claim, so a single lane can't
     // hold a permanent armed-vs-block tie against raw-line routing.
@@ -830,7 +1045,7 @@ fn drive_surefire_line<'a>(
             lanes.get(idx).keep_continuation = false;
             None
         }
-        SurefireStep::Passthrough => Some((idx, core, key.is_some())),
+        SurefireStep::Passthrough => Some((idx, core, keyed)),
     }
 }
 
@@ -885,7 +1100,7 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
             // Pre-emit the summary tail when we're about to write AGG.
             summary.handle_aggregate(core, &mut out, &mut lanes.get(idx).in_summary);
             // Detect summary header so subsequent `[ERROR]   ` entries get capped.
-            summary.handle_header(core, &mut lanes.get(idx).in_summary);
+            summary.handle_header(core, &mut lanes.get(idx).in_summary, idx);
             out.push_str(line);
             out.push('\n');
             // The armed per-lane flag is an owner claim in its own right:
@@ -894,10 +1109,20 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
             // own keyed lines may rewrite the claim (a kept raw line can't
             // arm anyway — starting with `[ERROR]` would have keyed it).
             if keyed {
+                // Invariant: on the root (untagged) lane, any `[ERROR]` line
+                // arms the claim — plain `mvn` never mints tagged lanes, so
+                // there is no phantom-tag risk there, and this preserves the
+                // pre-PR arming behavior exactly. On a tagged (mvnd module)
+                // lane, only a genuine compiler diagnostic
+                // (`file.java:[line,col]`) arms it — an `[ERROR]`-shaped app
+                // log (or the Surefire summary/close lines excluded below)
+                // can open a lane but can never arm it, so a one-off stray
+                // line can't hold a claim open.
                 lanes.get(idx).keep_continuation = core.starts_with("[ERROR]")
                     && !core.starts_with("[ERROR] Tests run:")
                     && !core.starts_with("[ERROR] Failures:")
-                    && !core.starts_with("[ERROR] Errors:");
+                    && !core.starts_with("[ERROR] Errors:")
+                    && (idx == ROOT_LANE || FILE_COORD.is_match(core));
             }
             continue;
         }
@@ -947,9 +1172,8 @@ pub fn filter_compile(raw: &str) -> String {
         // Classify on the module-prefix-stripped view; emit the original so
         // module identity survives in mvnd parallel reactors.
         let (key, core) = split_lane(line);
-        let keyed = key.is_some();
-        let idx = match lanes.route(key) {
-            Some(i) => i,
+        let (idx, keyed) = match lanes.route(key, core) {
+            Some(v) => v,
             // Reachable when two modules are armed concurrently (a tie):
             // preserve the raw line verbatim rather than guess an owner.
             None => {
@@ -961,7 +1185,14 @@ pub fn filter_compile(raw: &str) -> String {
         if MODULE_BANNER.is_match(core) {
             out.push_str(line);
             out.push('\n');
-            lanes.get(idx).keep_continuation = false;
+            // Uniform with every other disarm site: only this lane's own
+            // keyed line may rewrite its claim. Provably unreachable with
+            // `keyed == false` today (`is_lane_opener` already requires a
+            // `MODULE_BANNER` match to establish a lane), but guarded here
+            // too so that invariant doesn't have to hold forever for safety.
+            if keyed {
+                lanes.get(idx).keep_continuation = false;
+            }
             continue;
         }
         if BUILD_FOOT.is_match(core)
@@ -972,7 +1203,9 @@ pub fn filter_compile(raw: &str) -> String {
         {
             out.push_str(line);
             out.push('\n');
-            lanes.get(idx).keep_continuation = false;
+            if keyed {
+                lanes.get(idx).keep_continuation = false;
+            }
             continue;
         }
         // Help boilerplate: drop before the `[ERROR]` catch-all (parity with
@@ -988,8 +1221,12 @@ pub fn filter_compile(raw: &str) -> String {
             out.push_str(line);
             out.push('\n');
             // Armed flag is an owner claim scanned by raw_owner — no `hot`
-            // bookkeeping needed.
-            lanes.get(idx).keep_continuation = true;
+            // bookkeeping needed. Root lane: any `[ERROR]` arms (pre-PR
+            // behavior, no phantom-tag risk on plain `mvn`). Tagged lane:
+            // only a genuine compiler diagnostic (`file.java:[line,col]`)
+            // arms — see the matching invariant on the Surefire/package arm
+            // sites.
+            lanes.get(idx).keep_continuation = idx == ROOT_LANE || FILE_COORD.is_match(core);
             continue;
         }
         if lanes.get(idx).keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
@@ -1004,7 +1241,15 @@ pub fn filter_compile(raw: &str) -> String {
                 out.push_str(line);
                 out.push('\n');
             }
-            lanes.get(idx).keep_continuation = false;
+            // Only this lane's own keyed line may rewrite its claim — a
+            // `[tag] [WARNING] …` line for a never-established tag routes
+            // here (via raw_owner's fallback) with `keyed == false` when
+            // this lane happens to be armed, and clearing the claim on that
+            // raw-routed line would drop the `symbol:` / `location:`
+            // continuations that follow. See the fall-through reset below.
+            if keyed {
+                lanes.get(idx).keep_continuation = false;
+            }
             continue;
         }
         // Drop everything else. Only keyed lines disarm: a raw stray only
@@ -1063,16 +1308,26 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
         // Outside any Surefire block: compile-keep AND surefire-outside-keep merge.
         if reactor_keep || MODULE_BANNER.is_match(core) || keep_outside_block(core) {
             summary.handle_aggregate(core, &mut out, &mut lanes.get(idx).in_summary);
-            summary.handle_header(core, &mut lanes.get(idx).in_summary);
+            summary.handle_header(core, &mut lanes.get(idx).in_summary, idx);
             out.push_str(line);
             out.push('\n');
             // Armed flag is an owner claim scanned by raw_owner; only keyed
             // lines rewrite it — see filter_surefire_with_cap.
             if keyed {
+                // Invariant: on the root (untagged) lane, any `[ERROR]` line
+                // arms the claim — plain `mvn` never mints tagged lanes, so
+                // there is no phantom-tag risk there, and this preserves the
+                // pre-PR arming behavior exactly. On a tagged (mvnd module)
+                // lane, only a genuine compiler diagnostic
+                // (`file.java:[line,col]`) arms it — an `[ERROR]`-shaped app
+                // log (or the Surefire summary/close lines excluded below)
+                // can open a lane but can never arm it, so a one-off stray
+                // line can't hold a claim open.
                 lanes.get(idx).keep_continuation = core.starts_with("[ERROR]")
                     && !core.starts_with("[ERROR] Tests run:")
                     && !core.starts_with("[ERROR] Failures:")
-                    && !core.starts_with("[ERROR] Errors:");
+                    && !core.starts_with("[ERROR] Errors:")
+                    && (idx == ROOT_LANE || FILE_COORD.is_match(core));
             }
             continue;
         }
@@ -1082,15 +1337,21 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
             continue;
         }
         if core.starts_with("[WARNING]") {
-            // `[WARNING]`-prefixed lines are always keyed (split_lane keys
-            // any `[`-initial log line), so this reset never hits a claim.
             let payload = core.strip_prefix("[WARNING] ").unwrap_or(core);
             let norm = FILE_COORD.replace_all(payload, "").to_string();
             if seen_warnings.insert(norm) {
                 out.push_str(line);
                 out.push('\n');
             }
-            lanes.get(idx).keep_continuation = false;
+            // Only this lane's own keyed line may rewrite its claim — a
+            // `[tag] [WARNING] …` line for a never-established tag reaches
+            // here via raw_owner's fallback (`keyed == false`) whenever this
+            // lane is the one currently armed, and clearing the claim on
+            // that raw-routed line would drop the `symbol:` / `location:`
+            // continuations that follow. See the fall-through reset below.
+            if keyed {
+                lanes.get(idx).keep_continuation = false;
+            }
             continue;
         }
         // Raw fall-through lines never disarm — see filter_surefire_with_cap.
@@ -1714,6 +1975,154 @@ mod tests {
         assert_summary_cap_spans_sequential_lanes(filter_package_with_cap);
     }
 
+    /// Reviewer probe (upstream PR #3199 finding 1): `mvn verify`/`install`
+    /// emits two independent failures summaries in the same (unprefixed)
+    /// lane — Surefire's for unit-test failures, then Failsafe's for
+    /// integration-test failures. Each must get its own budget of `cap`: the
+    /// second summary must not start at zero remaining because the first
+    /// one already spent the whole invocation-wide budget.
+    #[test]
+    fn failures_summary_cap_resets_per_phase_on_same_lane() {
+        let mut i = String::from("[INFO] Scanning for projects...\n[ERROR] Failures:\n");
+        for n in 1..=12 {
+            i.push_str(&format!("[ERROR]   UnitTest.case{n}:{n} boom u{n}\n"));
+        }
+        i.push_str("[ERROR] Tests run: 12, Failures: 12, Errors: 0, Skipped: 0\n");
+        i.push_str("[ERROR] Failures:\n");
+        for n in 1..=12 {
+            i.push_str(&format!("[ERROR]   ITTest.case{n}:{n} boom it{n}\n"));
+        }
+        i.push_str("[ERROR] Tests run: 12, Failures: 12, Errors: 0, Skipped: 0\n[INFO] BUILD FAILURE\n");
+
+        let o = filter_package(&i);
+        assert_eq!(
+            o.matches("boom u").count(),
+            10,
+            "Surefire summary keeps its own 10 entries; got:\n{o}"
+        );
+        assert_eq!(
+            o.matches("boom it").count(),
+            10,
+            "Failsafe summary gets a fresh budget of 10, not zero; got:\n{o}"
+        );
+        assert_eq!(
+            o.matches("… +2 more failures").count(),
+            2,
+            "each phase reports its own 2 dropped entries; got:\n{o}"
+        );
+    }
+
+    /// Reviewer follow-up (upstream PR #3199, follow-up cold review): a run
+    /// whose failures are all thrown exceptions gets an `[ERROR] Errors:`
+    /// summary with no `Failures:` header at all — pre-fix, `handle_header`
+    /// only recognized `Failures:`, so this summary shape bypassed the
+    /// budget entirely (probe: 5/5 kept at cap=2).
+    fn assert_errors_only_summary_respects_cap(filter: fn(&str, usize) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+                  [ERROR] Errors: \n\
+                  [ERROR]   BoomTest.one:11 java.lang.IllegalStateException\n\
+                  [ERROR]   BoomTest.two:12 java.lang.IllegalStateException\n\
+                  [ERROR]   BoomTest.three:13 java.lang.IllegalStateException\n\
+                  [ERROR]   BoomTest.four:14 java.lang.IllegalStateException\n\
+                  [ERROR]   BoomTest.five:15 java.lang.IllegalStateException\n\
+                  [ERROR] Tests run: 5, Failures: 0, Errors: 5, Skipped: 0\n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter(i, 2);
+        assert_eq!(
+            o.matches("java.lang.IllegalStateException").count(),
+            2,
+            "cap=2 bounds an Errors-only summary same as a Failures one; got:\n{o}"
+        );
+        assert!(
+            o.contains("… +3 more failures"),
+            "tail reports the 3 dropped entries; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn surefire_errors_only_summary_respects_cap() {
+        assert_errors_only_summary_respects_cap(filter_surefire_with_cap);
+    }
+
+    #[test]
+    fn package_errors_only_summary_respects_cap() {
+        assert_errors_only_summary_respects_cap(filter_package_with_cap);
+    }
+
+    /// Same phase-reset invariant as `failures_summary_cap_resets_per_phase_on_same_lane`,
+    /// but the second phase is headed by `[ERROR] Errors:` instead of
+    /// `[ERROR] Failures:` — the reset must not care which of the two
+    /// header spellings opened either phase.
+    #[test]
+    fn errors_header_resets_summary_cap_per_phase_same_as_failures_header() {
+        let mut i = String::from("[INFO] Scanning for projects...\n[ERROR] Failures:\n");
+        for n in 1..=12 {
+            i.push_str(&format!("[ERROR]   UnitTest.case{n}:{n} boom u{n}\n"));
+        }
+        i.push_str("[ERROR] Tests run: 12, Failures: 12, Errors: 0, Skipped: 0\n");
+        i.push_str("[ERROR] Errors:\n");
+        for n in 1..=12 {
+            i.push_str(&format!("[ERROR]   ITTest.case{n}:{n} boom it{n}\n"));
+        }
+        i.push_str("[ERROR] Tests run: 0, Failures: 0, Errors: 12, Skipped: 0\n[INFO] BUILD FAILURE\n");
+
+        let o = filter_package(&i);
+        assert_eq!(
+            o.matches("boom u").count(),
+            10,
+            "Failures:-headed phase keeps its own 10 entries; got:\n{o}"
+        );
+        assert_eq!(
+            o.matches("boom it").count(),
+            10,
+            "Errors:-headed phase gets a fresh budget of 10, not zero; got:\n{o}"
+        );
+        assert_eq!(
+            o.matches("… +2 more failures").count(),
+            2,
+            "each phase reports its own 2 dropped entries; got:\n{o}"
+        );
+    }
+
+    /// Reviewer follow-up (upstream PR #3199, final review round): child-a
+    /// and child-b both finish a first-generation summary (Surefire), then
+    /// child-a opens its second-generation summary (Failsafe) — the reset
+    /// generation boundary. Before child-a's second-generation summary
+    /// closes, child-b's own second-generation header interleaves in. That
+    /// must be treated as child-b's first sighting *in the new generation*
+    /// (sharing the budget child-a already spent), not a second reset — a
+    /// second reset would let child-a's still-open block emit up to
+    /// `2 × cap` entries total instead of `cap`.
+    #[test]
+    fn interleaved_second_generation_header_does_not_double_reset_budget() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [child-a] [ERROR] Failures:\n\
+                  [child-a] [ERROR]   entryA1\n\
+                  [child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n\
+                  [child-b] [ERROR] Failures:\n\
+                  [child-b] [ERROR]   entryB1\n\
+                  [child-b] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n\
+                  [child-a] [ERROR] Failures:\n\
+                  [child-a] [ERROR]   entryA2\n\
+                  [child-a] [ERROR]   entryA3\n\
+                  [child-b] [ERROR] Failures:\n\
+                  [child-a] [ERROR]   entryA4\n\
+                  [child-a] [ERROR] Tests run: 3, Failures: 3, Errors: 0, Skipped: 0\n\
+                  [child-b] [ERROR]   entryB2\n\
+                  [child-b] [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0\n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter_package_with_cap(i, 2);
+        assert!(
+            o.contains("entryA2") && o.contains("entryA3"),
+            "second-generation entries under the cap survive; got:\n{o}"
+        );
+        assert!(
+            !o.contains("entryA4"),
+            "child-a's second-generation block stays at cap=2, not 3 \
+             (child-b's interleaved header must not double-reset the budget); got:\n{o}"
+        );
+    }
+
     /// A compile error surfacing inside a test/package run: the raw indented
     /// `symbol:` / `location:` continuations must route back to the module
     /// that armed them even when another module's line lands in between —
@@ -2072,6 +2481,42 @@ mod tests {
         assert_raw_stray_does_not_disarm_continuation(filter_package);
     }
 
+    /// Reviewer blocker (upstream PR #3199, final review round): a
+    /// `[tag] [WARNING] …` line for a never-established tag (e.g. an app log
+    /// line, not a real module) reaches an armed lane via `raw_owner`'s
+    /// fallback with `keyed == false` — the `[WARNING]` dedup branch in
+    /// `filter_compile` and `filter_package` must not disarm on it, exactly
+    /// like every other disarm site. Swept through every position of the
+    /// compile-error sequence, on all three filter paths (`filter_surefire`
+    /// has no `[WARNING]` branch but shares the same fall-through reset).
+    fn assert_warning_interloper_does_not_disarm_continuation(filter: fn(&str) -> String) {
+        const WARNING_INTERLOPER: [&str; 1] = ["[main] [WARNING] connection pool exhausted"];
+        for (n, m) in merges(&SWEEP_COMPILE_A, &WARNING_INTERLOPER).iter().enumerate() {
+            let i = sweep_input(m);
+            let o = filter(&i);
+            assert!(
+                o.contains("symbol:   variable bar")
+                    && o.contains("location: class com.example.rtk.A"),
+                "WARNING interloper at position #{n} disarmed the continuation;\ninput:\n{i}\noutput:\n{o}"
+            );
+        }
+    }
+
+    #[test]
+    fn mvnd_warning_interloper_does_not_disarm_continuation() {
+        assert_warning_interloper_does_not_disarm_continuation(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_compile_warning_interloper_does_not_disarm_continuation() {
+        assert_warning_interloper_does_not_disarm_continuation(filter_compile);
+    }
+
+    #[test]
+    fn mvnd_package_warning_interloper_does_not_disarm_continuation() {
+        assert_warning_interloper_does_not_disarm_continuation(filter_package);
+    }
+
     #[test]
     fn mvnd_compile_raw_stray_does_not_disarm_continuation() {
         assert_raw_stray_does_not_disarm_continuation(filter_compile);
@@ -2154,6 +2599,73 @@ mod tests {
         assert_raw_stray_does_not_leak_capped_rearm(filter_package_with_cap);
     }
 
+    const RAW_BLANK_STRAY: [&str; 1] = [""];
+
+    /// Reviewer blocker (upstream PR #3199, cold review round): a raw BLANK
+    /// line landing inside a *tagged* lane's failure trail must not be
+    /// mistaken for that lane's own `[tag] [INFO] ` terminator. mvnd always
+    /// prefixes a tagged lane's real blank terminator, so an unprefixed
+    /// blank reaching a tagged trail is foreign (another module's stray
+    /// blank println, or a blank line inside a multi-line assertion
+    /// message) — the trail must stay open until the lane's own keyed
+    /// terminator arrives. Pre-fix, the blank closed the trail early and
+    /// the remaining assertion message / user frame found no claim and were
+    /// dropped by the keep-lists.
+    fn assert_raw_blank_does_not_terminate_trail(filter: fn(&str) -> String) {
+        for (n, m) in merges(&SWEEP_FAIL_A, &RAW_BLANK_STRAY).iter().enumerate() {
+            let i = sweep_input(m);
+            let o = filter(&i);
+            assert!(
+                o.contains("expected: <1> but was: <2>")
+                    && o.contains("ParallelFailTest.reactorDiagnostic(ParallelFailTest.java:10)"),
+                "raw blank at position #{n} truncated the trail;\ninput:\n{i}\noutput:\n{o}"
+            );
+        }
+    }
+
+    #[test]
+    fn mvnd_raw_blank_does_not_terminate_trail() {
+        assert_raw_blank_does_not_terminate_trail(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_package_raw_blank_does_not_terminate_trail() {
+        assert_raw_blank_does_not_terminate_trail(filter_package);
+    }
+
+    /// Drop side of the same claim: with the class capped (fully dropped), a
+    /// raw blank inside the trail must not end `drop_trail` mode early —
+    /// otherwise the remaining (still-supposed-to-be-suppressed) trail
+    /// content falls through unclaimed and can leak past the outer
+    /// keep-list instead of staying dropped.
+    fn assert_raw_blank_does_not_leak_capped_trail(filter: fn(&str, usize) -> String) {
+        // Insert the blank between the assertion message and the user frame
+        // — squarely inside the (dropped) trail.
+        let mut m: Vec<&str> = SWEEP_FAIL_A[..4].to_vec();
+        m.push(RAW_BLANK_STRAY[0]);
+        m.extend_from_slice(&SWEEP_FAIL_A[4..]);
+        let i = sweep_input(&m);
+        let o = filter(&i, 0);
+        assert!(
+            !o.contains("ParallelFailTest") && !o.contains("expected: <1> but was: <2>"),
+            "capped class stays fully dropped across the raw blank; got:\n{o}"
+        );
+        assert!(
+            o.contains("+1 more failing test classes"),
+            "capped class still reported in the tail; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn mvnd_raw_blank_does_not_leak_capped_trail() {
+        assert_raw_blank_does_not_leak_capped_trail(filter_surefire_with_cap);
+    }
+
+    #[test]
+    fn mvnd_package_raw_blank_does_not_leak_capped_trail() {
+        assert_raw_blank_does_not_leak_capped_trail(filter_package_with_cap);
+    }
+
     /// Two modules armed concurrently: raw continuation lines have no unique
     /// owner (two armed lanes are a tie on their own) and must be preserved
     /// verbatim rather than routed to a guess. Completes the claimant
@@ -2228,6 +2740,17 @@ mod tests {
         assert!(o.contains("[ERROR] Failed to execute goal"));
         assert!(!o.contains("Processing build on daemon"));
         assert!(!o.contains("BuildTimeEventSpy"));
+    }
+
+    /// Parity with the other three mvnd fixtures' dedicated savings tests
+    /// (`mvnd_reactor_pass_savings`, `mvnd_test_fail_savings`,
+    /// `mvnd_parallel_reactor_fail_savings`) — same ≥60% floor.
+    #[test]
+    fn mvnd_compile_error_savings() {
+        let i = include_str!("../../../tests/fixtures/mvnd_compile_error_raw.txt");
+        let o = filter_compile(i);
+        let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
+        assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
     }
 
     // ── Surefire filter ──────────────────────────────────────────────────────
@@ -2672,6 +3195,43 @@ mod tests {
             "indented `location:` continuation preserved; got:\n{}",
             o
         );
+    }
+
+    /// Reviewer follow-up (upstream PR #3199, final review round): the
+    /// `FILE_COORD` arming guard is scoped to *tagged* (mvnd module) lanes
+    /// only. On the root (untagged) lane — the only lane a plain `mvn` run
+    /// ever uses — any `[ERROR]` line still arms broadly, exactly as it did
+    /// pre-PR, so a non-compiler `[ERROR]` (no `file.java:[line,col]`
+    /// coordinate) with an indented raw continuation is still kept.
+    fn assert_root_lane_arms_broadly_without_file_coord(filter: fn(&str) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+                  [ERROR] Internal error: java.lang.IllegalStateException: broken plugin\n\
+                  \x20 at com.example.PluginImpl.run(PluginImpl.java:42)\n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter(i);
+        assert!(
+            o.contains("Internal error: java.lang.IllegalStateException"),
+            "the ERROR line itself survives; got:\n{o}"
+        );
+        assert!(
+            o.contains("at com.example.PluginImpl.run(PluginImpl.java:42)"),
+            "root lane arms broadly (pre-PR behavior), so the raw continuation survives; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn surefire_root_lane_arms_broadly_without_file_coord() {
+        assert_root_lane_arms_broadly_without_file_coord(filter_surefire);
+    }
+
+    #[test]
+    fn compile_root_lane_arms_broadly_without_file_coord() {
+        assert_root_lane_arms_broadly_without_file_coord(filter_compile);
+    }
+
+    #[test]
+    fn package_root_lane_arms_broadly_without_file_coord() {
+        assert_root_lane_arms_broadly_without_file_coord(filter_package);
     }
 
     #[test]
@@ -3277,6 +3837,264 @@ mod tests {
             o.contains("Some unexpected error output"),
             "unclassified ERROR line preserved; got:\n{}",
             o
+        );
+    }
+
+    // ── split_lane / app-log false-positive lane guard ──────────────────────
+
+    /// `[tag] [LEVEL] …` only counts as lane-shaped when the second bracket
+    /// is a genuine level — a non-level second bracket (or none at all)
+    /// falls through to the root lane exactly like a plain unprefixed line.
+    #[test]
+    fn split_lane_requires_real_level_in_second_bracket() {
+        assert_eq!(
+            split_lane("[child-a] [INFO] Running com.example.rtk.FooTest"),
+            (Some("child-a"), "[INFO] Running com.example.rtk.FooTest")
+        );
+        assert_eq!(
+            split_lane("[main] [status] app started"),
+            (None, "[main] [status] app started")
+        );
+        assert_eq!(
+            split_lane("[INFO] plain single-bracket line"),
+            (Some(""), "[INFO] plain single-bracket line")
+        );
+        assert_eq!(
+            split_lane("at com.example.rtk.FooTest.bar(FooTest.java:1)"),
+            (None, "at com.example.rtk.FooTest.bar(FooTest.java:1)")
+        );
+        // Bracket-shaped but not Maven's own `[LEVEL] ...` output and not a
+        // real `[tag] [LEVEL]` module line either: raw, not root-keyed.
+        assert_eq!(
+            split_lane("[boom] weird bracket assertion line"),
+            (None, "[boom] weird bracket assertion line")
+        );
+        assert_eq!(
+            split_lane("[1, 2] != [1, 3]"),
+            (None, "[1, 2] != [1, 3]")
+        );
+        // No `"] "` substring at all: only Maven's own bare `[LEVEL]` blank
+        // root-keys — a bracketed assertion-diff fragment with no `"] "`
+        // anywhere is raw, same as the `"] "`-present case above.
+        assert_eq!(split_lane("[INFO]"), (Some(""), "[INFO]"));
+        assert_eq!(split_lane("[1, 2]"), (None, "[1, 2]"));
+        assert_eq!(split_lane("[boom]"), (None, "[boom]"));
+        // Empty tag: `""` is the root lane's reserved key, so `[] [LEVEL] …`
+        // must not impersonate root-keyed routing — raw, not `(Some(""), …)`.
+        assert_eq!(
+            split_lane("[] [INFO] started"),
+            (None, "[] [INFO] started")
+        );
+    }
+
+    /// Reviewer probe (upstream PR #3199 finding 2): an application log line
+    /// shaped `[thread] [LEVEL] …` inside a failing test's captured stdout
+    /// must not mint a phantom lane and vanish from the committed block —
+    /// `main` was never established as a module (no `Running`/`Building`/
+    /// banner/`[ERROR]` line for it), so it falls back to raw-line ownership
+    /// and rides along with the rest of the failing block's content.
+    #[test]
+    fn app_log_line_survives_inside_failing_block() {
+        let i = "[INFO] Running com.example.rtk.MyTest\n\
+                  [main] [INFO] app started with config=/etc/foo.yml\n\
+                  plain stdout line\n\
+                  [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE! -- in com.example.rtk.MyTest\n\
+                  [ERROR] com.example.rtk.MyTest.testFoo -- Time elapsed: 0.05 s <<< FAILURE!\n\
+                  java.lang.AssertionError: expected <1> but was <2>\n\
+                  \tat com.example.rtk.MyTest.testFoo(MyTest.java:10)\n\
+                  \n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter_surefire(i);
+        assert!(
+            o.contains("app started with config=/etc/foo.yml"),
+            "app log line kept in the committed block; got:\n{o}"
+        );
+        assert!(
+            o.contains("plain stdout line"),
+            "adjacent unbracketed stdout still kept; got:\n{o}"
+        );
+    }
+
+    /// A genuine mvnd module tag (established via its `Running` line) must
+    /// still lane-split correctly: interleaved output from two modules is
+    /// kept separate, so a passing class from one module never leaks under
+    /// the other's failing block.
+    #[test]
+    fn genuine_mvnd_module_tags_still_lane_split() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [child-a] [INFO] Running com.example.rtk.FailTest\n\
+                  [child-b] [INFO] Running com.example.rtk.PassTest\n\
+                  [child-b] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.010 s -- in com.example.rtk.PassTest\n\
+                  [child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.020 s <<< FAILURE! -- in com.example.rtk.FailTest\n\
+                  [child-a] [ERROR] com.example.rtk.FailTest.bar -- Time elapsed: 0.020 s <<< FAILURE!\n\
+                  org.opentest4j.AssertionFailedError: expected: <1> but was: <2>\n\
+                  \tat com.example.rtk.FailTest.bar(FailTest.java:5)\n\
+                  \n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter_surefire(i);
+        assert!(
+            o.contains("[child-a] [ERROR] Tests run: 1, Failures: 1"),
+            "failing module's close kept; got:\n{o}"
+        );
+        assert!(
+            o.contains("expected: <1> but was: <2>"),
+            "failing module's assertion kept; got:\n{o}"
+        );
+        assert!(
+            !o.contains("PassTest"),
+            "passing module's class collapsed, not leaked under child-a's block; got:\n{o}"
+        );
+    }
+
+    /// Reviewer blocker (upstream PR #3199, follow-up cold review): a
+    /// multi-line assertion message inside a *tagged* lane's failure trail
+    /// can contain bracket-leading continuation lines (`[1, 2] != [1, 3]`,
+    /// a collection diff; `[boom] weird bracket assertion line`) that are
+    /// bracket-shaped but not Maven's own `[LEVEL] ...` output. Pre-fix,
+    /// `split_lane` root-keyed these (bypassing `raw_owner` entirely), so
+    /// they landed on the root keep-list and were dropped even though
+    /// child-a's trail was active. They must now route as raw content and
+    /// survive as part of the trail, same as any other continuation line.
+    fn assert_bracket_leading_trail_line_survives(filter: fn(&str) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+                  [child-a] [INFO] Running com.example.rtk.FooTest\n\
+                  [child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE! -- in com.example.rtk.FooTest\n\
+                  [child-a] [ERROR] com.example.rtk.FooTest.bar -- Time elapsed: 0.05 s <<< FAILURE!\n\
+                  org.opentest4j.AssertionFailedError: collections differ\n\
+                  [1, 2] != [1, 3]\n\
+                  [boom] weird bracket assertion line\n\
+                  [1, 2]\n\
+                  [boom]\n\
+                  [] [INFO] started\n\
+                  \tat com.example.rtk.FooTest.bar(FooTest.java:5)\n\
+                  \n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter(i);
+        assert!(
+            o.contains("[1, 2] != [1, 3]"),
+            "bracket-leading collection diff survives; got:\n{o}"
+        );
+        assert!(
+            o.contains("[boom] weird bracket assertion line"),
+            "bracket-leading assertion fragment survives; got:\n{o}"
+        );
+        // No `"] "` substring at all — the sibling shape split_lane must
+        // also not root-key (only a bare `[LEVEL]` blank may).
+        assert!(
+            o.lines().any(|l| l.trim_end() == "[1, 2]"),
+            "bare bracket diff line (no \"] \") survives; got:\n{o}"
+        );
+        assert!(
+            o.lines().any(|l| l.trim_end() == "[boom]"),
+            "bare bracket fragment (no \"] \") survives; got:\n{o}"
+        );
+        // Empty tag: `[] [INFO] started` must not impersonate the root
+        // lane and get swallowed by the root keep-list.
+        assert!(
+            o.contains("[] [INFO] started"),
+            "empty-tag line survives, not swallowed as root-keyed; got:\n{o}"
+        );
+        assert!(
+            o.contains("at com.example.rtk.FooTest.bar(FooTest.java:5)"),
+            "user frame still survives too; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn surefire_bracket_leading_trail_line_survives() {
+        assert_bracket_leading_trail_line_survives(filter_surefire);
+    }
+
+    #[test]
+    fn package_bracket_leading_trail_line_survives() {
+        assert_bracket_leading_trail_line_survives(filter_package);
+    }
+
+    /// Reviewer probe (upstream PR #3199 finding 3): two `[tag] [ERROR] …`
+    /// app-log lines earlier in the output each mint a lane, but neither
+    /// looks like a compiler diagnostic, so neither ever arms a
+    /// continuation claim. A later real failing class's trail must then be
+    /// the sole, unambiguous claimant of its own raw frames: the single
+    /// user frame survives, and the framework frames (`org.junit.jupiter`,
+    /// `java.base/`) are stripped exactly as they would be with no phantom
+    /// lanes in play at all.
+    #[test]
+    fn phantom_lane_claim_never_arms_and_never_steals_a_real_trail() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [Server] [ERROR] connection refused to db\n\
+                  [Cache] [ERROR] connection refused to cache\n\
+                  [INFO] Running com.example.rtk.RealTest\n\
+                  [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE! -- in com.example.rtk.RealTest\n\
+                  [ERROR] com.example.rtk.RealTest.foo -- Time elapsed: 0.05 s <<< FAILURE!\n\
+                  java.lang.AssertionError: boom\n\
+                  \tat com.example.rtk.RealTest.foo(RealTest.java:5)\n\
+                  \tat org.junit.jupiter.engine.execution.SomeThing.invoke(SomeThing.java:1)\n\
+                  \tat java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)\n\
+                  \n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter_surefire(i);
+        assert!(
+            o.contains("at com.example.rtk.RealTest.foo(RealTest.java:5)"),
+            "the single user frame survives; got:\n{o}"
+        );
+        assert!(
+            !o.contains("org.junit.jupiter"),
+            "junit framework frame must not leak; got:\n{o}"
+        );
+        assert!(
+            !o.contains("java.base/"),
+            "java.base framework frame must not leak; got:\n{o}"
+        );
+    }
+
+    /// Finding 4: an adversarial run of uniquely-tagged `[ERROR]` lines
+    /// (each individually opener-shaped, per `is_lane_opener`) must not mint
+    /// unbounded lanes — `Lanes::route`'s scan stays `O(MAX_LANES)`, not
+    /// `O(distinct tags)`. Also exercises the public entry point end to end
+    /// to confirm the cap doesn't panic or drop output.
+    #[test]
+    fn lane_count_is_capped_on_pathological_input() {
+        let mut i = String::from("[INFO] Scanning for projects...\n");
+        // Non-coordinate `[ERROR]` text deliberately: `is_lane_opener`'s
+        // blanket `[ERROR]`-prefix rule still mints a lane per tag (what
+        // this test measures), but without a `FILE_COORD` match these
+        // never arm `keep_continuation` — so the overflow-module assertion
+        // below isn't accidentally satisfied by an unrelated 255-way armed
+        // tie in `raw_owner` instead of exercising the fix it targets.
+        for n in 0..(MAX_LANES + 50) {
+            i.push_str(&format!("[tag{n}] [ERROR] connection refused for tag{n}\n"));
+        }
+        // One more never-seen tag, past the cap: a genuine failing test
+        // class (`Running` + failing close), not just a bare `[ERROR]`
+        // line — the shape the cold-review fix specifically targets
+        // (`Lanes::route` preferring `None` over `raw_owner` guesswork once
+        // the cap is exceeded, so this doesn't get misrouted onto an
+        // unrelated lane and corrupt or drop it).
+        i.push_str(
+            "[overflow-mod] [INFO] Running com.example.rtk.OverflowTest\n\
+             [overflow-mod] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.01 s <<< FAILURE! -- in com.example.rtk.OverflowTest\n",
+        );
+        i.push_str("[INFO] BUILD FAILURE\n");
+
+        let mut lanes = Lanes::new();
+        let mut classes = FailingClassCap::new(MAX_MVN_FAILING_CLASSES);
+        let mut out = String::new();
+        for line in i.lines() {
+            drive_surefire_line(&mut lanes, line, &mut classes, &mut out);
+        }
+        assert!(
+            lanes.lanes.len() <= MAX_LANES,
+            "lane count must stay capped at {MAX_LANES}, got {}",
+            lanes.lanes.len()
+        );
+
+        let o = filter_surefire(&i);
+        assert!(!o.is_empty(), "capped run still produces output");
+        assert!(
+            o.contains("Running com.example.rtk.OverflowTest")
+                && o.contains("<<< FAILURE! -- in com.example.rtk.OverflowTest"),
+            "an overflow (past-cap) module's own failing diagnostics must survive \
+             (preserved verbatim), not be lost to a misrouted guess; got:\n{o}"
         );
     }
 }

@@ -36,7 +36,7 @@ Key behaviours:
 - **Reactor Summary preservation** — for multi-module builds, the trailing `Reactor Summary for <root>` block with per-module SUCCESS/FAILURE rows is kept (toggled by a `[INFO] Reactor Summary for ` header and cleared on `BUILD SUCCESS` / `BUILD FAILURE`).
 - **Failure cap** — both the count of emitted failing test classes and the size of the `[ERROR] Failures:` summary block are bounded by `MAX_MVN_FAILING_CLASSES = CAP_WARNINGS` (the shared test-failure cap class from `src/core/truncate.rs`, same binding as pytest/rspec/rake/runner). Excess emissions are replaced by a single `… +N more failing test classes` / `… +N more failures` tail (canonical `join_with_overflow` shape) to keep large failure sets compact; the raw output stays recoverable via the tee `[full output: …]` hint. Per the core cap policy, a cap of `0` means summary-only: no blocks emitted, the tail still counts every dropped class.
 
-Token-savings tests run inline as part of `cargo test --all` and verify ≥90% savings for `mvn test` and ≥85% for `mvn install` on full synthetic fixtures (gzipped, ~1100 lines each). The `flate2` dependency (already in `Cargo.toml`) decompresses the ~3 KB gzipped fixtures in milliseconds.
+Token-savings tests run inline as part of `cargo test --all`. The `mvn` fixtures (gzipped, ~1100 lines each; `flate2`, already in `Cargo.toml`, decompresses the ~3 KB gzipped fixtures in milliseconds) verify ≥90% savings for `mvn test` and ≥85% for `mvn install`. The `mvnd` fixtures are smaller synthetic captures and are held to the repo-wide ≥60% savings floor instead (`mvnd_reactor_pass_savings`, `mvnd_test_fail_savings`, `mvnd_parallel_reactor_fail_savings`, `mvnd_compile_error_savings`; actuals run 64.9–76.5%).
 
 ### Integrity-check whitelist
 
