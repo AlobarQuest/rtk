@@ -19,7 +19,7 @@ const MAX_FAILED_LIST_LINES: usize = CAP_LIST;
 
 static TEST_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?s)^\s*(?:\d+/\d+\s+)?Test\s+#(\d+):\s+(.+?)\s+\.{2,}\s*(?:\*{3})?\s*(.+?)\s+([\d.]+)\s+sec\s*$",
+        r"(?s)^\s*(?:\d+/(\d+)\s+)?Test\s+#(\d+):\s+(.+?)\s+\.{2,}\s*(?:\*{3})?\s*(.+?)\s+([\d.]+)\s+sec\s*$",
     )
     .expect("invalid ctest result regex")
 });
@@ -50,6 +50,13 @@ struct TestCase {
     reason: Option<String>,
     duration: f64,
     line_index: usize,
+    counter_total: Option<u32>,
+}
+
+#[derive(Debug)]
+struct ParsedTests {
+    tests: Vec<TestCase>,
+    result_lines: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -102,7 +109,13 @@ fn should_passthrough(args: &[String]) -> bool {
                 | "--debug"
                 | "--show-only"
                 | "--print-labels"
-        ) || arg.starts_with("--show-only=")
+                | "-M"
+                | "-T"
+                | "-S"
+                | "-SP"
+                | "--build-and-test"
+        ) || arg.starts_with("-D")
+            || arg.starts_with("--show-only=")
             || arg.starts_with("--help-")
     })
 }
@@ -139,8 +152,13 @@ pub(crate) fn filter_ctest_output(output: &str) -> String {
     }
 
     let lines = build_logical_lines(&clean);
-    let tests = parse_tests(&lines);
-    let framing_lines = collect_framing_line_indices(&lines, &tests);
+    let parsed_tests = parse_tests(&lines);
+    let framing_lines = collect_framing_line_indices(
+        &lines,
+        &parsed_tests.tests,
+        &parsed_tests.result_lines,
+    );
+    let tests = parsed_tests.tests;
     let summary = lines.iter().rev().find_map(|line| parse_summary(line));
     let total_time = lines
         .iter()
@@ -230,33 +248,111 @@ fn is_no_tests_line(line: &str) -> bool {
     line.trim() == "No tests were found!!!"
 }
 
-fn parse_tests(lines: &[String]) -> Vec<TestCase> {
+/// Result lines are trusted only when their `N/M` total matches the run: a
+/// test that forwards a nested ctest run echoes result lines carrying the
+/// nested suite's own total, which must neither replace a real record nor
+/// bound a failure block. The run total comes from the final summary when
+/// there is one (reconciled for disabled tests, see below) and otherwise from
+/// the most frequent counter. `--repeat` retries carry no counter and repeat
+/// both number and name, so dedup keys on the pair and the last result wins.
+fn parse_tests(lines: &[String]) -> ParsedTests {
+    let candidates: Vec<TestCase> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(line_index, line)| parse_test_line(line, line_index))
+        .collect();
+    let most_frequent_total = most_frequent_counter_total(&candidates);
+    let run_total = lines
+        .iter()
+        .rev()
+        .find_map(|line| parse_summary(line))
+        .and_then(|summary| u32::try_from(summary.total).ok())
+        .map(|summary_total| {
+            counter_total_with_disabled_tests(summary_total, most_frequent_total, &candidates)
+        })
+        .or(most_frequent_total);
+
     let mut tests: Vec<TestCase> = Vec::new();
-    for (line_index, line) in lines.iter().enumerate() {
-        let Some(test) = parse_test_line(line, line_index) else {
-            continue;
-        };
-        if let Some(existing) = tests
-            .iter_mut()
-            .find(|existing| existing.number == test.number)
-        {
+    let mut result_lines = Vec::new();
+    for test in candidates.into_iter().filter(|test| {
+        run_total.is_none_or(|run_total| {
+            test.counter_total
+                .is_none_or(|counter_total| counter_total == run_total)
+        })
+    }) {
+        result_lines.push(test.line_index);
+        if let Some(existing) = tests.iter_mut().find(|existing| {
+            existing.number == test.number && existing.name == test.name
+        }) {
             *existing = test;
         } else {
             tests.push(test);
         }
     }
-    tests
+
+    ParsedTests {
+        tests,
+        result_lines,
+    }
+}
+
+/// Ties keep the first total seen: ctest prints the run's own result lines
+/// before any output a test could forward.
+fn most_frequent_counter_total(candidates: &[TestCase]) -> Option<u32> {
+    let mut counts: Vec<(u32, usize)> = Vec::new();
+    for total in candidates.iter().filter_map(|test| test.counter_total) {
+        if let Some((_, count)) = counts.iter_mut().find(|(candidate, _)| *candidate == total) {
+            *count += 1;
+        } else {
+            counts.push((total, 1));
+        }
+    }
+
+    counts
+        .into_iter()
+        .reduce(|most_frequent, candidate| {
+            if candidate.1 > most_frequent.1 {
+                candidate
+            } else {
+                most_frequent
+            }
+        })
+        .map(|(total, _)| total)
+}
+
+/// CTest includes disabled tests in the `N/M` counter but excludes them from
+/// the summary total. Reconcile that documented mismatch before validation.
+fn counter_total_with_disabled_tests(
+    summary_total: u32,
+    most_frequent_total: Option<u32>,
+    candidates: &[TestCase],
+) -> u32 {
+    let Some(counter_total) = most_frequent_total else {
+        return summary_total;
+    };
+    let disabled_tests: HashSet<(u32, &str)> = candidates
+        .iter()
+        .filter(|test| test.counter_total == Some(counter_total) && test.is_disabled())
+        .map(|test| (test.number, test.name.as_str()))
+        .collect();
+    let disabled_count = u32::try_from(disabled_tests.len()).ok();
+
+    match disabled_count.and_then(|count| summary_total.checked_add(count)) {
+        Some(total_with_disabled) if total_with_disabled == counter_total => counter_total,
+        _ => summary_total,
+    }
 }
 
 fn parse_test_line(line: &str, line_index: usize) -> Option<TestCase> {
     let caps = TEST_RE.captures(line.trim_end())?;
-    let (status, reason) = split_status_reason(caps.get(3)?.as_str());
+    let (status, reason) = split_status_reason(caps.get(4)?.as_str());
     Some(TestCase {
-        number: caps.get(1)?.as_str().parse().ok()?,
-        name: caps.get(2)?.as_str().trim().to_string(),
+        counter_total: caps.get(1).and_then(|value| value.as_str().parse().ok()),
+        number: caps.get(2)?.as_str().parse().ok()?,
+        name: caps.get(3)?.as_str().trim().to_string(),
         status,
         reason,
-        duration: caps.get(4)?.as_str().parse().ok()?,
+        duration: caps.get(5)?.as_str().parse().ok()?,
         line_index,
     })
 }
@@ -299,12 +395,12 @@ fn parse_total_time(line: &str) -> Option<f64> {
 /// like `Start N:` or the summary, so `Start` lines are validated against the
 /// parsed test set (number and name must both match) and the trailer lines are
 /// honoured only at their last occurrence, where ctest prints them.
-fn collect_framing_line_indices(lines: &[String], tests: &[TestCase]) -> HashSet<usize> {
-    let mut framing_lines: HashSet<usize> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| parse_test_line(line, index).map(|_| index))
-        .collect();
+fn collect_framing_line_indices(
+    lines: &[String],
+    tests: &[TestCase],
+    result_lines: &[usize],
+) -> HashSet<usize> {
+    let mut framing_lines: HashSet<usize> = result_lines.iter().copied().collect();
 
     framing_lines.extend(lines.iter().enumerate().filter_map(|(index, line)| {
         let captures = START_RE.captures(line)?;
@@ -577,6 +673,7 @@ fn collect_failure_block(
         block.extend(
             lines[start + 1..result_index]
                 .iter()
+                .flat_map(|line| line.split('\n'))
                 .map(|line| line.trim_end().to_string()),
         );
     }
@@ -586,7 +683,11 @@ fn collect_failure_block(
         if framing_lines.contains(&index) {
             break;
         }
-        block.push(lines[index].trim_end().to_string());
+        block.extend(
+            lines[index]
+                .split('\n')
+                .map(|line| line.trim_end().to_string()),
+        );
         index += 1;
     }
 
@@ -796,6 +897,17 @@ Total Test time (real) =   0.01 sec
         assert!(should_passthrough(&["--show-only=json-v1".to_string()]));
         assert!(should_passthrough(&["--help-command".to_string()]));
         assert!(should_passthrough(&["/?".to_string()]));
+        for dashboard_arg in [
+            "-D",
+            "-DExperimental",
+            "-M",
+            "-T",
+            "-S",
+            "-SP",
+            "--build-and-test",
+        ] {
+            assert!(should_passthrough(&[dashboard_arg.to_string()]));
+        }
         assert!(!should_passthrough(&["--output-on-failure".to_string()]));
     }
 
@@ -823,10 +935,17 @@ Total Test time (real) =   0.01 sec
 
     fn failed_section_parts(input: &str) -> (String, String, bool) {
         let lines = build_logical_lines(input);
-        let tests = parse_tests(&lines);
-        let framing_lines = collect_framing_line_indices(&lines, &tests);
-        let failed_tests: Vec<&TestCase> =
-            tests.iter().filter(|test| test.is_failure()).collect();
+        let parsed_tests = parse_tests(&lines);
+        let framing_lines = collect_framing_line_indices(
+            &lines,
+            &parsed_tests.tests,
+            &parsed_tests.result_lines,
+        );
+        let failed_tests: Vec<&TestCase> = parsed_tests
+            .tests
+            .iter()
+            .filter(|test| test.is_failure())
+            .collect();
         let section = build_failed_section(&lines, &failed_tests, &framing_lines);
         (section.rendered, section.full, section.truncated)
     }
@@ -886,6 +1005,113 @@ slowest:
   flaky_case 0.00 sec
   pass_fast 0.00 sec"#
         );
+    }
+
+    #[test]
+    fn rejects_nested_result_fixture_by_run_total() {
+        let input = include_str!("../../../tests/fixtures/ctest_nested_result_raw.txt");
+
+        assert_eq!(
+            filter_ctest_output(input),
+            r#"ctest: 1/3 passed, 2 failed (0.01 sec)
+failed:
+  #1 wrapper (Failed, 0.00 sec)
+    delegating to inner suite
+        Start 1: inner_case
+    1/1 Test #1: inner_case ......................   Passed    0.02 sec
+    100% tests passed, 0 tests failed out of 1
+    ASSERT FAILED: wrapper post-check
+  #2 wrapped_out (Failed, 0.00 sec)
+    Test #99: phase begin
+    L1
+    L2
+    L3
+    L4
+    L5
+    L6
+    phase done in 1.5 sec
+    ASSERT FAILED: real
+
+Errors while running CTest"#
+        );
+    }
+
+    #[test]
+    fn nested_result_cannot_replace_outer_result_with_summary() {
+        let input = r#"Test project /tmp/build
+    Start 1: wrapper
+1/2 Test #1: wrapper ..........................***Failed    0.00 sec
+delegating to inner suite
+1/1 Test #1: inner_case .......................   Passed    0.02 sec
+ASSERT FAILED: wrapper post-check
+    Start 2: other
+2/2 Test #2: other ............................   Passed    0.00 sec
+
+50% tests passed, 1 tests failed out of 2
+
+Total Test time (real) =   0.01 sec
+"#;
+
+        assert_eq!(
+            filter_ctest_output(input),
+            r#"ctest: 1/2 passed, 1 failed (0.01 sec)
+failed:
+  #1 wrapper (Failed, 0.00 sec)
+    delegating to inner suite
+    1/1 Test #1: inner_case .......................   Passed    0.02 sec
+    ASSERT FAILED: wrapper post-check"#
+        );
+    }
+
+    #[test]
+    fn most_frequent_counter_drops_nested_result_without_summary() {
+        let input = r#"Test project /tmp/build
+    Start 1: wrapper
+1/2 Test #1: wrapper ..........................***Failed    0.00 sec
+delegating to inner suite
+1/1 Test #1: inner_case .......................   Passed    0.02 sec
+ASSERT FAILED: wrapper post-check
+    Start 2: other
+2/2 Test #2: other ............................   Passed    0.00 sec
+"#;
+
+        assert_eq!(
+            filter_ctest_output(input),
+            r#"ctest: 1/2 passed, 1 failed
+failed:
+  #1 wrapper (Failed, 0.00 sec)
+    delegating to inner suite
+    1/1 Test #1: inner_case .......................   Passed    0.02 sec
+    ASSERT FAILED: wrapper post-check"#
+        );
+    }
+
+    #[test]
+    fn folded_failure_lines_count_toward_the_physical_line_cap() {
+        let input = r#"Test project /tmp/build
+    Start 1: failing_case
+1/2 Test #1: failing_case .....................***Failed    0.00 sec
+Test #99: phase begin
+L1
+L2
+L3
+L4
+L5
+L6
+phase done in 1.5 sec
+extra 1
+extra 2
+extra 3
+    Start 2: passing_case
+2/2 Test #2: passing_case .....................   Passed    0.00 sec
+
+50% tests passed, 1 tests failed out of 2
+"#;
+
+        let (rendered, _, truncated) = failed_section_parts(input);
+
+        assert!(truncated);
+        assert!(rendered.contains("... +1 more lines"));
     }
 
     #[test]
@@ -1191,7 +1417,7 @@ Errors while running CTest"#
     Test #12: flaky_case .......................   Passed    0.00 sec
 "#;
 
-        let tests = parse_tests(&build_logical_lines(output));
+        let tests = parse_tests(&build_logical_lines(output)).tests;
 
         assert_eq!(tests.len(), 1);
         assert_eq!(tests[0].number, 12);
@@ -1210,7 +1436,7 @@ Errors while running CTest"#
             "    Start 2: following_case\n2/2 Test #2: following_case ...................   Passed    0.01 sec\n\n50% tests passed, 1 tests failed out of 2\n\nTotal Test time (real) =   0.01 sec\n",
         );
 
-        let tests = parse_tests(&build_logical_lines(&output));
+        let tests = parse_tests(&build_logical_lines(&output)).tests;
 
         assert_eq!(tests.len(), 1);
         assert_eq!(tests[0].name, "following_case");
