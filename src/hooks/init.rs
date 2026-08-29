@@ -4248,7 +4248,7 @@ pub fn run_gemini(
     }
 
     // 3. Patch ~/.gemini/settings.json
-    patch_gemini_settings(&gemini_dir, &hook_path, patch_mode, ctx)?;
+    let settings_parse_failed = patch_gemini_settings(&gemini_dir, &hook_path, patch_mode, ctx)?;
 
     if dry_run {
         print_dry_run_footer();
@@ -4257,6 +4257,9 @@ pub fn run_gemini(
         println!("  Hook: {}", hook_path.display());
         if !hook_only {
             println!("  GEMINI.md: {}", gemini_dir.join(GEMINI_MD).display());
+        }
+        if settings_parse_failed {
+            println!("  settings.json: NOT patched (existing file could not be parsed; see warning above)");
         }
         println!("  Restart Gemini CLI. Test with: git status\n");
     }
@@ -4274,13 +4277,18 @@ fn print_gemini_manual_setup(settings_path: &Path) {
     );
 }
 
-/// Patch ~/.gemini/settings.json with the BeforeTool hook
+/// Patch ~/.gemini/settings.json with the BeforeTool hook.
+///
+/// Returns `Ok(true)` when the existing settings.json could not be parsed
+/// (so the caller can tell an honest "hook installed, settings.json NOT
+/// patched" apart from every other reason nothing changed — already
+/// patched, `PatchMode::Skip`, declined at the `Ask` prompt, dry-run).
 fn patch_gemini_settings(
     gemini_dir: &Path,
     hook_path: &Path,
     patch_mode: PatchMode,
     ctx: InitContext,
-) -> Result<()> {
+) -> Result<bool> {
     let InitContext { verbose, dry_run } = ctx;
     let settings_path = gemini_dir.join(SETTINGS_JSON);
     let hook_cmd = hook_path.to_string_lossy().to_string();
@@ -4308,7 +4316,7 @@ fn patch_gemini_settings(
                         e
                     );
                     print_gemini_manual_setup(&settings_path);
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
@@ -4327,7 +4335,7 @@ fn patch_gemini_settings(
                 if verbose > 0 {
                     eprintln!("Gemini settings.json already has RTK hook");
                 }
-                return Ok(());
+                return Ok(false);
             }
         }
     }
@@ -4335,7 +4343,7 @@ fn patch_gemini_settings(
     // Ask user before patching
     if patch_mode == PatchMode::Skip {
         print_gemini_manual_setup(&settings_path);
-        return Ok(());
+        return Ok(false);
     }
 
     if patch_mode == PatchMode::Ask {
@@ -4351,7 +4359,7 @@ fn patch_gemini_settings(
             std::io::stdin().read_line(&mut answer)?;
             if !answer.trim().eq_ignore_ascii_case("y") {
                 println!("Skipped. Add hook manually later.");
-                return Ok(());
+                return Ok(false);
             }
         }
     }
@@ -4393,7 +4401,7 @@ fn patch_gemini_settings(
         if verbose > 0 {
             println!("[dry-run] content:\n{}", content);
         }
-        return Ok(());
+        return Ok(false);
     }
 
     // Write atomically
@@ -4406,7 +4414,7 @@ fn patch_gemini_settings(
         eprintln!("Patched {}", settings_path.display());
     }
 
-    Ok(())
+    Ok(false)
 }
 
 /// Remove Gemini artifacts during uninstall
@@ -6998,8 +7006,11 @@ mod tests {
         // patch_gemini_settings runs, run_gemini has already written the hook
         // script, GEMINI.md, and the integrity baseline, so aborting here
         // would leave a half-installed state with no summary. Treat it like
-        // PatchMode::Skip: warn and continue, same as Skip's Ok(()) return,
-        // and critically still never overwrite the unparsed file.
+        // PatchMode::Skip: warn and continue, and critically still never
+        // overwrite the unparsed file. Unlike Skip (and every other
+        // non-patch outcome), this path returns Ok(true) so run_gemini's
+        // final summary can honestly say settings.json was NOT patched
+        // instead of implying full success.
         let tmp = TempDir::new().unwrap();
         let gemini_dir = tmp.path().join(".gemini");
         fs::create_dir_all(&gemini_dir).unwrap();
@@ -7015,9 +7026,8 @@ mod tests {
         );
 
         assert!(
-            result.is_ok(),
-            "unparseable settings.json must not abort the install: {:?}",
-            result.err()
+            result.unwrap(),
+            "parse failure must be signaled so the summary can say settings.json was NOT patched"
         );
 
         let content = fs::read_to_string(&settings_path).unwrap();

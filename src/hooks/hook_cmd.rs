@@ -233,17 +233,46 @@ pub fn run_gemini() -> Result<()> {
     Ok(())
 }
 
-/// Parse the Gemini BeforeTool stdin payload, decide, and render the
-/// response JSON — no stdin/stdout I/O. Used by `run_gemini` itself (not
-/// just tests), so a regression here (e.g. dropping the BOM strip) fails
-/// for real rather than only in a duplicate test copy.
-fn run_gemini_inner(input: &str) -> Option<String> {
+/// Parse the Gemini BeforeTool stdin payload, decide (against the real,
+/// on-disk Gemini settings), and render the response JSON — no stdin/stdout
+/// I/O. Used by `run_gemini` itself (not just tests), so a regression here
+/// (e.g. dropping the BOM strip) fails for real rather than only in a
+/// duplicate test copy.
+fn run_gemini_inner(input: &str) -> serde_json::Result<String> {
+    run_gemini_inner_impl(input, |cmd| {
+        decide_hook_action(cmd, permissions::Host::Gemini)
+    })
+}
+
+/// Same parse/render path as `run_gemini_inner`, but with the permission
+/// decision driven by explicit rule slices instead of `~/.gemini/settings.json`
+/// — lets tests exercise the real BOM-stripping/parsing logic without
+/// depending on (or being broken by) whatever is on disk at HOME.
+#[cfg(test)]
+fn run_gemini_inner_with_rules(
+    input: &str,
+    deny: &[String],
+    ask: &[String],
+    allow: &[String],
+) -> serde_json::Result<String> {
+    run_gemini_inner_impl(input, |cmd| {
+        decide_from_verdict(
+            cmd,
+            permissions::check_command_with_rules(cmd, deny, ask, allow),
+        )
+    })
+}
+
+fn run_gemini_inner_impl(
+    input: &str,
+    decide: impl Fn(&str) -> HookDecision,
+) -> serde_json::Result<String> {
     let input = strip_leading_bom(input);
-    let json: Value = serde_json::from_str(input).ok()?;
+    let json: Value = serde_json::from_str(input)?;
 
     let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
     if tool_name != "run_shell_command" {
-        return Some(gemini_json("allow", None));
+        return Ok(gemini_json("allow", None));
     }
 
     let cmd = json
@@ -251,10 +280,10 @@ fn run_gemini_inner(input: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if cmd.is_empty() {
-        return Some(gemini_json("allow", None));
+        return Ok(gemini_json("allow", None));
     }
 
-    Some(match decide_hook_action(cmd, permissions::Host::Gemini) {
+    Ok(match decide(cmd) {
         HookDecision::Deny => {
             r#"{"decision":"deny","reason":"Blocked by RTK permission rule"}"#.to_string()
         }
@@ -1478,22 +1507,41 @@ mod tests {
         // Windows hosts may prepend a UTF-8 BOM to hook stdin (confirmed for
         // Cursor; run_gemini must survive it too). Without stripping,
         // serde_json rejects the payload, `rtk hook gemini` exits non-zero,
-        // and the tool call is blocked. Goes through the real
-        // run_gemini_inner (also used by production run_gemini), not a
-        // test-local copy of the parse logic.
+        // and the tool call is blocked.
+        //
+        // Uses run_gemini_inner_with_rules (explicit allow-all rules) rather
+        // than run_gemini_inner: the latter's decide_hook_action reads the
+        // REAL ~/.gemini/settings.json (and project .gemini/settings.json),
+        // making the decision assertion depend on whatever is on the
+        // machine running the test. Both share the same parse/strip/render
+        // core (run_gemini_inner_impl) that production run_gemini uses, so
+        // this still exercises the real BOM-stripping path.
         let payload = json!({
             "tool_name": "run_shell_command",
             "tool_input": { "command": "git status" }
         })
         .to_string();
         let with_bom = format!("\u{feff}{payload}");
-        let result = run_gemini_inner(&with_bom).expect("BOM-prefixed payload must parse");
+        let result = run_gemini_inner_with_rules(&with_bom, &[], &[], &all_allowed())
+            .expect("BOM-prefixed payload must parse");
         let v: Value = serde_json::from_str(&result).unwrap();
-        // No config in the test environment: default-to-ask semantics.
-        assert_eq!(v["decision"], "ask_user");
+        assert_eq!(v["decision"], "allow");
         assert_eq!(
             v["hookSpecificOutput"]["tool_input"]["command"],
             "rtk git status"
+        );
+    }
+
+    #[test]
+    fn test_gemini_inner_preserves_serde_diagnostic() {
+        // run_gemini_inner must return the serde_json error itself (not
+        // discard it via `.ok()`), so run_gemini's `.context(...)` has a
+        // real source to chain instead of only the generic wrapper message.
+        let err = run_gemini_inner("not valid json {{{").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("line") && msg.contains("column"),
+            "expected serde_json's own parse diagnostic, got: {msg}"
         );
     }
 

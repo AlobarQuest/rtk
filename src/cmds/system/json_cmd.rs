@@ -5,6 +5,7 @@ use crate::core::tracking;
 use crate::core::utils::{from_json_str, strip_leading_bom};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
@@ -85,14 +86,29 @@ pub fn run_stdin(max_depth: usize, schema_only: bool, verbose: u8) -> Result<()>
 /// against the *stripped* content — otherwise a raw fallback would still
 /// carry the BOM into piped output (`rtk json foo.json | jq .` failing to
 /// parse it) even though `filter_json_*` already tolerates a BOM on input.
-fn render_json(content: &str, max_depth: usize, schema_only: bool) -> Result<String> {
+///
+/// Returns `Cow` rather than an owned `String`: the raw-fallback case can
+/// then stay a zero-copy borrow of `content` instead of paying for another
+/// full copy of the (potentially large) input on every fallback.
+fn render_json<'a>(
+    content: &'a str,
+    max_depth: usize,
+    schema_only: bool,
+) -> Result<Cow<'a, str>> {
     let content = strip_leading_bom(content);
     let output = if schema_only {
         filter_json_string(content, max_depth)?
     } else {
         filter_json_compact(content, max_depth)?
     };
-    Ok(never_worse(content, &output).to_string())
+    let shown = never_worse(content, &output);
+    // never_worse returns one of its two inputs verbatim (no allocation);
+    // compare addresses to tell which, instead of re-deriving the decision.
+    Ok(if std::ptr::eq(shown.as_ptr(), content.as_ptr()) {
+        Cow::Borrowed(content)
+    } else {
+        Cow::Owned(output)
+    })
 }
 
 /// Parse a JSON string and return compact representation with values preserved.
@@ -397,7 +413,12 @@ mod tests {
         // reading stdin. It must strip internally, not rely on the caller.
         let shown = render_json(raw, 5, false).expect("must render");
 
-        // Sanity: this exercises the raw-fallback path, not the filtered one.
+        // Sanity: this exercises the raw-fallback path (a zero-copy borrow
+        // of the stripped content), not the filtered/owned one.
+        assert!(
+            matches!(shown, Cow::Borrowed(_)),
+            "raw fallback should borrow, not allocate: {shown:?}"
+        );
         assert_eq!(shown, stripped, "expected the raw (BOM-stripped) fallback");
         assert!(
             !shown.starts_with('\u{feff}'),
