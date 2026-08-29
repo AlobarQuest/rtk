@@ -10,17 +10,13 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
 
-/// Unparseable failure output is limited to this many non-empty lines, split
-/// between head and tail. The runner tees the full raw output and prints a
-/// recovery hint, so the hidden middle stays reachable, with two exceptions the
-/// cap accounts for: output under `MIN_TEE_SIZE` bytes gets no tee, so it is
-/// printed whole; and with tee disabled (`RTK_TEE=0` or
-/// `config.tee.enabled = false`) these lines are the only surviving copy, which
-/// is why both ends are kept.
+/// Cap on the non-empty lines kept when RTK cannot parse failure output. With
+/// tee disabled (`RTK_TEE=0`, `config.tee.enabled = false`) these lines are the
+/// only surviving copy of the failure.
 const MAX_UNPARSED_LINES: usize = CAP_WARNINGS;
-/// Deviation: tsc and npx print the cause first (`Unknown compiler option`,
-/// `This is not the tsc command`) and boilerplate after it, so a plain tail
-/// would drop the cause; split the cap between head and tail.
+/// tsc and npx print the cause first (`Unknown compiler option`, `This is not
+/// the tsc command`) and boilerplate after it, so spending the whole cap on a
+/// tail would drop the cause.
 const MAX_UNPARSED_HEAD_LINES: usize = reduced(MAX_UNPARSED_LINES, 5);
 
 static TSC_ERROR: LazyLock<Regex> = LazyLock::new(|| {
@@ -67,7 +63,6 @@ fn parse_diagnostic(line: &str) -> Option<Diagnostic<'_>> {
     })
 }
 
-/// One line of the raw failure dump: width-capped like every other emission.
 fn push_dump_line(summary: &mut String, line: &str) {
     summary.push_str(&truncate(line, 120));
     summary.push('\n');
@@ -128,8 +123,7 @@ impl TscHandler {
 
 impl BlockHandler for TscHandler {
     /// `--pretty` wraps every field in ANSI escapes; strip them once so
-    /// matching and the emitted block both see plain text. Plain lines are
-    /// passed through without allocating.
+    /// matching and the emitted block both see plain text.
     fn normalize_line<'a>(&self, line: &'a str) -> Cow<'a, str> {
         clean_line(line)
     }
@@ -165,8 +159,8 @@ impl BlockHandler for TscHandler {
             }
             // tsc failed without one diagnostic RTK understands (missing binary,
             // no project, unparseable output). "No errors found" would be a
-            // false green, so report the failure with the head and tail of the
-            // raw output; only the retained lines are ANSI-stripped.
+            // false green, so surface the failure with both ends of the raw
+            // output.
             let mut summary = format!(
                 "TypeScript: compiler exited with code {exit_code}, but RTK parsed no diagnostics\n"
             );

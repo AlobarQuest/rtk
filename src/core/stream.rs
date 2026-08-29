@@ -1025,8 +1025,7 @@ pub(crate) mod tests {
 
     #[test]
     fn block_handler_normalize_line_feeds_matching_and_emission() {
-        // The handler matches on the normalized line and the emitted block is
-        // the normalized text, so normalization happens exactly once per line.
+        // Both the match and the emitted block see the normalized line.
         let mut f = BlockStreamFilter::new(UpperHandler);
         let out = run_block_filter(&mut f, "err: one\n  detail\nnoise\n", 0);
         assert_eq!(out, "ERR: ONE\n  DETAIL\n");
