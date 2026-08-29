@@ -12,7 +12,6 @@ use crate::core::truncate::{self, CAP_LIST, CAP_WARNINGS};
 use crate::core::utils::{resolved_command, strip_ansi};
 
 const MAX_SLOWEST: usize = 3;
-const MAX_RESULT_CONTINUATION_LINES: usize = 8;
 const MAX_FAILURE_LINES: usize = CAP_WARNINGS;
 const MAX_FAILURE_HEAD_LINES: usize = 2;
 const MAX_FAILED_LIST_LINES: usize = CAP_LIST;
@@ -109,10 +108,15 @@ fn should_passthrough(args: &[String]) -> bool {
                 | "--debug"
                 | "--show-only"
                 | "--print-labels"
+                | "--dashboard"
                 | "-M"
+                | "--test-model"
                 | "-T"
+                | "--test-action"
                 | "-S"
+                | "--script"
                 | "-SP"
+                | "--script-new-process"
                 | "--build-and-test"
         ) || arg.starts_with("-D")
             || arg.starts_with("--show-only=")
@@ -215,11 +219,8 @@ fn build_logical_lines(output: &str) -> Vec<String> {
         }
 
         let mut result_end = None;
-        for continuation in 1..=MAX_RESULT_CONTINUATION_LINES {
-            let continuation_index = index + continuation;
-            let Some(continuation_line) = physical_lines.get(continuation_index) else {
-                break;
-            };
+        let mut continuation_index = index + 1;
+        while let Some(continuation_line) = physical_lines.get(continuation_index) {
             if START_RE.is_match(continuation_line)
                 || RESULT_PREFIX_RE.is_match(continuation_line)
                 || parse_summary(continuation_line).is_some()
@@ -230,6 +231,7 @@ fn build_logical_lines(output: &str) -> Vec<String> {
                 result_end = Some(continuation_index);
                 break;
             }
+            continuation_index += 1;
         }
 
         if let Some(end) = result_end {
@@ -248,29 +250,18 @@ fn is_no_tests_line(line: &str) -> bool {
     line.trim() == "No tests were found!!!"
 }
 
-/// Result lines are trusted only when their `N/M` total matches the run: a
-/// test that forwards a nested ctest run echoes result lines carrying the
-/// nested suite's own total, which must neither replace a real record nor
-/// bound a failure block. The run total comes from the final summary when
-/// there is one (reconciled for disabled tests, see below) and otherwise from
-/// the most frequent counter. `--repeat` retries carry no counter and repeat
-/// both number and name, so dedup keys on the pair and the last result wins.
+/// Result lines are trusted only when their `N/M` total matches the first result
+/// line that carries one. CTest prints its own result before any test output in
+/// serial and `-j` modes, so that first total identifies the run and excludes
+/// forwarded nested suites; counterless `--repeat` retries remain valid. Retries
+/// repeat both number and name, so dedup keys on the pair and the last result wins.
 fn parse_tests(lines: &[String]) -> ParsedTests {
     let candidates: Vec<TestCase> = lines
         .iter()
         .enumerate()
         .filter_map(|(line_index, line)| parse_test_line(line, line_index))
         .collect();
-    let most_frequent_total = most_frequent_counter_total(&candidates);
-    let run_total = lines
-        .iter()
-        .rev()
-        .find_map(|line| parse_summary(line))
-        .and_then(|summary| u32::try_from(summary.total).ok())
-        .map(|summary_total| {
-            counter_total_with_disabled_tests(summary_total, most_frequent_total, &candidates)
-        })
-        .or(most_frequent_total);
+    let run_total = candidates.iter().find_map(|test| test.counter_total);
 
     let mut tests: Vec<TestCase> = Vec::new();
     let mut result_lines = Vec::new();
@@ -293,53 +284,6 @@ fn parse_tests(lines: &[String]) -> ParsedTests {
     ParsedTests {
         tests,
         result_lines,
-    }
-}
-
-/// Ties keep the first total seen: ctest prints the run's own result lines
-/// before any output a test could forward.
-fn most_frequent_counter_total(candidates: &[TestCase]) -> Option<u32> {
-    let mut counts: Vec<(u32, usize)> = Vec::new();
-    for total in candidates.iter().filter_map(|test| test.counter_total) {
-        if let Some((_, count)) = counts.iter_mut().find(|(candidate, _)| *candidate == total) {
-            *count += 1;
-        } else {
-            counts.push((total, 1));
-        }
-    }
-
-    counts
-        .into_iter()
-        .reduce(|most_frequent, candidate| {
-            if candidate.1 > most_frequent.1 {
-                candidate
-            } else {
-                most_frequent
-            }
-        })
-        .map(|(total, _)| total)
-}
-
-/// CTest includes disabled tests in the `N/M` counter but excludes them from
-/// the summary total. Reconcile that documented mismatch before validation.
-fn counter_total_with_disabled_tests(
-    summary_total: u32,
-    most_frequent_total: Option<u32>,
-    candidates: &[TestCase],
-) -> u32 {
-    let Some(counter_total) = most_frequent_total else {
-        return summary_total;
-    };
-    let disabled_tests: HashSet<(u32, &str)> = candidates
-        .iter()
-        .filter(|test| test.counter_total == Some(counter_total) && test.is_disabled())
-        .map(|test| (test.number, test.name.as_str()))
-        .collect();
-    let disabled_count = u32::try_from(disabled_tests.len()).ok();
-
-    match disabled_count.and_then(|count| summary_total.checked_add(count)) {
-        Some(total_with_disabled) if total_with_disabled == counter_total => counter_total,
-        _ => summary_total,
     }
 }
 
@@ -472,6 +416,11 @@ fn format_failure(
     total_time: Option<f64>,
 ) -> String {
     let failed_tests: Vec<&TestCase> = tests.iter().filter(|test| test.is_failure()).collect();
+    let unparsed_failed_entries = summary
+        .filter(|summary| summary.failed > failed_tests.len())
+        .map_or_else(Vec::new, |_| {
+            collect_unparsed_failed_entries(lines, framing_lines, &failed_tests)
+        });
     let failed = summary.map_or(failed_tests.len(), |s| s.failed);
     let total = summary.map_or(tests.len(), |s| s.total);
     let skipped = tests.iter().filter(|test| test.is_skipped()).count();
@@ -496,6 +445,10 @@ fn format_failure(
             &failed_tests,
             framing_lines,
         ));
+    }
+    if !unparsed_failed_entries.is_empty() {
+        out.push('\n');
+        out.push_str(&format_unparsed_failed_section(&unparsed_failed_entries));
     }
     append_skipped_list(&mut out, tests);
 
@@ -695,10 +648,66 @@ fn collect_failure_block(
     block
 }
 
-fn collect_failed_trailer(lines: &[String], framing_lines: &HashSet<usize>) -> Vec<String> {
-    let Some(start) = (0..lines.len()).rev().find(|index| {
+fn failed_trailer_start(lines: &[String], framing_lines: &HashSet<usize>) -> Option<usize> {
+    (0..lines.len()).rev().find(|index| {
         framing_lines.contains(index) && lines[*index].trim() == "The following tests FAILED:"
-    }) else {
+    })
+}
+
+fn collect_unparsed_failed_entries(
+    lines: &[String],
+    framing_lines: &HashSet<usize>,
+    parsed_failed_tests: &[&TestCase],
+) -> Vec<String> {
+    let Some(start) = failed_trailer_start(lines, framing_lines) else {
+        return Vec::new();
+    };
+    let parsed_numbers: HashSet<u32> = parsed_failed_tests
+        .iter()
+        .map(|test| test.number)
+        .collect();
+
+    lines[start + 1..]
+        .iter()
+        .filter(|line| line.starts_with('\t'))
+        .map(|line| line.trim().to_string())
+        .filter(|entry| {
+            entry
+                .split_whitespace()
+                .next()
+                .and_then(|number| number.parse::<u32>().ok())
+                .is_none_or(|number| !parsed_numbers.contains(&number))
+        })
+        .collect()
+}
+
+fn format_unparsed_failed_section(entries: &[String]) -> String {
+    let formatted_entries: Vec<String> = entries
+        .iter()
+        .map(|entry| format!("    {entry}"))
+        .collect();
+    let mut section = String::from("failed (unparsed, raw):");
+    for entry in formatted_entries.iter().take(MAX_FAILED_LIST_LINES) {
+        section.push('\n');
+        section.push_str(entry);
+    }
+    if formatted_entries.len() > MAX_FAILED_LIST_LINES {
+        let hidden = formatted_entries.len() - MAX_FAILED_LIST_LINES;
+        section.push_str(&format!("\n    ... +{hidden} more failed"));
+        let all_entries_joined = formatted_entries.join("\n");
+        if let Some(hint) = crate::core::tee::force_tee_tail_hint(
+            &all_entries_joined,
+            "ctest-failed-raw",
+            MAX_FAILED_LIST_LINES + 1,
+        ) {
+            section.push_str(&format!("\n    {hint}"));
+        }
+    }
+    section
+}
+
+fn collect_failed_trailer(lines: &[String], framing_lines: &HashSet<usize>) -> Vec<String> {
+    let Some(start) = failed_trailer_start(lines, framing_lines) else {
         return Vec::new();
     };
     let mut trailer: Vec<String> = lines[start + 1..]
@@ -780,6 +789,54 @@ failed:
 Errors while running CTest
 Use "--rerun-failed --output-on-failure" to re-run the failed cases verbosely."#
         );
+    }
+
+    #[test]
+    fn reports_unparsed_failure_from_raw_trailer() {
+        let input = r#"Test project /tmp/build
+    Start 1: broken
+1/1 Test #1: broken ...........................***Failed
+
+0% tests passed, 1 tests failed out of 1
+
+The following tests FAILED:
+	  1 - broken (Failed)
+"#;
+
+        assert_eq!(
+            filter_ctest_output(input),
+            r#"ctest: 0/1 passed, 1 failed
+failed (unparsed, raw):
+    1 - broken (Failed)"#
+        );
+    }
+
+    #[test]
+    fn omits_raw_failure_when_parsed_failures_cover_summary() {
+        let input = r#"Test project /tmp/build
+    Start 1: broken
+1/1 Test #1: broken ...........................***Failed    0.00 sec
+REAL-EVIDENCE-broken
+
+0% tests passed, 1 tests failed out of 1
+
+The following tests FAILED:
+	  1 - broken (Failed)
+Errors while running CTest
+"#;
+
+        let filtered = filter_ctest_output(input);
+
+        assert_eq!(
+            filtered,
+            r#"ctest: 0/1 passed, 1 failed
+failed:
+  #1 broken (Failed, 0.00 sec)
+    REAL-EVIDENCE-broken
+
+Errors while running CTest"#
+        );
+        assert!(!filtered.contains("failed (unparsed, raw):"));
     }
 
     #[test]
@@ -900,10 +957,15 @@ Total Test time (real) =   0.01 sec
         for dashboard_arg in [
             "-D",
             "-DExperimental",
+            "--dashboard",
             "-M",
+            "--test-model",
             "-T",
+            "--test-action",
             "-S",
+            "--script",
             "-SP",
+            "--script-new-process",
             "--build-and-test",
         ] {
             assert!(should_passthrough(&[dashboard_arg.to_string()]));
@@ -973,6 +1035,43 @@ failed:
   #4 regex_fail (Failed, 0.00 sec)
     Required regular expression not found. Regex=[expected-token]
     nope
+
+Errors while running CTest"#
+        );
+    }
+
+    #[test]
+    fn filters_stop_on_failure_fixture() {
+        let input = include_str!("../../../tests/fixtures/ctest_stop_on_failure_raw.txt");
+
+        assert_eq!(
+            filter_ctest_output(input),
+            r#"ctest: 1/2 passed, 1 failed (0.01 sec)
+failed:
+  #2 b_fail (Failed, 0.00 sec)
+    REAL-EVIDENCE-b_fail-broke
+
+Errors while running CTest"#
+        );
+    }
+
+    #[test]
+    fn folds_long_wrapped_regex_result_fixture() {
+        let input = include_str!("../../../tests/fixtures/ctest_long_regex_list_raw.txt");
+
+        assert_eq!(
+            filter_ctest_output(input),
+            r#"ctest: 0/3 passed, 3 failed (0.01 sec)
+failed:
+  #2 b_fail (Failed, 0.00 sec)
+    REAL-EVIDENCE-b_fail-broke
+  #8 a_fail (Failed, 0.00 sec)
+    Error regular expression found in output. Regex=[EVIDENCE]
+    REAL FAILURE EVIDENCE for a_fail
+    EVIDENCE
+  #9 b_regex (Failed, 0.00 sec)
+    Required regular expression not found. Regex=[r1 r2 r3 r4 r5 r6 r7 r8 r9 r10]
+    hello from b_regex
 
 Errors while running CTest"#
         );
@@ -1064,7 +1163,7 @@ failed:
     }
 
     #[test]
-    fn most_frequent_counter_drops_nested_result_without_summary() {
+    fn first_counter_total_drops_nested_result_without_summary() {
         let input = r#"Test project /tmp/build
     Start 1: wrapper
 1/2 Test #1: wrapper ..........................***Failed    0.00 sec
@@ -1083,6 +1182,31 @@ failed:
     delegating to inner suite
     1/1 Test #1: inner_case .......................   Passed    0.02 sec
     ASSERT FAILED: wrapper post-check"#
+        );
+    }
+
+    #[test]
+    fn first_counter_total_rejects_forwarded_suite_in_killed_run() {
+        let input = r#"Test project /tmp/build
+    Start 1: outer
+1/2 Test #1: outer ............................***Failed    0.00 sec
+forwarding inner suite:
+1/3 Test #1: inner_a ..........................   Passed    0.01 sec
+2/3 Test #2: inner_b ..........................   Passed    0.01 sec
+3/3 Test #3: inner_c ..........................   Passed    0.01 sec
+    Start 2: other
+2/2 Test #2: other ............................   Passed    0.00 sec
+"#;
+
+        assert_eq!(
+            filter_ctest_output(input),
+            r#"ctest: 1/2 passed, 1 failed
+failed:
+  #1 outer (Failed, 0.00 sec)
+    forwarding inner suite:
+    1/3 Test #1: inner_a ..........................   Passed    0.01 sec
+    2/3 Test #2: inner_b ..........................   Passed    0.01 sec
+    3/3 Test #3: inner_c ..........................   Passed    0.01 sec"#
         );
     }
 
@@ -1361,6 +1485,38 @@ Errors while running CTest"#
         );
         assert!(full_section.contains("detail 25.30"));
         assert!(!full_section.contains("... +"));
+    }
+
+    #[test]
+    fn caps_unparsed_raw_failed_entries_with_recovery_hint() {
+        let mut input = String::from(
+            "Test project /tmp/build\n\n0% tests passed, 25 tests failed out of 25\n\nThe following tests FAILED:\n",
+        );
+        for number in 1..=25 {
+            input.push_str(&format!("\t  {number} - broken_{number} (Failed)\n"));
+        }
+
+        let filtered = filter_ctest_output(&input);
+
+        assert_eq!(
+            filtered
+                .lines()
+                .filter(|line| {
+                    line.strip_prefix("    ")
+                        .and_then(|entry| entry.chars().next())
+                        .is_some_and(|first| first.is_ascii_digit())
+                })
+                .count(),
+            MAX_FAILED_LIST_LINES
+        );
+        assert!(filtered.contains("    ... +5 more failed"));
+        assert_eq!(
+            filtered
+                .lines()
+                .filter(|line| line.trim_start().starts_with("[see remaining:"))
+                .count(),
+            1
+        );
     }
 
     #[test]
