@@ -2,7 +2,7 @@
 
 use crate::core::guard::never_worse;
 use crate::core::tracking;
-use crate::core::utils::strip_leading_bom;
+use crate::core::utils::from_json_str;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::fs;
@@ -94,7 +94,7 @@ pub fn run_stdin(max_depth: usize, schema_only: bool, verbose: u8) -> Result<()>
 /// Long strings are truncated, arrays are summarized.
 pub fn filter_json_compact(json_str: &str, max_depth: usize) -> Result<String> {
     let value: Value =
-        serde_json::from_str(strip_leading_bom(json_str)).context("Failed to parse JSON")?;
+        from_json_str(json_str).context("Failed to parse JSON")?;
     Ok(compact_json(&value, 0, max_depth))
 }
 
@@ -186,7 +186,7 @@ fn compact_json(value: &Value, depth: usize, max_depth: usize) -> String {
 /// Useful for piping JSON from other commands (e.g., `gh api`, `curl`).
 pub fn filter_json_string(json_str: &str, max_depth: usize) -> Result<String> {
     let value: Value =
-        serde_json::from_str(strip_leading_bom(json_str)).context("Failed to parse JSON")?;
+        from_json_str(json_str).context("Failed to parse JSON")?;
     Ok(extract_schema(&value, 0, max_depth))
 }
 

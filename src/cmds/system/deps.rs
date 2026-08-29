@@ -136,9 +136,8 @@ fn summarize_cargo_str(path: &Path) -> Result<String> {
 fn summarize_package_json_str(path: &Path) -> Result<String> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let json: serde_json::Value =
-        serde_json::from_str(crate::core::utils::strip_leading_bom(&content))
-            .with_context(|| format!("Failed to parse {}", path.display()))?;
+    let json: serde_json::Value = crate::core::utils::from_json_str(&content)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
     let mut out = String::new();
 
     if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
