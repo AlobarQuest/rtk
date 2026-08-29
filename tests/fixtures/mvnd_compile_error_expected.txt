@@ -1,7 +1,3 @@
----
-source: src/cmds/jvm/mvn_cmd.rs
-expression: filter_compile(i)
----
 [INFO] Scanning for projects...
 [INFO] -----------------< com.example.rtk:multifail-skeleton >-----------------
 [INFO] Building multifail-skeleton 1.0.0-SNAPSHOT

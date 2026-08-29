@@ -1,7 +1,3 @@
----
-source: src/cmds/jvm/mvn_cmd.rs
-expression: filter_package(i)
----
 [INFO] Scanning for projects...
 [multi-module-skeleton] [INFO] ---------------< com.example.rtk:multi-module-skeleton >----------------
 [multi-module-skeleton] [INFO] Building multi-module-skeleton 1.0.0-SNAPSHOT                      [1/3]

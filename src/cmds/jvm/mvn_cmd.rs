@@ -274,8 +274,9 @@ fn lane_rest_level(rest: &str) -> Option<&str> {
 /// Whether `core` (the tag-stripped remainder of a candidate lane-keyed
 /// line) is a genuine Maven/mvnd module-establishing line: a test class
 /// starting (`RUNNING`), a plugin or module banner, a `Building` line, a
-/// per-class result (`CLOSE`), or an `[ERROR]` diagnostic (compiler errors
-/// are always the first line mvnd emits for a module that fails to
+/// per-class result (`CLOSE`), or a genuine compiler diagnostic — a
+/// `file.java:[line,col]`-coordinate `[ERROR]` line ([`FILE_COORD`]; compiler
+/// errors are always the first line mvnd emits for a module that fails to
 /// compile — there is no `RUNNING`/`Building` line first). `[tag] [LEVEL] …`
 /// is syntactically identical whether `tag` is a real mvnd module or an
 /// application thread/timestamp caught in test-captured stdout (see
@@ -284,22 +285,44 @@ fn lane_rest_level(rest: &str) -> Option<&str> {
 /// module tags are always *introduced* by one of these lines before any
 /// other content appears under them, so this is the signal
 /// [`Lanes::route`] uses to admit a never-seen tag as a new lane rather
-/// than falling back to raw-line ownership. An `[ERROR]`-shaped app log on
-/// a never-seen tag (e.g. `[Server] [ERROR] connection refused`) still
-/// mints a lane — but that lane is inert: a continuation claim only ever
-/// arms on a genuine compiler diagnostic (see the `FILE_COORD` guard at
-/// each `keep_continuation` arm site), so a one-off log line can open a
-/// lane without ever contesting routing for it. Lane growth itself is
-/// bounded by [`MAX_LANES`], so an adversarial run of uniquely-tagged
-/// `[ERROR]` lines can mint at most that many lanes, keeping `route`'s scan
-/// O(`MAX_LANES`) regardless of how many distinct tags the input contains.
+/// than falling back to raw-line ownership.
+///
+/// Reviewer finding #1 (upstream PR #3199, second review round): a blanket
+/// `[ERROR]`-prefix rule (no `FILE_COORD` requirement) let *any*
+/// `[ERROR]`-shaped app log on a never-seen tag (e.g. `[Server] [ERROR]
+/// connection refused`) mint a lane. The claim it opens stays inert either
+/// way (a continuation only ever arms on a genuine compiler diagnostic —
+/// see the `FILE_COORD` guard at each `keep_continuation` arm site), but
+/// *minting the lane at all* was itself observable: routed to its own fresh
+/// (empty, `in_block == false`) lane instead of falling back to
+/// [`Lanes::raw_owner`], such a line bypassed whichever other lane's buffered
+/// block was genuinely open around it — written to `out` immediately via the
+/// outside-block keep-list while that other block was still buffering,
+/// re-ordering it ahead of the `Running` line it followed in the input, and
+/// on a green close (block discarded, not written at all) letting it survive
+/// as a stray line the whole rest of the passing block was correctly dropped
+/// for. Requiring `FILE_COORD` here fixes both: a non-diagnostic `[ERROR]`
+/// line on a never-seen tag is no longer an opener, so `route` falls back to
+/// `raw_owner`, which (with exactly one lane's block open) buffers it into
+/// *that* lane at its correct input position — preserved in order on a
+/// failing close, discarded with the rest on a green one. A genuine
+/// `file.java:[line,col]` compiler diagnostic is unaffected (mvnd's
+/// compile-error-first-sight case: no `Running`/`Building` line ever
+/// precedes it). A Surefire close whose module is never otherwise seen
+/// (`[ERROR] Tests run: … <<< FAILURE!`) is unaffected too — it's admitted
+/// by the separate `CLOSE.is_match` arm above, not this one.
+///
+/// Lane growth itself is bounded by [`MAX_LANES`] regardless, so an
+/// adversarial run of uniquely-tagged opener-shaped lines can mint at most
+/// that many lanes, keeping `route`'s scan O(`MAX_LANES`) regardless of how
+/// many distinct tags the input contains.
 fn is_lane_opener(core: &str) -> bool {
     RUNNING.is_match(core)
         || CLOSE.is_match(core)
         || MODULE_BANNER.is_match(core)
         || PLUGIN_BANNER.is_match(core)
         || core.starts_with("[INFO] Building ")
-        || core.starts_with("[ERROR]")
+        || (core.starts_with("[ERROR]") && FILE_COORD.is_match(core))
 }
 
 /// `[ERROR] FQN.method -- Time elapsed: 0.030 s <<< FAILURE!` (or `<<< ERROR!`).
@@ -653,15 +676,31 @@ impl<'a> SurefireBlock<'a> {
 /// [`MAX_MVN_FAILING_CLASSES`] and emit `\n… +N more failures\n` immediately
 /// before the `Tests run:` aggregate when entries were dropped.
 ///
-/// The budget is **reactor-wide within one generation**, not per module: a
-/// parallel reactor emits one summary block per failing module, and each
-/// module's *first* summary in a generation shares that generation's one
-/// running budget — a 20-module reactor still keeps at most `cap` entries
-/// total for that pass, never `modules × cap`, whether the modules'
-/// summaries interleave or run back-to-back. But `mvn verify`/`install` runs
+/// The *budget* (`emitted`, how many entries may still be kept) is
+/// **reactor-wide within one generation**, not per module: a parallel
+/// reactor emits one summary block per failing module, and each module's
+/// *first* summary in a generation shares that generation's one running
+/// budget — a 20-module reactor still keeps at most `cap` entries total for
+/// that pass, never `modules × cap`, whether the modules' summaries
+/// interleave or run back-to-back. But `mvn verify`/`install` runs
 /// Surefire's summary then Failsafe's as two independent generations over
 /// the *same* lanes — a lane's second `[ERROR] Failures:`/`Errors:` header
 /// starts a new generation, not a continuation, so it gets a fresh `cap`.
+///
+/// The *dropped-entry count* backing each `… +N more failures` tail is, by
+/// contrast, **per lane** ([`SurefireLane::dropped`]) — the shared budget
+/// says how many entries total may survive, but which module's entries got
+/// dropped while spending that budget is per-module information, and each
+/// module's own tail must report only its own drops, flushed at its own AGG
+/// line. Reactor-wide `dropped` (the pre-fix design) let whichever lane's
+/// AGG happened to arrive first flush *everyone's* outstanding drops under
+/// its own header and zero the counter for every lane after it — dropping a
+/// module's only failure with no tail to show for it, or crediting one
+/// module's drops to another's summary. Attribution invariant: **a lane's
+/// `… +N more failures` tail reports exactly the entries dropped while that
+/// lane's own summary block was open, no more and no less** — even when
+/// several lanes' summaries interleave and share one budget.
+///
 /// Invariant: **each summary block keeps at most `cap` entries; entries
 /// beyond that collapse to `… +N more failures`** — a generation's budget is
 /// shared reactor-wide the first time each lane opens a summary in it, and a
@@ -670,13 +709,10 @@ impl<'a> SurefireBlock<'a> {
 /// header that then interleaves before the reset lane's `AGG` is treated as
 /// that lane's first sighting *in the new generation* (no second reset) —
 /// otherwise an interleaved reactor could double-reset mid-generation and
-/// let one still-open block emit up to `2 × cap` entries. `dropped` alone
-/// additionally resets when a tail is emitted, so each `… +N more` reports
-/// the drops since the previous tail.
+/// let one still-open block emit up to `2 × cap` entries.
 struct FailuresSummaryCap {
     cap: usize,
     emitted: usize,
-    dropped: usize,
     /// Lanes that have opened a summary block in the *current generation*.
     /// Cleared and re-seeded with just the triggering lane when the first
     /// repeat header of a generation starts a new one — see
@@ -689,16 +725,25 @@ impl FailuresSummaryCap {
         Self {
             cap,
             emitted: 0,
-            dropped: 0,
             seen_lanes: HashSet::new(),
         }
     }
 
     /// If `core` is an `[ERROR]   ` entry inside the calling lane's failures
-    /// summary, write `line` (the original, module prefix included) — or count
-    /// it as dropped — and return `true` so the caller skips its own keep-list.
-    /// Returns `false` otherwise.
-    fn handle_entry(&mut self, in_summary: bool, core: &str, line: &str, out: &mut String) -> bool {
+    /// summary, write `line` (the original, module prefix included) — or
+    /// increment `dropped` (the calling lane's own pending-drop count) —
+    /// and return `true` so the caller skips its own keep-list. Returns
+    /// `false` otherwise. `emitted` (the reactor-wide shared budget) is the
+    /// only thing that decides keep-vs-drop; `dropped` only tracks *whose*
+    /// tail reports the drop.
+    fn handle_entry(
+        &mut self,
+        in_summary: bool,
+        dropped: &mut usize,
+        core: &str,
+        line: &str,
+        out: &mut String,
+    ) -> bool {
         if !in_summary || !core.starts_with("[ERROR]   ") {
             return false;
         }
@@ -708,7 +753,7 @@ impl FailuresSummaryCap {
             out.push('\n');
             self.emitted += 1;
         } else {
-            self.dropped += 1;
+            *dropped += 1;
         }
         true
     }
@@ -735,7 +780,10 @@ impl FailuresSummaryCap {
     /// let one lane's still-open block emit up to `2 × cap` entries. The
     /// `*in_summary` guard above already prevents a mid-block `Errors:`
     /// header (Maven can emit `Failures:` then `Errors:` as two sections of
-    /// one summary) from being treated as a new generation at all.
+    /// one summary) from being treated as a new generation at all. A lane's
+    /// own `dropped` count is untouched here — it's per-lane and only ever
+    /// reset by that lane's own [`FailuresSummaryCap::handle_aggregate`]
+    /// flush, regardless of generation boundaries.
     fn handle_header(&mut self, line: &str, in_summary: &mut bool, lane: usize) {
         let is_header =
             line.starts_with("[ERROR] Failures:") || line.starts_with("[ERROR] Errors:");
@@ -750,27 +798,26 @@ impl FailuresSummaryCap {
         }
     }
 
-    /// Pre-emit the `… +N more failures` tail when the aggregate
-    /// `[ERROR] Tests run:` line is about to be written, then close this lane's
-    /// summary. Caller writes the AGG line itself afterwards.
-    fn handle_aggregate(&mut self, line: &str, out: &mut String, in_summary: &mut bool) {
+    /// Pre-emit the calling lane's own `… +N more failures` tail (from
+    /// `dropped`, that lane's own pending-drop count — never another lane's)
+    /// when the aggregate `[ERROR] Tests run:` line is about to be written,
+    /// then close this lane's summary and zero its `dropped`. Caller writes
+    /// the AGG line itself afterwards.
+    fn handle_aggregate(
+        &mut self,
+        line: &str,
+        dropped: &mut usize,
+        out: &mut String,
+        in_summary: &mut bool,
+    ) {
         if !*in_summary || !AGG.is_match(line) {
             return;
         }
-        if self.dropped > 0 {
-            out.push_str(&format!("\n… +{} more failures\n", self.dropped));
-            self.dropped = 0;
+        if *dropped > 0 {
+            out.push_str(&format!("\n… +{} more failures\n", dropped));
+            *dropped = 0;
         }
         *in_summary = false;
-    }
-
-    /// End-of-stream tail emission for cases where the AGG line never arrives
-    /// (truncated output). Emits the tail with no trailing newline guard so
-    /// the resulting filtered output is still well-formed.
-    fn finish(&mut self, out: &mut String) {
-        if self.dropped > 0 {
-            out.push_str(&format!("\n… +{} more failures\n", self.dropped));
-        }
     }
 }
 
@@ -778,11 +825,21 @@ impl FailuresSummaryCap {
 /// Surefire block machine, continuation flag, and summary-open flag, because
 /// mvnd interleaves module output line-by-line (a `[child-b]` close can land
 /// between a `[child-a]` `Running` and its close). The failures-summary
-/// *budget* is deliberately not here — see [`FailuresSummaryCap`].
+/// *shared budget* (`emitted`/`cap`) is deliberately not here — see
+/// [`FailuresSummaryCap`] — but each lane's own *pending-drop count*
+/// (`dropped`) is: it must be flushed as that lane's own `… +N more
+/// failures` tail at that lane's own AGG line, never folded into or flushed
+/// by another lane's.
 struct SurefireLane<'a> {
     block: SurefireBlock<'a>,
     keep_continuation: bool,
     in_summary: bool,
+    /// Entries dropped (cap exceeded) while *this* lane's failures summary
+    /// was open, not yet reported in a `… +N more failures` tail. Flushed
+    /// and reset to `0` by [`FailuresSummaryCap::handle_aggregate`] at this
+    /// lane's own AGG line — see the attribution invariant on
+    /// [`FailuresSummaryCap`].
+    dropped: usize,
 }
 
 impl<'a> SurefireLane<'a> {
@@ -791,6 +848,7 @@ impl<'a> SurefireLane<'a> {
             block: SurefireBlock::new(),
             keep_continuation: false,
             in_summary: false,
+            dropped: 0,
         }
     }
 }
@@ -949,6 +1007,20 @@ impl<'a> Lanes<'a> {
             lane.block.finish(out);
         }
     }
+
+    /// End-of-stream flush of every lane's own pending failures-summary
+    /// `dropped` count — covers truncated output where a lane's `[ERROR]
+    /// Failures:` block opened, entries were capped, but its own AGG line
+    /// never arrived. Per-lane, in lane order — see the attribution
+    /// invariant on [`FailuresSummaryCap`].
+    fn finish_summaries(&mut self, out: &mut String) {
+        for (_, lane) in &mut self.lanes {
+            if lane.dropped > 0 {
+                out.push_str(&format!("\n… +{} more failures\n", lane.dropped));
+                lane.dropped = 0;
+            }
+        }
+    }
 }
 
 /// Reactor-wide cap on emitted failing test classes, with the
@@ -1089,18 +1161,24 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
         // Failures-summary cap: gate `[ERROR]   ` entries, emit `+N more` tail
         // before AGG. The helper consumes only summary entries — other lines
         // (header, AGG) fall through to the keep-list below.
-        if summary.handle_entry(lanes.get(idx).in_summary, core, line, &mut out) {
-            continue;
+        {
+            let lane = lanes.get(idx);
+            if summary.handle_entry(lane.in_summary, &mut lane.dropped, core, line, &mut out) {
+                continue;
+            }
         }
 
         // Order matters: call reactor_summary_keep first so its BUILD_FOOT
         // clears-flag side effect always runs regardless of `||` short-circuit.
         let reactor_keep = reactor_summary_keep(core, &mut in_reactor_summary);
         if reactor_keep || keep_outside_block(core) {
-            // Pre-emit the summary tail when we're about to write AGG.
-            summary.handle_aggregate(core, &mut out, &mut lanes.get(idx).in_summary);
+            let lane = lanes.get(idx);
+            // Pre-emit this lane's own summary tail when we're about to
+            // write its own AGG (never another lane's — see the attribution
+            // invariant on `FailuresSummaryCap`).
+            summary.handle_aggregate(core, &mut lane.dropped, &mut out, &mut lane.in_summary);
             // Detect summary header so subsequent `[ERROR]   ` entries get capped.
-            summary.handle_header(core, &mut lanes.get(idx).in_summary, idx);
+            summary.handle_header(core, &mut lane.in_summary, idx);
             out.push_str(line);
             out.push('\n');
             // The armed per-lane flag is an owner claim in its own right:
@@ -1128,18 +1206,25 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
         }
         // Dropped keyed line (e.g. help boilerplate): reset so a stale flag
         // can't keep an indented line that follows a dropped `[ERROR]` line.
-        // Parity with filter_package's fall-through reset. Raw fall-through
-        // lines never disarm: a raw line only routed here *because of* the
-        // armed claim, so letting it clear that claim would drop the
-        // `symbol:` / `location:` continuations whenever another module's
-        // stray stdout lands in the arm window.
-        if keyed {
+        // Parity with filter_package's fall-through reset. On a *tagged*
+        // (mvnd module) lane, raw fall-through lines never disarm: a raw
+        // line only routed here *because of* the armed claim, so letting it
+        // clear that claim would drop the `symbol:` / `location:`
+        // continuations whenever another module's stray stdout lands in the
+        // arm window. The root (untagged) lane has no such ambiguity — it's
+        // the only lane a plain `mvn` run ever uses, so every raw line is
+        // genuinely this lane's own content — and disarms on any
+        // fall-through line, keyed or not: this is pre-d602a3b behavior,
+        // restored so a stale root-lane claim can't survive an intervening
+        // raw line (e.g. an exception message) and wrongly keep unrelated
+        // indented lines (e.g. stack frames) that follow it.
+        if keyed || idx == ROOT_LANE {
             lanes.get(idx).keep_continuation = false;
         }
     }
 
     lanes.finish(&mut out);
-    summary.finish(&mut out);
+    lanes.finish_summaries(&mut out);
     classes.finish(&mut out);
     out
 }
@@ -1225,8 +1310,17 @@ pub fn filter_compile(raw: &str) -> String {
             // behavior, no phantom-tag risk on plain `mvn`). Tagged lane:
             // only a genuine compiler diagnostic (`file.java:[line,col]`)
             // arms — see the matching invariant on the Surefire/package arm
-            // sites.
-            lanes.get(idx).keep_continuation = idx == ROOT_LANE || FILE_COORD.is_match(core);
+            // sites. Only this lane's own keyed line may rewrite its claim
+            // (parity with every other disarm/arm site in this function): a
+            // never-established tag's `[ERROR]` app log (e.g. `[main]
+            // [ERROR] connection pool exhausted`) reaches here via
+            // `raw_owner`'s fallback with `keyed == false` whenever this
+            // lane is the uniquely armed one, and rewriting the claim on
+            // that raw-routed line would silently disarm it, dropping the
+            // `symbol:`/`location:` continuations that follow.
+            if keyed {
+                lanes.get(idx).keep_continuation = idx == ROOT_LANE || FILE_COORD.is_match(core);
+            }
             continue;
         }
         if lanes.get(idx).keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
@@ -1252,10 +1346,13 @@ pub fn filter_compile(raw: &str) -> String {
             }
             continue;
         }
-        // Drop everything else. Only keyed lines disarm: a raw stray only
-        // routed to this lane because of its armed claim, and clearing it
-        // would drop the `symbol:` / `location:` continuations that follow.
-        if keyed {
+        // Drop everything else. On a *tagged* lane, only keyed lines disarm:
+        // a raw stray only routed to this lane because of its armed claim,
+        // and clearing it would drop the `symbol:` / `location:`
+        // continuations that follow. The root lane disarms on any
+        // fall-through line — see the matching comment in
+        // `filter_surefire_with_cap`.
+        if keyed || idx == ROOT_LANE {
             lanes.get(idx).keep_continuation = false;
         }
     }
@@ -1298,8 +1395,11 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
                 None => continue,
             };
         // Failures-summary cap (see filter_surefire_with_cap for details).
-        if summary.handle_entry(lanes.get(idx).in_summary, core, line, &mut out) {
-            continue;
+        {
+            let lane = lanes.get(idx);
+            if summary.handle_entry(lane.in_summary, &mut lane.dropped, core, line, &mut out) {
+                continue;
+            }
         }
 
         // Order matters: call reactor_summary_keep first so its BUILD_FOOT
@@ -1307,8 +1407,9 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
         let reactor_keep = reactor_summary_keep(core, &mut in_reactor_summary);
         // Outside any Surefire block: compile-keep AND surefire-outside-keep merge.
         if reactor_keep || MODULE_BANNER.is_match(core) || keep_outside_block(core) {
-            summary.handle_aggregate(core, &mut out, &mut lanes.get(idx).in_summary);
-            summary.handle_header(core, &mut lanes.get(idx).in_summary, idx);
+            let lane = lanes.get(idx);
+            summary.handle_aggregate(core, &mut lane.dropped, &mut out, &mut lane.in_summary);
+            summary.handle_header(core, &mut lane.in_summary, idx);
             out.push_str(line);
             out.push('\n');
             // Armed flag is an owner claim scanned by raw_owner; only keyed
@@ -1354,14 +1455,15 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
             }
             continue;
         }
-        // Raw fall-through lines never disarm — see filter_surefire_with_cap.
-        if keyed {
+        // Tagged-lane raw fall-through lines never disarm; the root lane
+        // disarms on any fall-through line — see filter_surefire_with_cap.
+        if keyed || idx == ROOT_LANE {
             lanes.get(idx).keep_continuation = false;
         }
     }
 
     lanes.finish(&mut out);
-    summary.finish(&mut out);
+    lanes.finish_summaries(&mut out);
     classes.finish(&mut out);
     out
 }
@@ -1577,6 +1679,57 @@ mod tests {
 
     fn count_tokens(s: &str) -> usize {
         s.split_whitespace().count()
+    }
+
+    /// Reviewer finding #3 (upstream PR #3199, second review round): d602a3b
+    /// gated every fall-through `keep_continuation` disarm on `keyed`,
+    /// protecting mvnd's tagged lanes — but the root (untagged) lane, the
+    /// only one plain `mvn` ever uses, has no raw-line ambiguity to protect:
+    /// every raw line genuinely belongs to it. Gating its disarm too let a
+    /// stale claim (armed by any `[ERROR]` line, root lane arms broadly —
+    /// see `assert_root_lane_arms_broadly_without_file_coord`) survive an
+    /// intervening raw, non-indented line (here, a JUnit assertion message)
+    /// and then wrongly keep unrelated indented lines that follow it (here,
+    /// stack frames misread as compile-error `symbol:`/`location:`
+    /// continuations). Probed through `filter_compile` — it shares the same
+    /// `Lanes`/`keep_continuation` machinery as `filter_surefire`/
+    /// `filter_package` and has no Surefire block state to obscure the
+    /// effect. Byte/frame counts pinned to the exact numbers measured
+    /// against merge-base ba7a9ce (pre-d602a3b: 0 frames kept, byte-identical
+    /// output) and against the d602a3b-era regression (10 / 17 frames leaked,
+    /// output grown to 1588 / 2391 bytes) — a regression on either axis fails
+    /// this test.
+    fn assert_root_lane_disarms_on_raw_trail_line(fixture: &str, expected_bytes: usize) {
+        let o = filter_compile(fixture);
+        let frames = o
+            .lines()
+            .filter(|l| l.trim_start().starts_with("at "))
+            .count();
+        assert_eq!(
+            frames, 0,
+            "stray stack frames leaked through as compile continuations;\noutput:\n{o}"
+        );
+        assert_eq!(
+            o.len(),
+            expected_bytes,
+            "output size drifted from the known-good (pre-d602a3b) baseline;\noutput:\n{o}"
+        );
+    }
+
+    #[test]
+    fn root_lane_disarms_on_raw_trail_line_single_failure() {
+        assert_root_lane_disarms_on_raw_trail_line(
+            include_str!("../../../tests/fixtures/mvn_test_fail_slice_raw.txt"),
+            822,
+        );
+    }
+
+    #[test]
+    fn root_lane_disarms_on_raw_trail_line_multi_failure() {
+        assert_root_lane_disarms_on_raw_trail_line(
+            include_str!("../../../tests/fixtures/mvn_test_multifail_slice_raw.txt"),
+            1254,
+        );
     }
 
     fn gunzip(bytes: &[u8]) -> String {
@@ -1903,10 +2056,21 @@ mod tests {
         );
     }
 
-    /// The `[ERROR] Failures:` cap is reactor-wide: two modules' summaries
-    /// interleaving must share one budget, not get `modules × cap` entries.
+    /// The `[ERROR] Failures:` *budget* is reactor-wide: two modules'
+    /// summaries interleaving must share one budget, not get `modules × cap`
+    /// entries. But the `… +N more failures` *tail* is attributed per lane
+    /// (reviewer finding #3199, second round): each module's own tail
+    /// reports only its own drops, flushed at its own AGG line — here
+    /// child-a and child-b each drop exactly one entry while sharing the
+    /// cap=2 budget, so each gets its own `… +1 more failures`, not one
+    /// combined `… +2 more failures` sitting under whichever AGG happened
+    /// to arrive first.
     fn assert_summary_cap_shared_across_lanes(filter: fn(&str, usize) -> String) {
         let i = "[INFO] Scanning for projects...\n\
+             [child-a] [INFO] Running com.example.rtk.ChildAPass\n\
+             [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildAPass\n\
+             [child-b] [INFO] Running com.example.rtk.ChildBPass\n\
+             [child-b] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildBPass\n\
              [child-a] [ERROR] Failures: \n\
              [child-a] [ERROR]   ChildATest.one:11 boom a1\n\
              [child-b] [ERROR] Failures: \n\
@@ -1922,9 +2086,14 @@ mod tests {
             2,
             "cap=2 bounds the whole reactor, not each module; got:\n{o}"
         );
+        assert_eq!(
+            o.matches("… +1 more failures").count(),
+            2,
+            "each lane reports only its own drop, not a combined tail on whichever lane's AGG arrived first; got:\n{o}"
+        );
         assert!(
-            o.contains("… +2 more failures"),
-            "tail counts both dropped entries; got:\n{o}"
+            !o.contains("… +2 more failures"),
+            "no lane's tail should absorb another lane's drop; got:\n{o}"
         );
     }
 
@@ -1938,12 +2107,97 @@ mod tests {
         assert_summary_cap_shared_across_lanes(filter_package_with_cap);
     }
 
+    /// Reviewer finding #2 (upstream PR #3199, second review round), exact
+    /// probe: cap=2, child-a has 3 failures, child-b has 1 — and by the time
+    /// child-b's *own* single entry (B1) arrives, child-a's first two
+    /// entries have already spent the whole shared budget, so B1 is
+    /// dropped. child-b's AGG line then arrives before child-a's.
+    ///
+    /// Attribution invariant (see the doc comment on
+    /// [`FailuresSummaryCap`]): each lane's `… +N more failures` tail
+    /// reports exactly the entries dropped while *that* lane's own summary
+    /// block was open, flushed at *that* lane's own AGG — never another
+    /// lane's. Pre-fix (reactor-wide `dropped`, flushed once at whichever
+    /// AGG arrived first): B1 vanished with no tail under child-b's
+    /// zero-entry header, the flush under child-b's AGG double-counted
+    /// child-a's still-pending drop, and child-a's own AGG then found
+    /// `dropped` already zeroed and emitted no tail at all — a module's
+    /// only failure silently disappearing is the core wrong this fixes.
+    /// Post-fix: child-b's header is legitimately empty (its one entry lost
+    /// the shared-budget race) but is followed by its own `… +1 more
+    /// failures`, and child-a's block keeps its two entries and reports its
+    /// own `… +1 more failures` for the third — every drop is accounted for
+    /// under the lane that actually dropped it, and no header is left
+    /// looking complete when it silently isn't.
+    fn assert_shared_budget_race_attributes_tails_per_lane(filter: fn(&str, usize) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+             [child-a] [INFO] Running com.example.rtk.ChildAPass\n\
+             [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildAPass\n\
+             [child-b] [INFO] Running com.example.rtk.ChildBPass\n\
+             [child-b] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildBPass\n\
+             [child-a] [ERROR] Failures: \n\
+             [child-a] [ERROR]   ChildATest.one:11 boom a1\n\
+             [child-a] [ERROR]   ChildATest.two:12 boom a2\n\
+             [child-b] [ERROR] Failures: \n\
+             [child-b] [ERROR]   ChildBTest.one:11 boom b1\n\
+             [child-a] [ERROR]   ChildATest.three:13 boom a3\n\
+             [child-b] [INFO] \n\
+             [child-b] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n\
+             [child-a] [INFO] \n\
+             [child-a] [ERROR] Tests run: 3, Failures: 3, Errors: 0, Skipped: 0\n\
+             [INFO] BUILD FAILURE\n";
+        let o = filter(i, 2);
+        assert_eq!(
+            o.matches("boom ").count(),
+            2,
+            "shared budget still bounds the whole reactor at 2 kept entries; got:\n{o}"
+        );
+        assert!(
+            !o.contains("boom b1"),
+            "B1 lost the shared-budget race, same as pre-fix; got:\n{o}"
+        );
+        assert_eq!(
+            o.matches("… +1 more failures").count(),
+            2,
+            "child-a and child-b each report exactly their own one drop, not a combined or misattributed tail; got:\n{o}"
+        );
+        assert!(
+            !o.contains("… +2 more failures"),
+            "no lane's tail should double-count another lane's drop; got:\n{o}"
+        );
+        // child-b's header is legitimately empty (its only entry lost the
+        // race) — but must never look *complete*: its own tail must follow
+        // directly, not vanish silently.
+        let b_header = o.find("[child-b] [ERROR] Failures:").expect("child-b header kept");
+        let b_agg = o
+            .find("[child-b] [ERROR] Tests run:")
+            .expect("child-b AGG kept");
+        assert!(
+            o[b_header..b_agg].contains("… +1 more failures"),
+            "child-b's zero-entry header is followed by its own tail before its AGG; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn mvnd_shared_budget_race_attributes_tails_per_lane() {
+        assert_shared_budget_race_attributes_tails_per_lane(filter_surefire_with_cap);
+    }
+
+    #[test]
+    fn mvnd_package_shared_budget_race_attributes_tails_per_lane() {
+        assert_shared_budget_race_attributes_tails_per_lane(filter_package_with_cap);
+    }
+
     /// The failures-summary budget spans the whole invocation: module
     /// summaries that run back-to-back (child A opens and closes its summary
     /// before child B opens) share one budget too — sequential lanes must not
     /// each get a fresh `cap`.
     fn assert_summary_cap_spans_sequential_lanes(filter: fn(&str, usize) -> String) {
         let i = "[INFO] Scanning for projects...\n\
+             [child-a] [INFO] Running com.example.rtk.ChildAPass\n\
+             [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildAPass\n\
+             [child-b] [INFO] Running com.example.rtk.ChildBPass\n\
+             [child-b] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildBPass\n\
              [child-a] [ERROR] Failures: \n\
              [child-a] [ERROR]   ChildATest.one:11 boom a1\n\
              [child-a] [ERROR]   ChildATest.two:12 boom a2\n\
@@ -2047,6 +2301,59 @@ mod tests {
     #[test]
     fn package_errors_only_summary_respects_cap() {
         assert_errors_only_summary_respects_cap(filter_package_with_cap);
+    }
+
+    /// Cold-preclear finding (🟡 2): truncated output — a lane's failures
+    /// summary opened, entries got capped, but its own AGG line never
+    /// arrives before the stream ends. `Lanes::finish_summaries` must still
+    /// flush that lane's own pending `dropped` count as a `… +N more
+    /// failures` tail, attributed to the right lane — not silently lost, and
+    /// not folded into another lane's count. Two lanes truncate at once here
+    /// (`child-a` drops 1, `child-b` drops 2) to prove the per-lane
+    /// attribution invariant (see the doc comment on `FailuresSummaryCap`)
+    /// survives into the end-of-stream path too, not just the AGG-driven one
+    /// `handle_aggregate` covers.
+    fn assert_truncated_summary_flushes_per_lane_tail(filter: fn(&str, usize) -> String) {
+        let i = "[INFO] BUILD FAILURE\n\
+             [child-a] [INFO] Running com.example.rtk.ChildAPass\n\
+             [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildAPass\n\
+             [child-b] [INFO] Running com.example.rtk.ChildBPass\n\
+             [child-b] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildBPass\n\
+             [child-a] [ERROR] Failures: \n\
+             [child-a] [ERROR]   ChildATest.one:11 boom a1\n\
+             [child-a] [ERROR]   ChildATest.two:12 boom a2\n\
+             [child-a] [ERROR]   ChildATest.three:13 boom a3\n\
+             [child-b] [ERROR] Failures: \n\
+             [child-b] [ERROR]   ChildBTest.one:11 boom b1\n\
+             [child-b] [ERROR]   ChildBTest.two:12 boom b2\n";
+        let o = filter(i, 2);
+        assert_eq!(
+            o.matches("boom ").count(),
+            2,
+            "shared budget still bounds kept entries at 2; got:\n{o}"
+        );
+        assert!(
+            o.contains("… +1 more failures"),
+            "child-a's own truncated drop (1 entry) is flushed at end-of-stream; got:\n{o}"
+        );
+        assert!(
+            o.contains("… +2 more failures"),
+            "child-b's own truncated drop (2 entries) is flushed at end-of-stream; got:\n{o}"
+        );
+        assert!(
+            !o.contains("… +3 more failures"),
+            "the two lanes' truncated drops must not be folded into one combined tail; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn mvnd_truncated_summary_flushes_per_lane_tail() {
+        assert_truncated_summary_flushes_per_lane_tail(filter_surefire_with_cap);
+    }
+
+    #[test]
+    fn mvnd_package_truncated_summary_flushes_per_lane_tail() {
+        assert_truncated_summary_flushes_per_lane_tail(filter_package_with_cap);
     }
 
     /// Same phase-reset invariant as `failures_summary_cap_resets_per_phase_on_same_lane`,
@@ -2522,6 +2829,44 @@ mod tests {
         assert_raw_stray_does_not_disarm_continuation(filter_compile);
     }
 
+    /// Cold-preclear finding: a `[tag] [ERROR] …` app-log line for a
+    /// never-established tag (e.g. `[main] [ERROR] connection pool
+    /// exhausted`, no `FILE_COORD` coordinate — not an opener) reaches an
+    /// armed lane via `raw_owner`'s fallback with `keyed == false`, exactly
+    /// like the `[WARNING]` interloper above. `filter_compile`'s `[ERROR]`
+    /// arm/rewrite site was missing the `keyed` guard every sibling site has
+    /// (surefire, package, and `filter_compile`'s own `[WARNING]`/banner/
+    /// fall-through sites) and silently disarmed on it, dropping the
+    /// `symbol:`/`location:` continuations that follow. Swept through every
+    /// position of the compile-error sequence, on all three filter paths.
+    fn assert_error_interloper_does_not_disarm_continuation(filter: fn(&str) -> String) {
+        const ERROR_INTERLOPER: [&str; 1] = ["[main] [ERROR] connection pool exhausted"];
+        for (n, m) in merges(&SWEEP_COMPILE_A, &ERROR_INTERLOPER).iter().enumerate() {
+            let i = sweep_input(m);
+            let o = filter(&i);
+            assert!(
+                o.contains("symbol:   variable bar")
+                    && o.contains("location: class com.example.rtk.A"),
+                "ERROR interloper at position #{n} disarmed the continuation;\ninput:\n{i}\noutput:\n{o}"
+            );
+        }
+    }
+
+    #[test]
+    fn mvnd_error_interloper_does_not_disarm_continuation() {
+        assert_error_interloper_does_not_disarm_continuation(filter_surefire);
+    }
+
+    #[test]
+    fn mvnd_compile_error_interloper_does_not_disarm_continuation() {
+        assert_error_interloper_does_not_disarm_continuation(filter_compile);
+    }
+
+    #[test]
+    fn mvnd_package_error_interloper_does_not_disarm_continuation() {
+        assert_error_interloper_does_not_disarm_continuation(filter_package);
+    }
+
     /// child-a variant: one class with TWO blank-separated per-test detail
     /// blocks (Surefire's multi-failure shape) — `trail_rearm` carries the
     /// keep/drop decision across the blanks.
@@ -2700,33 +3045,39 @@ mod tests {
         assert_two_armed_lanes_preserve_continuations(filter_compile);
     }
 
-    // Snapshot regression tests locking the full filtered output of every
-    // mvnd fixture (insta, per docs/contributing/CODING_PRACTICES.md) — the
-    // substring assertions above document intent; the snapshots catch
-    // everything else.
+    // Full-output regression tests locking the complete filtered output of
+    // every mvnd fixture, per the repo-prescribed fixture pattern
+    // (`.claude/rules/cli-testing.md`: expected-output files in
+    // `tests/fixtures/`, compared via `include_str!` + `assert_eq!` — no
+    // snapshot-testing crate) — the substring assertions above document
+    // intent; these catch everything else.
 
     #[test]
-    fn mvnd_reactor_pass_snapshot() {
+    fn mvnd_reactor_pass_full_output() {
         let i = include_str!("../../../tests/fixtures/mvnd_reactor_pass_raw.txt");
-        insta::assert_snapshot!(filter_package(i));
+        let expected = include_str!("../../../tests/fixtures/mvnd_reactor_pass_expected.txt");
+        assert_eq!(filter_package(i), expected);
     }
 
     #[test]
-    fn mvnd_test_fail_snapshot() {
+    fn mvnd_test_fail_full_output() {
         let i = include_str!("../../../tests/fixtures/mvnd_test_fail_raw.txt");
-        insta::assert_snapshot!(filter_surefire(i));
+        let expected = include_str!("../../../tests/fixtures/mvnd_test_fail_expected.txt");
+        assert_eq!(filter_surefire(i), expected);
     }
 
     #[test]
-    fn mvnd_parallel_reactor_fail_snapshot() {
+    fn mvnd_parallel_reactor_fail_full_output() {
         let i = include_str!("../../../tests/fixtures/mvnd_reactor_fail_raw.txt");
-        insta::assert_snapshot!(filter_surefire(i));
+        let expected = include_str!("../../../tests/fixtures/mvnd_reactor_fail_expected.txt");
+        assert_eq!(filter_surefire(i), expected);
     }
 
     #[test]
-    fn mvnd_compile_error_snapshot() {
+    fn mvnd_compile_error_full_output() {
         let i = include_str!("../../../tests/fixtures/mvnd_compile_error_raw.txt");
-        insta::assert_snapshot!(filter_compile(i));
+        let expected = include_str!("../../../tests/fixtures/mvnd_compile_error_expected.txt");
+        assert_eq!(filter_compile(i), expected);
     }
 
     /// `mvnd compile` on a syntax error (exit code 1): compile diagnostics
@@ -3885,6 +4236,11 @@ mod tests {
             split_lane("[] [INFO] started"),
             (None, "[] [INFO] started")
         );
+        // Tagged blank, no-trailing-space spelling (`[tag] [LEVEL]`, nothing
+        // after — `lane_rest_level`'s documented other spelling of the
+        // daemon-prefixed trail terminator, alongside `[tag] [LEVEL] `).
+        // Pinned so the "both spellings" contract can't rot.
+        assert_eq!(split_lane("[child-a] [INFO]"), (Some("child-a"), "[INFO]"));
     }
 
     /// Reviewer probe (upstream PR #3199 finding 2): an application log line
@@ -4047,7 +4403,105 @@ mod tests {
         );
     }
 
-    /// Finding 4: an adversarial run of uniquely-tagged `[ERROR]` lines
+    /// Reviewer finding #1 (upstream PR #3199, second review round), failing
+    /// side: a `[tag] [ERROR]` app-log line for a never-seen tag (e.g.
+    /// `[Server] [ERROR] connection refused`, no `file.java:[line,col]`
+    /// coordinate) landing *inside* another lane's still-open buffered block
+    /// must stay inside that block, at its input position — not mint its own
+    /// fresh lane and get written to `out` immediately, ahead of the
+    /// `Running` line (and the rest of the block) it followed in the input.
+    /// Pre-fix, `is_lane_opener`'s blanket `[ERROR]`-prefix rule minted
+    /// `[Server]` its own lane; post-fix it has no `FILE_COORD` coordinate,
+    /// so it's not an opener and `Lanes::route` falls back to `raw_owner`,
+    /// which buffers it into `child-a`'s uniquely-open block instead.
+    #[test]
+    fn app_log_error_stays_in_order_inside_failing_block() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [child-a] [INFO] Running com.example.rtk.SlowTest\n\
+                  [Server] [ERROR] connection refused\n\
+                  [child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE! -- in com.example.rtk.SlowTest\n\
+                  [child-a] [ERROR] com.example.rtk.SlowTest.foo -- Time elapsed: 0.05 s <<< FAILURE!\n\
+                  java.lang.AssertionError: boom\n\
+                  \tat com.example.rtk.SlowTest.foo(SlowTest.java:5)\n\
+                  [child-a] [INFO] \n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter_surefire(i);
+        let running = o.find("Running com.example.rtk.SlowTest").expect("Running kept");
+        let server = o
+            .find("[Server] [ERROR] connection refused")
+            .expect("app log line kept, buffered inside the block");
+        let close = o
+            .find("<<< FAILURE! -- in com.example.rtk.SlowTest")
+            .expect("close line kept");
+        assert!(
+            running < server && server < close,
+            "app-log line must stay in its original input order inside the block \
+             (Running, then the app log, then the close), not jump ahead of Running; got:\n{o}"
+        );
+    }
+
+    /// Cold-preclear finding (🟡 1): `lane_rest_level` documents two blank
+    /// terminator spellings for a tagged lane's trail — `[tag] [LEVEL] `
+    /// (trailing space, mvnd's usual daemon-prefixed blank) and `[tag]
+    /// [LEVEL]` (no trailing space, nothing after). Every other
+    /// trail-termination test in this file uses the trailing-space spelling
+    /// (see `split_lane`'s own doc comment); this one pins the no-space
+    /// spelling so that half of the documented contract can't silently rot.
+    /// If termination on the no-space spelling ever breaks, the bare
+    /// terminator line survives as literal trail content instead of being
+    /// consumed, so it would appear verbatim right before the next
+    /// `Running` line.
+    #[test]
+    fn tagged_trail_terminates_on_no_trailing_space_blank() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [child-a] [INFO] Running com.example.rtk.SlowTest\n\
+                  [child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE! -- in com.example.rtk.SlowTest\n\
+                  [child-a] [ERROR] com.example.rtk.SlowTest.foo -- Time elapsed: 0.05 s <<< FAILURE!\n\
+                  java.lang.AssertionError: boom\n\
+                  \tat com.example.rtk.SlowTest.foo(SlowTest.java:5)\n\
+                  \tat org.junit.jupiter.api.Assertions.fail(Assertions.java:1)\n\
+                  [child-a] [INFO]\n\
+                  [child-a] [INFO] Running com.example.rtk.NextTest\n\
+                  [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.NextTest\n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter_surefire(i);
+        assert!(
+            o.contains("at com.example.rtk.SlowTest.foo(SlowTest.java:5)"),
+            "user frame survives; got:\n{o}"
+        );
+        assert!(
+            !o.contains("org.junit.jupiter"),
+            "framework frame stripped; got:\n{o}"
+        );
+        assert!(
+            !o.contains("[child-a] [INFO]\n[child-a] [INFO] Running"),
+            "the no-space blank must be consumed as the trail terminator, not survive \
+             as a stray literal line before the next Running; got:\n{o}"
+        );
+        assert!(o.contains("BUILD FAILURE"), "footer survives; got:\n{o}");
+    }
+
+    /// Reviewer finding #1 (upstream PR #3199, second review round), green
+    /// side: the same `[tag] [ERROR]` app-log line, but the block it lands
+    /// inside closes clean (0 failures/errors) — the whole block, app-log
+    /// line included, must be discarded with the rest, not survive as a
+    /// stray leftover from a lane it should never have minted.
+    #[test]
+    fn app_log_error_dropped_with_green_close_block() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [child-a] [INFO] Running com.example.rtk.SlowTest\n\
+                  [Server] [ERROR] connection refused\n\
+                  [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.05 s -- in com.example.rtk.SlowTest\n\
+                  [INFO] BUILD SUCCESS\n";
+        let o = filter_surefire(i);
+        assert!(
+            !o.contains("[Server]") && !o.contains("connection refused"),
+            "app-log line inside a green-closed block must be discarded with the rest \
+             of the block, not survive via a phantom lane; got:\n{o}"
+        );
+    }
+
+    /// Finding 4: an adversarial run of uniquely-tagged opener-shaped lines
     /// (each individually opener-shaped, per `is_lane_opener`) must not mint
     /// unbounded lanes — `Lanes::route`'s scan stays `O(MAX_LANES)`, not
     /// `O(distinct tags)`. Also exercises the public entry point end to end
@@ -4055,14 +4509,17 @@ mod tests {
     #[test]
     fn lane_count_is_capped_on_pathological_input() {
         let mut i = String::from("[INFO] Scanning for projects...\n");
-        // Non-coordinate `[ERROR]` text deliberately: `is_lane_opener`'s
-        // blanket `[ERROR]`-prefix rule still mints a lane per tag (what
-        // this test measures), but without a `FILE_COORD` match these
-        // never arm `keep_continuation` — so the overflow-module assertion
-        // below isn't accidentally satisfied by an unrelated 255-way armed
-        // tie in `raw_owner` instead of exercising the fix it targets.
+        // `Running` lines deliberately (not bare `[ERROR]` text): since
+        // finding #1 (upstream PR #3199, second round) narrowed
+        // `is_lane_opener`'s `[ERROR]` arm to genuine `FILE_COORD` compiler
+        // diagnostics, a non-coordinate `[ERROR]` line no longer mints a
+        // lane at all. `Running` is unaffected by that fix and, unlike a
+        // `FILE_COORD` line, never arms `keep_continuation` either — so the
+        // overflow-module assertion below isn't accidentally satisfied by an
+        // unrelated 255-way armed tie in `raw_owner` instead of exercising
+        // the fix it targets.
         for n in 0..(MAX_LANES + 50) {
-            i.push_str(&format!("[tag{n}] [ERROR] connection refused for tag{n}\n"));
+            i.push_str(&format!("[tag{n}] [INFO] Running com.example.rtk.Tag{n}Test\n"));
         }
         // One more never-seen tag, past the cap: a genuine failing test
         // class (`Running` + failing close), not just a bare `[ERROR]`

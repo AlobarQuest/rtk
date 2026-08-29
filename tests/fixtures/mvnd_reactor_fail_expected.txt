@@ -1,7 +1,3 @@
----
-source: src/cmds/jvm/mvn_cmd.rs
-expression: filter_surefire(i)
----
 [INFO] Scanning for projects...
 [multi-module-fail-skeleton] [INFO] -------------< com.example.rtk:multi-module-fail-skeleton >-------------
 [multi-module-fail-skeleton] [INFO] Building multi-module-fail-skeleton 1.0.0-SNAPSHOT                 [1/3]
