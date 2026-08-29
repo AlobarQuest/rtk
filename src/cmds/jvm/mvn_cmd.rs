@@ -64,6 +64,38 @@ static AGG: LazyLock<Regex> = LazyLock::new(|| {
 static PLUGIN_BANNER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[INFO\] --- .* @ .* ---$").unwrap());
 
+/// Surefire/Failsafe plugin execution banner specifically — captures the
+/// goal identifier (`plugin:version:goal (execution-id)`, e.g.
+/// `surefire:3.5.5:test (default-test)` vs `failsafe:3.5.5:integration-test
+/// (default-integration-test)`) so a phase transition between the two can be
+/// detected independent of lane/module identity (see
+/// [`FailuresSummaryCap::observe_plugin_banner`]). Deliberately narrower
+/// than [`PLUGIN_BANNER`], which matches *any* plugin's banner
+/// (`compiler:...`, `resources:...`, `clean:...`, …) — those never open a
+/// failures summary and must never trigger a budget reset.
+/// Widened per cold-preclear finding (upstream PR #3199, fourth review
+/// round): Maven ≤3.8 / mvnd 0.x spell the plugin coordinate
+/// `maven-surefire-plugin:2.22.2` / `maven-failsafe-plugin:2.22.2`, not the
+/// bare `surefire:`/`failsafe:` shorthand newer Maven emits — missing that
+/// spelling silently disabled the generation reset on older daemons, the
+/// exact failure mode the phase marker exists to prevent.
+static TEST_PLUGIN_BANNER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\[INFO\] --- ((?:maven-)?(?:surefire|failsafe)(?:-plugin)?:\S+ \([^)]*\)) @ .* ---$").unwrap()
+});
+
+/// A genuine mvnd reactor module header: `Building <name> <version>
+/// [n/m]` — the trailing `[n/m]` reactor-position counter is what a real
+/// module's own `Building` line always carries (confirmed against
+/// `mvnd_reactor_pass_raw.txt` / `mvnd_reactor_fail_raw.txt`) and an app log
+/// coincidentally shaped `[pool-1] [INFO] Building segment N of the data
+/// pipeline` never does. Used to gate the `[INFO] Building ` opener/keeper
+/// on *tagged* lanes only — see [`is_lane_opener`] and
+/// [`keep_outside_block`]. The root lane's own `Building` line (plain `mvn`,
+/// single-module — never reactor-numbered) is unaffected: it's kept by the
+/// unconditional `starts_with` check, not this one.
+static BUILDING_MODULE_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[INFO\] Building .*\[\d+/\d+\]\s*$").unwrap());
+
 /// Module banner with project name in brackets.
 static MODULE_BANNER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[INFO\] -+< .+ >-+$").unwrap());
@@ -213,7 +245,34 @@ fn is_blank_separator(line: &str) -> bool {
 ///   such a line inside a *tagged* lane's active failure trail/block was
 ///   dropped: it never reached the trail-keeping logic).
 /// - non-bracket-leading line → `(None, line)`, raw (checked first, below).
-fn split_lane(line: &str) -> (Option<&str>, &str) {
+///
+/// `daemon` gates this whole lane layer (cold-preclear finding, upstream PR
+/// #3199, third review round): plain `mvn` never interleaves module output —
+/// there is nothing for lane tracking to protect against, and the bracket
+/// heuristic above is exactly what let an SLF4J/Logback `[%thread] [%level]
+/// %msg` line (or a `[timestamp] [LEVEL] …` layout) masquerade as a real
+/// mvnd module tag, minting a phantom lane, opening a block that never
+/// closes, and resurrecting or reordering content base would have dropped
+/// or kept in place. `daemon == false` short-circuits to `(Some(""), line)`
+/// unconditionally — every line, bracket-leading or not, root-keyed with
+/// `core == line` — which is exactly base's (pre-lane) flat model: a single
+/// always-keyed state machine, `is_lane_opener`/`Lanes::raw_owner`/
+/// `MAX_LANES` never consulted at all (`Lanes::route` finds the pre-seeded
+/// root lane on the first lookup). This makes *routing* byte-identical to
+/// base *by construction*, not by case analysis.
+///
+/// Scope of that claim: it covers `split_lane`/`Lanes::route` only, not
+/// every byte `filter_surefire`/`filter_package` can ever emit for plain
+/// `mvn`. `SurefireBlock::step`'s in-block summary-header recovery (flushing
+/// a stale open block when an `[ERROR] Failures:`/`Errors:` header arrives
+/// mid-block — see its own doc comment) is a single shared fix that also
+/// improves the root lane's handling of a malformed/truncated stream over
+/// base's; that divergence is deliberate and orthogonal to routing, not a
+/// gap in this function.
+fn split_lane(line: &str, daemon: bool) -> (Option<&str>, &str) {
+    if !daemon {
+        return (Some(""), line);
+    }
     if !line.starts_with('[') {
         return (None, line);
     }
@@ -312,16 +371,38 @@ fn lane_rest_level(rest: &str) -> Option<&str> {
 /// (`[ERROR] Tests run: … <<< FAILURE!`) is unaffected too — it's admitted
 /// by the separate `CLOSE.is_match` arm above, not this one.
 ///
+/// The `RUNNING` arm is *not* narrowed the way `[ERROR]`/`Building` are: a
+/// genuine mvnd `Running` line carries no extra marker beyond `[INFO]
+/// Running <text>` (confirmed against every real fixture — unlike
+/// `Building`'s trailing `[n/m]` reactor-position counter, there is nothing
+/// fixture-grounded to gate on), so an app log merely shaped `[main] [INFO]
+/// Running the widget pipeline` still mints a tagged lane in daemon mode.
+/// Contract for that lane: it is bounded to the lines that opened and fed
+/// it — its unconfirmed tag's block never closes (no genuine `CLOSE` line
+/// ever arrives for it), so it flushes verbatim, in its own input order,
+/// at end-of-stream (i.e. after everything else, including the build
+/// footer). Over-keep and reorder of exactly those lines, never loss and
+/// never touching any other lane's content — see
+/// `app_log_running_line_mints_tagged_lane_and_flushes_at_end_of_stream`.
+///
 /// Lane growth itself is bounded by [`MAX_LANES`] regardless, so an
 /// adversarial run of uniquely-tagged opener-shaped lines can mint at most
 /// that many lanes, keeping `route`'s scan O(`MAX_LANES`) regardless of how
 /// many distinct tags the input contains.
+///
+/// Cold-preclear finding (upstream PR #3199, fourth review round): the
+/// `Building` arm used a bare `starts_with` — any `[pool-1] [INFO] Building
+/// segment N of the data pipeline` app log qualified. This function is only
+/// ever consulted for a *never-seen* tag (see [`Lanes::route`]), i.e. always
+/// a candidate *tagged* lane, never root — so it can require the real mvnd
+/// module shape unconditionally: [`BUILDING_MODULE_HEADER`]'s trailing
+/// `[n/m]` reactor-position counter.
 fn is_lane_opener(core: &str) -> bool {
     RUNNING.is_match(core)
         || CLOSE.is_match(core)
         || MODULE_BANNER.is_match(core)
         || PLUGIN_BANNER.is_match(core)
-        || core.starts_with("[INFO] Building ")
+        || BUILDING_MODULE_HEADER.is_match(core)
         || (core.starts_with("[ERROR]") && FILE_COORD.is_match(core))
 }
 
@@ -369,7 +450,18 @@ fn reactor_summary_keep(line: &str, in_reactor_summary: &mut bool) -> bool {
     *in_reactor_summary
 }
 
-fn keep_outside_block(line: &str) -> bool {
+/// `gate_building`: cold-preclear finding (upstream PR #3199, fourth review
+/// round) — a bare `[INFO] Building ` keeper let `[pool-1] [INFO] Building
+/// segment N of the data pipeline` app logs on a *tagged* mvnd lane through
+/// wholesale (probe: 2000 such lines in a green run, ~0.1% savings). The
+/// root lane's own `Building` header (plain `mvn`, single-module — never
+/// reactor-numbered) must stay on the unconditional check, so the caller
+/// passes `gate_building = daemon && idx != ROOT_LANE`: `true` narrows the
+/// `[INFO] Building ` keeper to [`BUILDING_MODULE_HEADER`]'s real
+/// `[n/m]`-numbered shape; `false` (root, or plain `mvn`) keeps the original
+/// unconditional check. `Building war:`/`jar:`/`ear:` (artifact-packaging
+/// lines, a different shape entirely) are never gated.
+fn keep_outside_block(line: &str, gate_building: bool) -> bool {
     // Help boilerplate must be rejected before the `[ERROR]` catch-all below
     // (non-quiet parity with `filter_quiet`'s boilerplate stripping).
     if is_boilerplate(line) {
@@ -381,7 +473,8 @@ fn keep_outside_block(line: &str) -> bool {
         || MODULE_BANNER.is_match(line)
         || line.starts_with("[INFO] Total time:")
         || line.starts_with("[INFO] Finished at:")
-        || line.starts_with("[INFO] Building ")
+        || (line.starts_with("[INFO] Building ")
+            && (!gate_building || BUILDING_MODULE_HEADER.is_match(line)))
         || line.starts_with("[INFO] Scanning ")
         || line.starts_with("[INFO] Installing ")
         || line.starts_with("[ERROR] Failures:")
@@ -504,6 +597,29 @@ impl<'a> SurefireBlock<'a> {
             // class must not re-arm into the new class's trail decision.
             self.trail_rearm = None;
             return SurefireStep::Consumed;
+        }
+
+        // A `[ERROR] Failures:` / `[ERROR] Errors:` summary header can never
+        // legitimately appear while a per-class block is genuinely still
+        // open — Maven only emits it after every class in the module has
+        // already closed (see `mvnd_reactor_fail_raw.txt`: the last class's
+        // own close line always precedes it). If one reaches here anyway —
+        // nothing closed the last class explicitly — swallowing it (and the
+        // entries/AGG that follow) into `block_lines` would dump the whole
+        // summary uncapped at end-of-stream, bypassing `FailuresSummaryCap`
+        // entirely. Flush the stale block as keep (the same recovery
+        // `RUNNING` already gets, right above) and fall through to
+        // `Passthrough` so the header actually reaches the summary-cap
+        // machinery. Invariant: the reactor-wide budget is keyed to summary
+        // blocks (`[ERROR] Failures:`/`Errors:` … the `AGG` aggregate),
+        // never to whether the carrying lane's last per-class block
+        // happened to close first.
+        if keyed
+            && self.in_block
+            && (core.starts_with("[ERROR] Failures:") || core.starts_with("[ERROR] Errors:"))
+        {
+            self.flush_open_block_as_keep(out);
+            return SurefireStep::Passthrough;
         }
 
         if self.in_block {
@@ -676,56 +792,65 @@ impl<'a> SurefireBlock<'a> {
 /// [`MAX_MVN_FAILING_CLASSES`] and emit `\n… +N more failures\n` immediately
 /// before the `Tests run:` aggregate when entries were dropped.
 ///
-/// The *budget* (`emitted`, how many entries may still be kept) is
-/// **reactor-wide within one generation**, not per module: a parallel
-/// reactor emits one summary block per failing module, and each module's
-/// *first* summary in a generation shares that generation's one running
-/// budget — a 20-module reactor still keeps at most `cap` entries total for
-/// that pass, never `modules × cap`, whether the modules' summaries
-/// interleave or run back-to-back. But `mvn verify`/`install` runs
-/// Surefire's summary then Failsafe's as two independent generations over
-/// the *same* lanes — a lane's second `[ERROR] Failures:`/`Errors:` header
-/// starts a new generation, not a continuation, so it gets a fresh `cap`.
+/// The *budget* (`emitted`, how many entries may still be kept) behaves
+/// differently by mode ([`FailuresSummaryCap::daemon`]):
 ///
-/// The *dropped-entry count* backing each `… +N more failures` tail is, by
-/// contrast, **per lane** ([`SurefireLane::dropped`]) — the shared budget
-/// says how many entries total may survive, but which module's entries got
+/// - **Plain `mvn`** (`daemon == false`): matches base (pre-lane) semantics
+///   exactly — every `[ERROR] Failures:`/`Errors:` header, however many a
+///   sequential multi-module build shows, gets its own unconditionally
+///   fresh budget. Plain `mvn` has no reactor-wide sharing concept; there is
+///   only ever one (root) lane, so there is nothing to share *between*.
+/// - **mvnd** (`daemon == true`): **reactor-wide within one generation**, not
+///   per module — a parallel reactor emits one summary block per failing
+///   module, and each module's *first* summary in a generation shares that
+///   generation's one running budget: a 20-module reactor still keeps at
+///   most `cap` entries total for that pass, never `modules × cap`, whether
+///   the modules' summaries interleave or run back-to-back. But `mvn
+///   verify`/`install` runs Surefire's summary then Failsafe's as two
+///   independent generations — a new generation gets a fresh `cap`. The
+///   boundary between generations is an explicit phase marker
+///   ([`FailuresSummaryCap::observe_plugin_banner`]), not lane-repeat
+///   inference (cold-preclear finding, upstream PR #3199, third review
+///   round): inferring "new generation" from a lane's header *repeating*
+///   silently failed to reset the budget when a module's only failures were
+///   integration-test ones — its Failsafe header was its first-ever
+///   sighting, never a repeat, so it shared whatever Surefire's phase had
+///   already spent (potentially zero) instead of a fresh `cap`.
+///
+/// The *dropped-entry count* backing each `… +N more failures` tail is
+/// **per lane** ([`SurefireLane::dropped`]) in both modes — the budget says
+/// how many entries total may survive, but which module's entries got
 /// dropped while spending that budget is per-module information, and each
 /// module's own tail must report only its own drops, flushed at its own AGG
-/// line. Reactor-wide `dropped` (the pre-fix design) let whichever lane's
-/// AGG happened to arrive first flush *everyone's* outstanding drops under
-/// its own header and zero the counter for every lane after it — dropping a
+/// line. Reactor-wide `dropped` (an earlier design) let whichever lane's AGG
+/// happened to arrive first flush *everyone's* outstanding drops under its
+/// own header and zero the counter for every lane after it — dropping a
 /// module's only failure with no tail to show for it, or crediting one
 /// module's drops to another's summary. Attribution invariant: **a lane's
 /// `… +N more failures` tail reports exactly the entries dropped while that
 /// lane's own summary block was open, no more and no less** — even when
 /// several lanes' summaries interleave and share one budget.
-///
-/// Invariant: **each summary block keeps at most `cap` entries; entries
-/// beyond that collapse to `… +N more failures`** — a generation's budget is
-/// shared reactor-wide the first time each lane opens a summary in it, and a
-/// new generation begins (with a fresh budget) exactly once per repeat
-/// header, on whichever lane's header repeats first; every other lane's
-/// header that then interleaves before the reset lane's `AGG` is treated as
-/// that lane's first sighting *in the new generation* (no second reset) —
-/// otherwise an interleaved reactor could double-reset mid-generation and
-/// let one still-open block emit up to `2 × cap` entries.
 struct FailuresSummaryCap {
     cap: usize,
     emitted: usize,
-    /// Lanes that have opened a summary block in the *current generation*.
-    /// Cleared and re-seeded with just the triggering lane when the first
-    /// repeat header of a generation starts a new one — see
-    /// [`FailuresSummaryCap::handle_header`].
-    seen_lanes: HashSet<usize>,
+    /// `false` for plain `mvn`: every header resets unconditionally (base
+    /// parity — see the struct doc). `true` for mvnd: resets only at a
+    /// plugin-banner phase transition ([`FailuresSummaryCap::
+    /// observe_plugin_banner`]).
+    daemon: bool,
+    /// mvnd only: the goal identifier (`plugin:version:goal (execution-id)`)
+    /// captured from the most recent Surefire/Failsafe plugin banner. `None`
+    /// until the first banner is seen.
+    phase: Option<String>,
 }
 
 impl FailuresSummaryCap {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize, daemon: bool) -> Self {
         Self {
             cap,
             emitted: 0,
-            seen_lanes: HashSet::new(),
+            daemon,
+            phase: None,
         }
     }
 
@@ -733,9 +858,8 @@ impl FailuresSummaryCap {
     /// summary, write `line` (the original, module prefix included) — or
     /// increment `dropped` (the calling lane's own pending-drop count) —
     /// and return `true` so the caller skips its own keep-list. Returns
-    /// `false` otherwise. `emitted` (the reactor-wide shared budget) is the
-    /// only thing that decides keep-vs-drop; `dropped` only tracks *whose*
-    /// tail reports the drop.
+    /// `false` otherwise. `emitted` is the only thing that decides
+    /// keep-vs-drop; `dropped` only tracks *whose* tail reports the drop.
     fn handle_entry(
         &mut self,
         in_summary: bool,
@@ -763,37 +887,43 @@ impl FailuresSummaryCap {
     /// all thrown exceptions (no assertion failures) gets an `Errors:`-only
     /// summary with no `Failures:` header at all, and must be capped the
     /// same way. Caller is responsible for writing the header to `out`.
-    /// `lane` is the opening lane's index.
     ///
-    /// Generation semantics: `seen_lanes` tracks lanes that have opened a
-    /// summary in the *current* generation (phase). A lane's first header in
-    /// a generation shares that generation's running budget (reactor-wide,
-    /// same as before). The first lane whose header repeats within the
-    /// current generation is the signal a new generation has begun (e.g.
-    /// Failsafe's summary following Surefire's): that starts a fresh
-    /// generation — `seen_lanes` is cleared (and re-seeded with just this
-    /// lane) and `emitted` resets once. Any *other* lane's header that then
-    /// interleaves before this lane's `AGG` line is a first sighting in the
-    /// new generation too (its `insert` succeeds), so it shares the new
-    /// generation's budget without triggering a second reset — otherwise an
-    /// interleaved reactor could reset `emitted` twice per generation and
-    /// let one lane's still-open block emit up to `2 × cap` entries. The
+    /// Plain `mvn` (`!self.daemon`): every header resets `emitted` and the
+    /// caller's `dropped` unconditionally — base parity, see the struct doc.
+    /// mvnd: no reset here at all — generation boundaries are driven
+    /// exclusively by [`FailuresSummaryCap::observe_plugin_banner`]. The
     /// `*in_summary` guard above already prevents a mid-block `Errors:`
     /// header (Maven can emit `Failures:` then `Errors:` as two sections of
-    /// one summary) from being treated as a new generation at all. A lane's
-    /// own `dropped` count is untouched here — it's per-lane and only ever
-    /// reset by that lane's own [`FailuresSummaryCap::handle_aggregate`]
-    /// flush, regardless of generation boundaries.
-    fn handle_header(&mut self, line: &str, in_summary: &mut bool, lane: usize) {
+    /// one summary) from being treated as a new generation at all.
+    fn handle_header(&mut self, line: &str, in_summary: &mut bool, dropped: &mut usize) {
         let is_header =
             line.starts_with("[ERROR] Failures:") || line.starts_with("[ERROR] Errors:");
         if !is_header || *in_summary {
             return;
         }
         *in_summary = true;
-        if !self.seen_lanes.insert(lane) {
-            self.seen_lanes.clear();
-            self.seen_lanes.insert(lane);
+        if !self.daemon {
+            self.emitted = 0;
+            *dropped = 0;
+        }
+    }
+
+    /// mvnd only (no-op for plain `mvn`): `goal` is the captured
+    /// `plugin:version:goal (execution-id)` from a Surefire/Failsafe plugin
+    /// banner (see [`TEST_PLUGIN_BANNER`]). A goal that differs from the
+    /// currently tracked phase is an unambiguous generation boundary —
+    /// every module's own banner within one phase carries the *same* goal
+    /// string (module identity isn't part of the capture), so repeated
+    /// banners for different modules in the same phase never trigger a
+    /// reset; only a genuine Surefire → Failsafe (or vice versa) transition
+    /// does, regardless of whether any lane's summary header happens to
+    /// repeat across it.
+    fn observe_plugin_banner(&mut self, goal: &str) {
+        if !self.daemon {
+            return;
+        }
+        if self.phase.as_deref() != Some(goal) {
+            self.phase = Some(goal.to_string());
             self.emitted = 0;
         }
     }
@@ -1077,9 +1207,11 @@ fn drive_surefire_line<'a>(
     lanes: &mut Lanes<'a>,
     line: &'a str,
     classes: &mut FailingClassCap,
+    summary: &mut FailuresSummaryCap,
+    daemon: bool,
     out: &mut String,
 ) -> Option<(usize, &'a str, bool)> {
-    let (key, core) = split_lane(line);
+    let (key, core) = split_lane(line, daemon);
     let (idx, keyed) = match lanes.route(key, core) {
         Some(v) => v,
         None => {
@@ -1090,6 +1222,20 @@ fn drive_surefire_line<'a>(
             return None;
         }
     };
+
+    // Surefire/Failsafe plugin banners are swallowed silently by
+    // `block.step()` below (never surface to the outer loop's keep-list),
+    // so this is the only point that can observe a phase transition —
+    // needed before the swallow so `FailuresSummaryCap` can reset the
+    // budget at an unambiguous boundary instead of inferring one from lane
+    // repetition (cold-preclear finding, upstream PR #3199, third review
+    // round: that inference silently shared Surefire's leftover budget with
+    // a module whose only failures were integration-test ones).
+    if keyed {
+        if let Some(caps) = TEST_PLUGIN_BANNER.captures(core) {
+            summary.observe_plugin_banner(caps.get(1).map_or("", |m| m.as_str()));
+        }
+    }
 
     let step = lanes.get(idx).block.step(line, core, keyed, idx == ROOT_LANE, out);
     // A lane inside a Surefire block has no pending javac continuations:
@@ -1130,11 +1276,11 @@ fn drive_surefire_line<'a>(
 ///
 /// English-footer guard: if no `BUILD SUCCESS`/`BUILD FAILURE` line is present,
 /// return the ANSI-stripped raw input (non-English locale or truncated output).
-pub fn filter_surefire(raw: &str) -> String {
-    filter_surefire_with_cap(raw, MAX_MVN_FAILING_CLASSES)
+pub fn filter_surefire(raw: &str, daemon: bool) -> String {
+    filter_surefire_with_cap(raw, MAX_MVN_FAILING_CLASSES, daemon)
 }
 
-fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
+fn filter_surefire_with_cap(raw: &str, cap: usize, daemon: bool) -> String {
     let stripped = strip_ansi(raw);
     if !has_english_footer(&stripped) {
         return stripped;
@@ -1143,15 +1289,16 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
     let mut out = String::new();
     let mut lanes = Lanes::new();
     let mut classes = FailingClassCap::new(cap);
-    let mut summary = FailuresSummaryCap::new(cap);
+    let mut summary = FailuresSummaryCap::new(cap, daemon);
     let mut in_reactor_summary = false;
 
     for line in stripped.lines() {
-        let (idx, core, keyed) =
-            match drive_surefire_line(&mut lanes, line, &mut classes, &mut out) {
-                Some(v) => v,
-                None => continue,
-            };
+        let (idx, core, keyed) = match drive_surefire_line(
+            &mut lanes, line, &mut classes, &mut summary, daemon, &mut out,
+        ) {
+            Some(v) => v,
+            None => continue,
+        };
         if lanes.get(idx).keep_continuation && (core.starts_with(' ') || core.starts_with('\t')) {
             out.push_str(line);
             out.push('\n');
@@ -1171,14 +1318,14 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
         // Order matters: call reactor_summary_keep first so its BUILD_FOOT
         // clears-flag side effect always runs regardless of `||` short-circuit.
         let reactor_keep = reactor_summary_keep(core, &mut in_reactor_summary);
-        if reactor_keep || keep_outside_block(core) {
+        if reactor_keep || keep_outside_block(core, daemon && idx != ROOT_LANE) {
             let lane = lanes.get(idx);
             // Pre-emit this lane's own summary tail when we're about to
             // write its own AGG (never another lane's — see the attribution
             // invariant on `FailuresSummaryCap`).
             summary.handle_aggregate(core, &mut lane.dropped, &mut out, &mut lane.in_summary);
             // Detect summary header so subsequent `[ERROR]   ` entries get capped.
-            summary.handle_header(core, &mut lane.in_summary, idx);
+            summary.handle_header(core, &mut lane.in_summary, &mut lane.dropped);
             out.push_str(line);
             out.push('\n');
             // The armed per-lane flag is an owner claim in its own right:
@@ -1237,7 +1384,7 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
 /// time, scanning line, install lines, and `[ERROR]` blocks with indented
 /// continuation (`  symbol:`, `  ^`, `  required:`). Deduplicates `[WARNING]`
 /// lines by normalised message (strip file coordinates).
-pub fn filter_compile(raw: &str) -> String {
+pub fn filter_compile(raw: &str, daemon: bool) -> String {
     let stripped = strip_ansi(raw);
     if !has_english_footer(&stripped) {
         return stripped;
@@ -1250,13 +1397,14 @@ pub fn filter_compile(raw: &str) -> String {
     // between must not clear the flag armed by `[child-a] [ERROR]`. Compile
     // never opens Surefire blocks, so `route` resolves raw lines to the unique
     // armed lane (or preserves them verbatim when several lanes are armed).
+    // `daemon` gates the whole lane layer — see `split_lane`.
     let mut lanes = Lanes::new();
     let mut seen_warnings: HashSet<String> = HashSet::new();
 
     for line in stripped.lines() {
         // Classify on the module-prefix-stripped view; emit the original so
         // module identity survives in mvnd parallel reactors.
-        let (key, core) = split_lane(line);
+        let (key, core) = split_lane(line, daemon);
         let (idx, keyed) = match lanes.route(key, core) {
             Some(v) => v,
             // Reachable when two modules are armed concurrently (a tie):
@@ -1280,8 +1428,11 @@ pub fn filter_compile(raw: &str) -> String {
             }
             continue;
         }
+        // `[INFO] Building ` gated the same way as `keep_outside_block` —
+        // see the cold-preclear finding on that function's doc comment.
         if BUILD_FOOT.is_match(core)
-            || core.starts_with("[INFO] Building ")
+            || (core.starts_with("[INFO] Building ")
+                && (!(daemon && idx != ROOT_LANE) || BUILDING_MODULE_HEADER.is_match(core)))
             || core.starts_with("[INFO] Total time:")
             || core.starts_with("[INFO] Finished at:")
             || core.starts_with("[INFO] Scanning ")
@@ -1368,11 +1519,11 @@ pub fn filter_compile(raw: &str) -> String {
 /// `[INFO] Running …` line is seen, switches back on `Tests run:` close.
 /// Outside any Surefire block, applies the unified keep-list (compile keepers
 /// + install/artifact lines).
-pub fn filter_package(raw: &str) -> String {
-    filter_package_with_cap(raw, MAX_MVN_FAILING_CLASSES)
+pub fn filter_package(raw: &str, daemon: bool) -> String {
+    filter_package_with_cap(raw, MAX_MVN_FAILING_CLASSES, daemon)
 }
 
-fn filter_package_with_cap(raw: &str, cap: usize) -> String {
+fn filter_package_with_cap(raw: &str, cap: usize, daemon: bool) -> String {
     let stripped = strip_ansi(raw);
     if !has_english_footer(&stripped) {
         return stripped;
@@ -1382,18 +1533,19 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
     // Per-module lanes + raw-line routing: see drive_surefire_line.
     let mut lanes = Lanes::new();
     let mut classes = FailingClassCap::new(cap);
-    let mut summary = FailuresSummaryCap::new(cap);
+    let mut summary = FailuresSummaryCap::new(cap, daemon);
     let mut in_reactor_summary = false;
     // Warning dedup is deliberately global: the same warning surfacing from
     // several reactor modules is still the same warning.
     let mut seen_warnings: HashSet<String> = HashSet::new();
 
     for line in stripped.lines() {
-        let (idx, core, keyed) =
-            match drive_surefire_line(&mut lanes, line, &mut classes, &mut out) {
-                Some(v) => v,
-                None => continue,
-            };
+        let (idx, core, keyed) = match drive_surefire_line(
+            &mut lanes, line, &mut classes, &mut summary, daemon, &mut out,
+        ) {
+            Some(v) => v,
+            None => continue,
+        };
         // Failures-summary cap (see filter_surefire_with_cap for details).
         {
             let lane = lanes.get(idx);
@@ -1406,10 +1558,10 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
         // clears-flag side effect always runs regardless of `||` short-circuit.
         let reactor_keep = reactor_summary_keep(core, &mut in_reactor_summary);
         // Outside any Surefire block: compile-keep AND surefire-outside-keep merge.
-        if reactor_keep || MODULE_BANNER.is_match(core) || keep_outside_block(core) {
+        if reactor_keep || MODULE_BANNER.is_match(core) || keep_outside_block(core, daemon && idx != ROOT_LANE) {
             let lane = lanes.get(idx);
             summary.handle_aggregate(core, &mut lane.dropped, &mut out, &mut lane.in_summary);
-            summary.handle_header(core, &mut lane.in_summary, idx);
+            summary.handle_header(core, &mut lane.in_summary, &mut lane.dropped);
             out.push_str(line);
             out.push('\n');
             // Armed flag is an owner claim scanned by raw_owner; only keyed
@@ -1645,21 +1797,21 @@ fn run_tool(args: &[String], daemon: bool, verbose: u8) -> Result<i32> {
             new_mvn_command(args, daemon),
             tool,
             &args_display,
-            filter_surefire,
+            move |raw: &str| filter_surefire(raw, daemon),
             RunOptions::with_tee("mvn_test"),
         ),
         MvnPhase::Compile => runner::run_filtered(
             new_mvn_command(args, daemon),
             tool,
             &args_display,
-            filter_compile,
+            move |raw: &str| filter_compile(raw, daemon),
             RunOptions::with_tee("mvn_compile"),
         ),
         MvnPhase::Package => runner::run_filtered(
             new_mvn_command(args, daemon),
             tool,
             &args_display,
-            filter_package,
+            move |raw: &str| filter_package(raw, daemon),
             RunOptions::with_tee("mvn_package"),
         ),
         MvnPhase::Passthrough => {
@@ -1681,6 +1833,258 @@ mod tests {
         s.split_whitespace().count()
     }
 
+    /// Cold-preclear finding (upstream PR #3199, fourth review round): the
+    /// `[INFO] Building ` keeper was a bare `starts_with`, so on a *tagged*
+    /// lane it kept any app log merely shaped like one — mvnd tags a
+    /// module's entire output stream with its own module tag regardless of
+    /// which thread emitted a line, so background/pool logging from a
+    /// module's own code (`[child-a] [INFO] Building segment N of the data
+    /// pipeline`) is exactly as opener/keeper-shaped as mvnd's own genuine
+    /// `Building <name> <version> [n/m]` header. Probe: 50 such lines in an
+    /// otherwise-green single-module run kept wholesale pre-fix (bloating
+    /// output on a real reactor's 2000-line equivalent to ~0.1% savings);
+    /// post-fix, dropped, same as plain `mvn` already drops any `[INFO]`
+    /// line outside its keep-list.
+    #[test]
+    fn daemon_mode_building_keeper_drops_app_log_spam_on_tagged_lane() {
+        let mut i = String::from(
+            "[INFO] Scanning for projects...\n\
+             [child-a] [INFO] ----------------------< com.example.rtk:child-a >-----------------------\n\
+             [child-a] [INFO] Building child-a 1.0.0-SNAPSHOT                                    [1/1]\n\
+             [child-a] [INFO] Running com.example.rtk.APassTest\n\
+             [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.APassTest\n",
+        );
+        for n in 0..50 {
+            i.push_str(&format!(
+                "[child-a] [INFO] Building segment {n} of the data pipeline\n"
+            ));
+        }
+        i.push_str("[INFO] BUILD SUCCESS\n");
+        let o = filter_surefire(&i, true);
+        assert!(
+            !o.contains("Building segment"),
+            "app-log spam shaped like a Building header is dropped on a tagged lane; got:\n{o}"
+        );
+        assert!(
+            o.contains("< com.example.rtk:child-a >") && o.contains("BUILD SUCCESS"),
+            "genuine module banner and footer survive; got:\n{o}"
+        );
+        assert!(
+            o.len() < 400,
+            "savings recover once the spam is dropped (input was {} bytes); got {} bytes:\n{o}",
+            i.len(),
+            o.len()
+        );
+    }
+
+    /// Real-fixture control for the same gate: mvnd's own genuine
+    /// `Building <name> <version> [n/m]` headers (the shape
+    /// [`BUILDING_MODULE_HEADER`] requires) must still survive on tagged
+    /// lanes — the gate narrows, it doesn't drop real content. Already
+    /// covered end-to-end by the `mvnd_reactor_pass_full_output` /
+    /// `mvnd_parallel_reactor_fail_full_output` fixture-diff tests staying
+    /// green (both fixtures' `Building … [n/3]` lines are asserted present
+    /// via `include_str!`-fixture byte equality); this test pins the
+    /// specific line directly, independent of the fuller snapshot.
+    #[test]
+    fn daemon_mode_building_keeper_keeps_real_module_header() {
+        let i = include_str!("../../../tests/fixtures/mvnd_reactor_pass_raw.txt");
+        let o = filter_package(i, true);
+        assert!(
+            o.contains("Building child-a 1.0.0-SNAPSHOT") && o.contains("Building child-b 1.0.0-SNAPSHOT"),
+            "genuine `[n/m]`-numbered module headers survive on tagged lanes; got:\n{o}"
+        );
+    }
+
+    /// Cold-preclear pin (upstream PR #3199, fourth review round): unlike
+    /// `[ERROR]`/`Building`, `is_lane_opener`'s `RUNNING` arm has no
+    /// fixture-grounded shape to narrow on, so an app log merely shaped
+    /// `[main] [INFO] Running the widget pipeline` still mints a tagged lane
+    /// in daemon mode. Enforced contract (see `is_lane_opener`'s doc
+    /// comment): that lane's unconfirmed tag never gets a genuine `CLOSE`
+    /// line, so its block flushes verbatim, in its own order, at
+    /// end-of-stream — after every other lane's content, including the
+    /// build footer. Bounded to exactly that one line: nothing else
+    /// reorders, nothing is lost, no other lane's content is touched.
+    #[test]
+    fn app_log_running_line_mints_tagged_lane_and_flushes_at_end_of_stream() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [child-a] [INFO] Running com.example.rtk.APassTest\n\
+                  [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.APassTest\n\
+                  [main] [INFO] Running the widget pipeline\n\
+                  [INFO] BUILD SUCCESS\n";
+        let o = filter_surefire(i, true);
+        assert_eq!(
+            o.matches("Running the widget pipeline").count(),
+            1,
+            "the app-log line survives exactly once, not lost or duplicated; got:\n{o}"
+        );
+        let pipeline = o.find("Running the widget pipeline").expect("line kept");
+        let footer = o.find("BUILD SUCCESS").expect("footer kept");
+        assert!(
+            footer < pipeline,
+            "the unconfirmed tag's block flushes at end-of-stream, after the footer \
+             (bounded over-keep + reorder of exactly this one line); got:\n{o}"
+        );
+        assert!(
+            o.contains("Scanning for projects"),
+            "unrelated content is untouched; got:\n{o}"
+        );
+    }
+
+    // Thin `daemon`-fixed wrappers so the bulk of the test suite (written
+    // before the `daemon` gate — cold-preclear finding, upstream PR #3199,
+    // third review round) keeps its original `fn(&str) -> String` /
+    // `fn(&str, usize) -> String` call shape. `_plain` == real `mvn`
+    // (`daemon == false`, base parity by construction); `_daemon` == `mvnd`.
+    fn filter_surefire_plain(raw: &str) -> String {
+        filter_surefire(raw, false)
+    }
+    fn filter_surefire_daemon(raw: &str) -> String {
+        filter_surefire(raw, true)
+    }
+    fn filter_compile_plain(raw: &str) -> String {
+        filter_compile(raw, false)
+    }
+    fn filter_compile_daemon(raw: &str) -> String {
+        filter_compile(raw, true)
+    }
+    fn filter_package_plain(raw: &str) -> String {
+        filter_package(raw, false)
+    }
+    fn filter_package_daemon(raw: &str) -> String {
+        filter_package(raw, true)
+    }
+    fn filter_surefire_with_cap_plain(raw: &str, cap: usize) -> String {
+        filter_surefire_with_cap(raw, cap, false)
+    }
+    fn filter_surefire_with_cap_daemon(raw: &str, cap: usize) -> String {
+        filter_surefire_with_cap(raw, cap, true)
+    }
+    fn filter_package_with_cap_plain(raw: &str, cap: usize) -> String {
+        filter_package_with_cap(raw, cap, false)
+    }
+    fn filter_package_with_cap_daemon(raw: &str, cap: usize) -> String {
+        filter_package_with_cap(raw, cap, true)
+    }
+
+    /// Cold-preclear finding #2 (upstream PR #3199, third review round),
+    /// KuSh's "fuller two-module probe": module banners, `Running`, genuine
+    /// failing closes (Surefire 3.x multi-failure shape — one class per
+    /// module, two failing methods each), per-module `Results:`/`Failures:`,
+    /// and interleaved `AGG` lines — modeled on `mvnd_reactor_fail_raw.txt`'s
+    /// real shape, extended with enough failures to exceed the cap. Asserts
+    /// all three things the finding named: the reactor-wide budget still
+    /// engages on real (non-root) lanes (2 kept, not 4), each lane's tail is
+    /// attributed to its own AGG (never the other lane's), and output order
+    /// stays sane (banners before Running before closes before the capped
+    /// summary before the reactor footer).
+    fn assert_fuller_two_module_probe_engages_cap(filter: fn(&str, usize) -> String) {
+        let i = "[INFO] Scanning for projects...\n\
+             [child-b] [INFO] ----------------------< com.example.rtk:child-b >-----------------------\n\
+             [child-b] [INFO] Building child-b 1.0.0-SNAPSHOT\n\
+             [child-a] [INFO] ----------------------< com.example.rtk:child-a >-----------------------\n\
+             [child-a] [INFO] Building child-a 1.0.0-SNAPSHOT\n\
+             [child-a] [INFO] Running com.example.rtk.AMultiFailTest\n\
+             [child-b] [INFO] Running com.example.rtk.BMultiFailTest\n\
+             [child-a] [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE! -- in com.example.rtk.AMultiFailTest\n\
+             [child-a] [ERROR] com.example.rtk.AMultiFailTest.first -- Time elapsed: 0.02 s <<< FAILURE!\n\
+             java.lang.AssertionError: a1 boom\n\
+             \tat com.example.rtk.AMultiFailTest.first(AMultiFailTest.java:10)\n\
+             [child-a] [INFO] \n\
+             [child-b] [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0, Time elapsed: 0.04 s <<< FAILURE! -- in com.example.rtk.BMultiFailTest\n\
+             [child-b] [ERROR] com.example.rtk.BMultiFailTest.first -- Time elapsed: 0.02 s <<< FAILURE!\n\
+             java.lang.AssertionError: b1 boom\n\
+             \tat com.example.rtk.BMultiFailTest.first(BMultiFailTest.java:10)\n\
+             [child-b] [INFO] \n\
+             [child-a] [ERROR] com.example.rtk.AMultiFailTest.second -- Time elapsed: 0.02 s <<< FAILURE!\n\
+             java.lang.AssertionError: a2 boom\n\
+             \tat com.example.rtk.AMultiFailTest.second(AMultiFailTest.java:20)\n\
+             [child-a] [INFO] \n\
+             [child-b] [ERROR] com.example.rtk.BMultiFailTest.second -- Time elapsed: 0.02 s <<< FAILURE!\n\
+             java.lang.AssertionError: b2 boom\n\
+             \tat com.example.rtk.BMultiFailTest.second(BMultiFailTest.java:20)\n\
+             [child-b] [INFO] \n\
+             [child-a] [INFO] Results:\n\
+             [child-b] [INFO] Results:\n\
+             [child-a] [ERROR] Failures: \n\
+             [child-b] [ERROR] Failures: \n\
+             [child-a] [ERROR]   AMultiFailTest.first:10 a1 boom\n\
+             [child-b] [ERROR]   BMultiFailTest.first:10 b1 boom\n\
+             [child-a] [ERROR]   AMultiFailTest.second:20 a2 boom\n\
+             [child-b] [ERROR]   BMultiFailTest.second:20 b2 boom\n\
+             [child-a] [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0\n\
+             [child-b] [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0\n\
+             [INFO] Reactor Summary for multi-module-fail-skeleton 1.0.0-SNAPSHOT:\n\
+             [INFO] \n\
+             [INFO] child-a ............................................ FAILURE [  1.234 s]\n\
+             [INFO] child-b ............................................ FAILURE [  1.234 s]\n\
+             [INFO] BUILD FAILURE\n";
+        let o = filter(i, 2);
+
+        // Cap engagement: only the *first* summary entry per module is
+        // kept — pre-fix (stale open block swallowing the header/entries)
+        // all 4 would survive.
+        assert!(
+            o.contains("AMultiFailTest.first:10 a1 boom") && o.contains("BMultiFailTest.first:10 b1 boom"),
+            "the first entry of each module's summary is kept; got:\n{o}"
+        );
+        assert!(
+            !o.contains("AMultiFailTest.second:20 a2 boom") && !o.contains("BMultiFailTest.second:20 b2 boom"),
+            "the second entry of each module's summary is capped, not kept; got:\n{o}"
+        );
+
+        // Per-lane tail attribution: each module's own drop is reported
+        // under its own AGG, not the other module's.
+        assert_eq!(
+            o.matches("… +1 more failures").count(),
+            2,
+            "each module reports exactly its own one dropped entry; got:\n{o}"
+        );
+        assert!(
+            !o.contains("… +2 more failures"),
+            "no module's tail should absorb the other's drop; got:\n{o}"
+        );
+        let a_header = o.find("[child-a] [ERROR] Failures:").expect("child-a header kept");
+        let a_agg = o
+            .find("[child-a] [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0\n")
+            .expect("child-a AGG kept");
+        let b_header = o.find("[child-b] [ERROR] Failures:").expect("child-b header kept");
+        let b_agg = o
+            .rfind("[child-b] [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0\n")
+            .expect("child-b AGG kept");
+        assert!(
+            o[a_header..a_agg].contains("… +1 more failures"),
+            "child-a's tail sits between its own header and its own AGG; got:\n{o}"
+        );
+        assert!(
+            o[b_header..b_agg].contains("… +1 more failures"),
+            "child-b's tail sits between its own header and its own AGG; got:\n{o}"
+        );
+
+        // Ordering: banners, Running, and the capped summary all survive in
+        // a sane relative order, ending at the reactor footer.
+        let banner_a = o.find("< com.example.rtk:child-a >").expect("child-a banner kept");
+        let running_a = o
+            .find("Running com.example.rtk.AMultiFailTest")
+            .expect("child-a Running kept");
+        let build_failure = o.rfind("BUILD FAILURE").expect("footer kept");
+        assert!(
+            banner_a < running_a && running_a < a_header && a_header < a_agg && a_agg < build_failure,
+            "banner < Running < header < AGG < footer; got:\n{o}"
+        );
+    }
+
+    #[test]
+    fn mvnd_fuller_two_module_probe_engages_cap() {
+        assert_fuller_two_module_probe_engages_cap(filter_surefire_with_cap_daemon);
+    }
+
+    #[test]
+    fn mvnd_package_fuller_two_module_probe_engages_cap() {
+        assert_fuller_two_module_probe_engages_cap(filter_package_with_cap_daemon);
+    }
+
     /// Reviewer finding #3 (upstream PR #3199, second review round): d602a3b
     /// gated every fall-through `keep_continuation` disarm on `keyed`,
     /// protecting mvnd's tagged lanes — but the root (untagged) lane, the
@@ -1700,7 +2104,7 @@ mod tests {
     /// output grown to 1588 / 2391 bytes) — a regression on either axis fails
     /// this test.
     fn assert_root_lane_disarms_on_raw_trail_line(fixture: &str, expected_bytes: usize) {
-        let o = filter_compile(fixture);
+        let o = filter_compile(fixture, true);
         let frames = o
             .lines()
             .filter(|l| l.trim_start().starts_with("at "))
@@ -1851,7 +2255,7 @@ mod tests {
     #[test]
     fn mvnd_reactor_pass_keeps_summary_drops_daemon_noise() {
         let i = include_str!("../../../tests/fixtures/mvnd_reactor_pass_raw.txt");
-        let o = filter_package(i);
+        let o = filter_package(i, true);
         assert!(o.contains("[INFO] Reactor Summary for multi-module-skeleton 1.0.0-SNAPSHOT:"));
         assert!(o.contains("child-a ............................................ SUCCESS"));
         assert!(o.contains("child-b ............................................ SUCCESS"));
@@ -1872,7 +2276,7 @@ mod tests {
     #[test]
     fn mvnd_reactor_pass_savings() {
         let i = include_str!("../../../tests/fixtures/mvnd_reactor_pass_raw.txt");
-        let o = filter_package(i);
+        let o = filter_package(i, true);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
         assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
     }
@@ -1883,7 +2287,7 @@ mod tests {
     #[test]
     fn mvnd_test_fail_preserves_failures() {
         let i = include_str!("../../../tests/fixtures/mvnd_test_fail_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, true);
         assert!(o.contains("[INFO] Running com.example.rtk.BoomTest"));
         assert!(o.contains("[INFO] Running com.example.rtk.CalcTest"));
         assert!(o.contains("failOne: addition should equal five ==> expected: <5> but was: <4>"));
@@ -1905,7 +2309,7 @@ mod tests {
     #[test]
     fn mvnd_test_fail_savings() {
         let i = include_str!("../../../tests/fixtures/mvnd_test_fail_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, true);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
         assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
     }
@@ -1920,7 +2324,7 @@ mod tests {
     #[test]
     fn mvnd_parallel_reactor_fail_preserves_diagnostics() {
         let i = include_str!("../../../tests/fixtures/mvnd_reactor_fail_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, true);
         assert!(o.contains("[child-a] [INFO] Running com.example.rtk.ParallelFailTest"));
         assert!(o.contains(
             "[child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed:"
@@ -1948,7 +2352,7 @@ mod tests {
     #[test]
     fn mvnd_parallel_reactor_fail_savings() {
         let i = include_str!("../../../tests/fixtures/mvnd_reactor_fail_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, true);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
         assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
     }
@@ -1997,12 +2401,12 @@ mod tests {
 
     #[test]
     fn mvnd_interleaved_block_does_not_steal_failure_trail() {
-        assert_interleaved_trail_survives(filter_surefire);
+        assert_interleaved_trail_survives(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_package_interleaved_block_does_not_steal_failure_trail() {
-        assert_interleaved_trail_survives(filter_package);
+        assert_interleaved_trail_survives(filter_package_daemon);
     }
 
     /// Raw lines with no unambiguous owner — several plain blocks open, no
@@ -2025,12 +2429,12 @@ mod tests {
 
     #[test]
     fn mvnd_ambiguous_raw_line_is_preserved() {
-        assert_ambiguous_raw_line_preserved(filter_surefire);
+        assert_ambiguous_raw_line_preserved(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_package_ambiguous_raw_line_is_preserved() {
-        assert_ambiguous_raw_line_preserved(filter_package);
+        assert_ambiguous_raw_line_preserved(filter_package_daemon);
     }
 
     /// javac emits `symbol:` / `location:` as raw indented lines *after* the
@@ -2045,7 +2449,7 @@ mod tests {
              \x20 symbol:   variable bar\n\
              \x20 location: class com.example.rtk.A\n\
              [INFO] BUILD FAILURE\n";
-        let o = filter_compile(i);
+        let o = filter_compile(i, true);
         assert!(
             o.contains("symbol:   variable bar"),
             "continuation survives the interleave; got:\n{o}"
@@ -2065,12 +2469,18 @@ mod tests {
     /// cap=2 budget, so each gets its own `… +1 more failures`, not one
     /// combined `… +2 more failures` sitting under whichever AGG happened
     /// to arrive first.
+    ///
+    /// Cold-preclear finding (upstream PR #3199, third review round): a bare
+    /// `Running` line — no explicit close for it — is exactly what real
+    /// mvnd always emits for a module before its failures summary
+    /// (establishing the lane), and is deliberately used here rather than a
+    /// `Running` + passing-close pair: the pair alone doesn't reach the
+    /// stale-open-block path this test guards, so it wouldn't have caught
+    /// the regression.
     fn assert_summary_cap_shared_across_lanes(filter: fn(&str, usize) -> String) {
         let i = "[INFO] Scanning for projects...\n\
              [child-a] [INFO] Running com.example.rtk.ChildAPass\n\
-             [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildAPass\n\
              [child-b] [INFO] Running com.example.rtk.ChildBPass\n\
-             [child-b] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildBPass\n\
              [child-a] [ERROR] Failures: \n\
              [child-a] [ERROR]   ChildATest.one:11 boom a1\n\
              [child-b] [ERROR] Failures: \n\
@@ -2099,12 +2509,12 @@ mod tests {
 
     #[test]
     fn mvnd_failures_summary_cap_is_shared_across_lanes() {
-        assert_summary_cap_shared_across_lanes(filter_surefire_with_cap);
+        assert_summary_cap_shared_across_lanes(filter_surefire_with_cap_daemon);
     }
 
     #[test]
     fn mvnd_package_failures_summary_cap_is_shared_across_lanes() {
-        assert_summary_cap_shared_across_lanes(filter_package_with_cap);
+        assert_summary_cap_shared_across_lanes(filter_package_with_cap_daemon);
     }
 
     /// Reviewer finding #2 (upstream PR #3199, second review round), exact
@@ -2132,9 +2542,7 @@ mod tests {
     fn assert_shared_budget_race_attributes_tails_per_lane(filter: fn(&str, usize) -> String) {
         let i = "[INFO] Scanning for projects...\n\
              [child-a] [INFO] Running com.example.rtk.ChildAPass\n\
-             [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildAPass\n\
              [child-b] [INFO] Running com.example.rtk.ChildBPass\n\
-             [child-b] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildBPass\n\
              [child-a] [ERROR] Failures: \n\
              [child-a] [ERROR]   ChildATest.one:11 boom a1\n\
              [child-a] [ERROR]   ChildATest.two:12 boom a2\n\
@@ -2180,12 +2588,12 @@ mod tests {
 
     #[test]
     fn mvnd_shared_budget_race_attributes_tails_per_lane() {
-        assert_shared_budget_race_attributes_tails_per_lane(filter_surefire_with_cap);
+        assert_shared_budget_race_attributes_tails_per_lane(filter_surefire_with_cap_daemon);
     }
 
     #[test]
     fn mvnd_package_shared_budget_race_attributes_tails_per_lane() {
-        assert_shared_budget_race_attributes_tails_per_lane(filter_package_with_cap);
+        assert_shared_budget_race_attributes_tails_per_lane(filter_package_with_cap_daemon);
     }
 
     /// The failures-summary budget spans the whole invocation: module
@@ -2195,9 +2603,7 @@ mod tests {
     fn assert_summary_cap_spans_sequential_lanes(filter: fn(&str, usize) -> String) {
         let i = "[INFO] Scanning for projects...\n\
              [child-a] [INFO] Running com.example.rtk.ChildAPass\n\
-             [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildAPass\n\
              [child-b] [INFO] Running com.example.rtk.ChildBPass\n\
-             [child-b] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildBPass\n\
              [child-a] [ERROR] Failures: \n\
              [child-a] [ERROR]   ChildATest.one:11 boom a1\n\
              [child-a] [ERROR]   ChildATest.two:12 boom a2\n\
@@ -2221,12 +2627,12 @@ mod tests {
 
     #[test]
     fn mvnd_failures_summary_cap_spans_sequential_lanes() {
-        assert_summary_cap_spans_sequential_lanes(filter_surefire_with_cap);
+        assert_summary_cap_spans_sequential_lanes(filter_surefire_with_cap_daemon);
     }
 
     #[test]
     fn mvnd_package_failures_summary_cap_spans_sequential_lanes() {
-        assert_summary_cap_spans_sequential_lanes(filter_package_with_cap);
+        assert_summary_cap_spans_sequential_lanes(filter_package_with_cap_daemon);
     }
 
     /// Reviewer probe (upstream PR #3199 finding 1): `mvn verify`/`install`
@@ -2248,7 +2654,7 @@ mod tests {
         }
         i.push_str("[ERROR] Tests run: 12, Failures: 12, Errors: 0, Skipped: 0\n[INFO] BUILD FAILURE\n");
 
-        let o = filter_package(&i);
+        let o = filter_package(&i, false);
         assert_eq!(
             o.matches("boom u").count(),
             10,
@@ -2295,12 +2701,12 @@ mod tests {
 
     #[test]
     fn surefire_errors_only_summary_respects_cap() {
-        assert_errors_only_summary_respects_cap(filter_surefire_with_cap);
+        assert_errors_only_summary_respects_cap(filter_surefire_with_cap_plain);
     }
 
     #[test]
     fn package_errors_only_summary_respects_cap() {
-        assert_errors_only_summary_respects_cap(filter_package_with_cap);
+        assert_errors_only_summary_respects_cap(filter_package_with_cap_plain);
     }
 
     /// Cold-preclear finding (🟡 2): truncated output — a lane's failures
@@ -2316,9 +2722,7 @@ mod tests {
     fn assert_truncated_summary_flushes_per_lane_tail(filter: fn(&str, usize) -> String) {
         let i = "[INFO] BUILD FAILURE\n\
              [child-a] [INFO] Running com.example.rtk.ChildAPass\n\
-             [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildAPass\n\
              [child-b] [INFO] Running com.example.rtk.ChildBPass\n\
-             [child-b] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.ChildBPass\n\
              [child-a] [ERROR] Failures: \n\
              [child-a] [ERROR]   ChildATest.one:11 boom a1\n\
              [child-a] [ERROR]   ChildATest.two:12 boom a2\n\
@@ -2348,12 +2752,12 @@ mod tests {
 
     #[test]
     fn mvnd_truncated_summary_flushes_per_lane_tail() {
-        assert_truncated_summary_flushes_per_lane_tail(filter_surefire_with_cap);
+        assert_truncated_summary_flushes_per_lane_tail(filter_surefire_with_cap_daemon);
     }
 
     #[test]
     fn mvnd_package_truncated_summary_flushes_per_lane_tail() {
-        assert_truncated_summary_flushes_per_lane_tail(filter_package_with_cap);
+        assert_truncated_summary_flushes_per_lane_tail(filter_package_with_cap_daemon);
     }
 
     /// Same phase-reset invariant as `failures_summary_cap_resets_per_phase_on_same_lane`,
@@ -2373,7 +2777,7 @@ mod tests {
         }
         i.push_str("[ERROR] Tests run: 0, Failures: 0, Errors: 12, Skipped: 0\n[INFO] BUILD FAILURE\n");
 
-        let o = filter_package(&i);
+        let o = filter_package(&i, false);
         assert_eq!(
             o.matches("boom u").count(),
             10,
@@ -2391,42 +2795,47 @@ mod tests {
         );
     }
 
-    /// Reviewer follow-up (upstream PR #3199, final review round): child-a
-    /// and child-b both finish a first-generation summary (Surefire), then
-    /// child-a opens its second-generation summary (Failsafe) — the reset
-    /// generation boundary. Before child-a's second-generation summary
-    /// closes, child-b's own second-generation header interleaves in. That
-    /// must be treated as child-b's first sighting *in the new generation*
-    /// (sharing the budget child-a already spent), not a second reset — a
-    /// second reset would let child-a's still-open block emit up to
-    /// `2 × cap` entries total instead of `cap`.
+    /// Cold-preclear finding (upstream PR #3199, third review round):
+    /// generation resets are now driven exclusively by
+    /// [`FailuresSummaryCap::observe_plugin_banner`], not lane-repeat
+    /// inference — a design that structurally can't double-reset from two
+    /// *different* lanes' headers repeating (there's no per-lane repeat
+    /// tracking left to trip over), but must also not spuriously reset
+    /// *within* one phase just because two modules each carry their own
+    /// Surefire banner. child-a and child-b share the identical
+    /// `surefire:3.5.5:test (default-test)` goal string — `observe_plugin_banner`
+    /// must treat child-b's own banner as a no-op (same phase), not a fresh
+    /// budget, even though it's a different lane's banner.
     #[test]
-    fn interleaved_second_generation_header_does_not_double_reset_budget() {
+    fn same_goal_banners_from_different_lanes_do_not_reset_budget() {
         let i = "[INFO] Scanning for projects...\n\
+                  [child-a] [INFO] --- surefire:3.5.5:test (default-test) @ child-a ---\n\
+                  [child-a] [INFO] Running com.example.rtk.AOneTest\n\
+                  [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.AOneTest\n\
+                  [child-b] [INFO] --- surefire:3.5.5:test (default-test) @ child-b ---\n\
+                  [child-b] [INFO] Running com.example.rtk.BOneTest\n\
+                  [child-b] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.BOneTest\n\
                   [child-a] [ERROR] Failures:\n\
                   [child-a] [ERROR]   entryA1\n\
-                  [child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n\
+                  [child-a] [ERROR]   entryA2\n\
                   [child-b] [ERROR] Failures:\n\
                   [child-b] [ERROR]   entryB1\n\
+                  [child-a] [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0\n\
                   [child-b] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n\
-                  [child-a] [ERROR] Failures:\n\
-                  [child-a] [ERROR]   entryA2\n\
-                  [child-a] [ERROR]   entryA3\n\
-                  [child-b] [ERROR] Failures:\n\
-                  [child-a] [ERROR]   entryA4\n\
-                  [child-a] [ERROR] Tests run: 3, Failures: 3, Errors: 0, Skipped: 0\n\
-                  [child-b] [ERROR]   entryB2\n\
-                  [child-b] [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0\n\
                   [INFO] BUILD FAILURE\n";
-        let o = filter_package_with_cap(i, 2);
+        let o = filter_package_with_cap(i, 2, true);
         assert!(
-            o.contains("entryA2") && o.contains("entryA3"),
-            "second-generation entries under the cap survive; got:\n{o}"
+            o.contains("entryA1") && o.contains("entryA2"),
+            "child-a's two entries fill the shared cap=2 budget; got:\n{o}"
         );
         assert!(
-            !o.contains("entryA4"),
-            "child-a's second-generation block stays at cap=2, not 3 \
-             (child-b's interleaved header must not double-reset the budget); got:\n{o}"
+            !o.contains("entryB1"),
+            "child-b's own same-goal banner must not grant it a fresh budget; got:\n{o}"
+        );
+        assert_eq!(
+            o.matches("… +1 more failures").count(),
+            1,
+            "exactly one dropped entry (child-b's), not a doubled or missing tail; got:\n{o}"
         );
     }
 
@@ -2455,12 +2864,12 @@ mod tests {
 
     #[test]
     fn mvnd_surefire_interleaved_compile_continuation_survives() {
-        assert_interleaved_compile_continuation_survives(filter_surefire);
+        assert_interleaved_compile_continuation_survives(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_package_interleaved_compile_continuation_survives() {
-        assert_interleaved_compile_continuation_survives(filter_package);
+        assert_interleaved_compile_continuation_survives(filter_package_daemon);
     }
 
     // ── Exhaustive interleaving sweeps ──────────────────────────────────────
@@ -2567,12 +2976,12 @@ mod tests {
 
     #[test]
     fn mvnd_every_interleaving_keeps_diagnostics() {
-        assert_every_interleaving_keeps_diagnostics(filter_surefire);
+        assert_every_interleaving_keeps_diagnostics(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_package_every_interleaving_keeps_diagnostics() {
-        assert_every_interleaving_keeps_diagnostics(filter_package);
+        assert_every_interleaving_keeps_diagnostics(filter_package_daemon);
     }
 
     /// Two failing modules under `cap = 1`, all 924 merges: whichever class
@@ -2614,12 +3023,12 @@ mod tests {
 
     #[test]
     fn mvnd_every_interleaving_keeps_admitted_class() {
-        assert_every_interleaving_keeps_admitted_class(filter_surefire_with_cap);
+        assert_every_interleaving_keeps_admitted_class(filter_surefire_with_cap_daemon);
     }
 
     #[test]
     fn mvnd_package_every_interleaving_keeps_admitted_class() {
-        assert_every_interleaving_keeps_admitted_class(filter_package_with_cap);
+        assert_every_interleaving_keeps_admitted_class(filter_package_with_cap_daemon);
     }
 
     /// Compile-error module × passing test module, all 35 merges: the raw
@@ -2644,12 +3053,12 @@ mod tests {
 
     #[test]
     fn mvnd_every_interleaving_keeps_compile_continuation() {
-        assert_every_interleaving_keeps_compile_continuation(filter_surefire);
+        assert_every_interleaving_keeps_compile_continuation(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_package_every_interleaving_keeps_compile_continuation() {
-        assert_every_interleaving_keeps_compile_continuation(filter_package);
+        assert_every_interleaving_keeps_compile_continuation(filter_package_daemon);
     }
 
     /// Compile-error module × *failing* test module, all 84 merges: the armed
@@ -2676,12 +3085,12 @@ mod tests {
 
     #[test]
     fn mvnd_every_interleaving_keeps_continuation_and_failure() {
-        assert_every_interleaving_keeps_continuation_and_failure(filter_surefire);
+        assert_every_interleaving_keeps_continuation_and_failure(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_package_every_interleaving_keeps_continuation_and_failure() {
-        assert_every_interleaving_keeps_continuation_and_failure(filter_package);
+        assert_every_interleaving_keeps_continuation_and_failure(filter_package_daemon);
     }
 
     /// Dropping-trail variant of the orphaned-continuation case, cap=1: A's
@@ -2720,12 +3129,12 @@ mod tests {
 
     #[test]
     fn mvnd_continuation_survives_dropping_trail() {
-        assert_continuation_survives_dropping_trail(filter_surefire_with_cap);
+        assert_continuation_survives_dropping_trail(filter_surefire_with_cap_daemon);
     }
 
     #[test]
     fn mvnd_package_continuation_survives_dropping_trail() {
-        assert_continuation_survives_dropping_trail(filter_package_with_cap);
+        assert_continuation_survives_dropping_trail(filter_package_with_cap_daemon);
     }
 
     /// Entering a Surefire block retires a lane's stale armed claim: a lane
@@ -2752,12 +3161,12 @@ mod tests {
 
     #[test]
     fn mvnd_block_entry_retires_armed_claim() {
-        assert_block_entry_retires_armed_claim(filter_surefire);
+        assert_block_entry_retires_armed_claim(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_package_block_entry_retires_armed_claim() {
-        assert_block_entry_retires_armed_claim(filter_package);
+        assert_block_entry_retires_armed_claim(filter_package_daemon);
     }
 
     /// An unrelated raw stdout line (another module's, unprefixed) must not
@@ -2780,12 +3189,12 @@ mod tests {
 
     #[test]
     fn mvnd_raw_stray_does_not_disarm_continuation() {
-        assert_raw_stray_does_not_disarm_continuation(filter_surefire);
+        assert_raw_stray_does_not_disarm_continuation(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_package_raw_stray_does_not_disarm_continuation() {
-        assert_raw_stray_does_not_disarm_continuation(filter_package);
+        assert_raw_stray_does_not_disarm_continuation(filter_package_daemon);
     }
 
     /// Reviewer blocker (upstream PR #3199, final review round): a
@@ -2811,22 +3220,22 @@ mod tests {
 
     #[test]
     fn mvnd_warning_interloper_does_not_disarm_continuation() {
-        assert_warning_interloper_does_not_disarm_continuation(filter_surefire);
+        assert_warning_interloper_does_not_disarm_continuation(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_compile_warning_interloper_does_not_disarm_continuation() {
-        assert_warning_interloper_does_not_disarm_continuation(filter_compile);
+        assert_warning_interloper_does_not_disarm_continuation(filter_compile_daemon);
     }
 
     #[test]
     fn mvnd_package_warning_interloper_does_not_disarm_continuation() {
-        assert_warning_interloper_does_not_disarm_continuation(filter_package);
+        assert_warning_interloper_does_not_disarm_continuation(filter_package_daemon);
     }
 
     #[test]
     fn mvnd_compile_raw_stray_does_not_disarm_continuation() {
-        assert_raw_stray_does_not_disarm_continuation(filter_compile);
+        assert_raw_stray_does_not_disarm_continuation(filter_compile_daemon);
     }
 
     /// Cold-preclear finding: a `[tag] [ERROR] …` app-log line for a
@@ -2854,17 +3263,17 @@ mod tests {
 
     #[test]
     fn mvnd_error_interloper_does_not_disarm_continuation() {
-        assert_error_interloper_does_not_disarm_continuation(filter_surefire);
+        assert_error_interloper_does_not_disarm_continuation(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_compile_error_interloper_does_not_disarm_continuation() {
-        assert_error_interloper_does_not_disarm_continuation(filter_compile);
+        assert_error_interloper_does_not_disarm_continuation(filter_compile_daemon);
     }
 
     #[test]
     fn mvnd_package_error_interloper_does_not_disarm_continuation() {
-        assert_error_interloper_does_not_disarm_continuation(filter_package);
+        assert_error_interloper_does_not_disarm_continuation(filter_package_daemon);
     }
 
     /// child-a variant: one class with TWO blank-separated per-test detail
@@ -2906,12 +3315,12 @@ mod tests {
 
     #[test]
     fn mvnd_raw_stray_does_not_disarm_trail_rearm() {
-        assert_raw_stray_does_not_disarm_trail_rearm(filter_surefire);
+        assert_raw_stray_does_not_disarm_trail_rearm(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_package_raw_stray_does_not_disarm_trail_rearm() {
-        assert_raw_stray_does_not_disarm_trail_rearm(filter_package);
+        assert_raw_stray_does_not_disarm_trail_rearm(filter_package_daemon);
     }
 
     /// Drop side of the same claim: with the class capped, the stray must
@@ -2936,12 +3345,12 @@ mod tests {
 
     #[test]
     fn mvnd_raw_stray_does_not_leak_capped_rearm() {
-        assert_raw_stray_does_not_leak_capped_rearm(filter_surefire_with_cap);
+        assert_raw_stray_does_not_leak_capped_rearm(filter_surefire_with_cap_daemon);
     }
 
     #[test]
     fn mvnd_package_raw_stray_does_not_leak_capped_rearm() {
-        assert_raw_stray_does_not_leak_capped_rearm(filter_package_with_cap);
+        assert_raw_stray_does_not_leak_capped_rearm(filter_package_with_cap_daemon);
     }
 
     const RAW_BLANK_STRAY: [&str; 1] = [""];
@@ -2970,12 +3379,12 @@ mod tests {
 
     #[test]
     fn mvnd_raw_blank_does_not_terminate_trail() {
-        assert_raw_blank_does_not_terminate_trail(filter_surefire);
+        assert_raw_blank_does_not_terminate_trail(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_package_raw_blank_does_not_terminate_trail() {
-        assert_raw_blank_does_not_terminate_trail(filter_package);
+        assert_raw_blank_does_not_terminate_trail(filter_package_daemon);
     }
 
     /// Drop side of the same claim: with the class capped (fully dropped), a
@@ -3003,12 +3412,12 @@ mod tests {
 
     #[test]
     fn mvnd_raw_blank_does_not_leak_capped_trail() {
-        assert_raw_blank_does_not_leak_capped_trail(filter_surefire_with_cap);
+        assert_raw_blank_does_not_leak_capped_trail(filter_surefire_with_cap_daemon);
     }
 
     #[test]
     fn mvnd_package_raw_blank_does_not_leak_capped_trail() {
-        assert_raw_blank_does_not_leak_capped_trail(filter_package_with_cap);
+        assert_raw_blank_does_not_leak_capped_trail(filter_package_with_cap_daemon);
     }
 
     /// Two modules armed concurrently: raw continuation lines have no unique
@@ -3032,17 +3441,17 @@ mod tests {
 
     #[test]
     fn mvnd_two_armed_lanes_preserve_continuations() {
-        assert_two_armed_lanes_preserve_continuations(filter_surefire);
+        assert_two_armed_lanes_preserve_continuations(filter_surefire_daemon);
     }
 
     #[test]
     fn mvnd_package_two_armed_lanes_preserve_continuations() {
-        assert_two_armed_lanes_preserve_continuations(filter_package);
+        assert_two_armed_lanes_preserve_continuations(filter_package_daemon);
     }
 
     #[test]
     fn mvnd_compile_two_armed_lanes_preserve_continuations() {
-        assert_two_armed_lanes_preserve_continuations(filter_compile);
+        assert_two_armed_lanes_preserve_continuations(filter_compile_daemon);
     }
 
     // Full-output regression tests locking the complete filtered output of
@@ -3056,28 +3465,28 @@ mod tests {
     fn mvnd_reactor_pass_full_output() {
         let i = include_str!("../../../tests/fixtures/mvnd_reactor_pass_raw.txt");
         let expected = include_str!("../../../tests/fixtures/mvnd_reactor_pass_expected.txt");
-        assert_eq!(filter_package(i), expected);
+        assert_eq!(filter_package(i, true), expected);
     }
 
     #[test]
     fn mvnd_test_fail_full_output() {
         let i = include_str!("../../../tests/fixtures/mvnd_test_fail_raw.txt");
         let expected = include_str!("../../../tests/fixtures/mvnd_test_fail_expected.txt");
-        assert_eq!(filter_surefire(i), expected);
+        assert_eq!(filter_surefire(i, true), expected);
     }
 
     #[test]
     fn mvnd_parallel_reactor_fail_full_output() {
         let i = include_str!("../../../tests/fixtures/mvnd_reactor_fail_raw.txt");
         let expected = include_str!("../../../tests/fixtures/mvnd_reactor_fail_expected.txt");
-        assert_eq!(filter_surefire(i), expected);
+        assert_eq!(filter_surefire(i, true), expected);
     }
 
     #[test]
     fn mvnd_compile_error_full_output() {
         let i = include_str!("../../../tests/fixtures/mvnd_compile_error_raw.txt");
         let expected = include_str!("../../../tests/fixtures/mvnd_compile_error_expected.txt");
-        assert_eq!(filter_compile(i), expected);
+        assert_eq!(filter_compile(i, true), expected);
     }
 
     /// `mvnd compile` on a syntax error (exit code 1): compile diagnostics
@@ -3085,7 +3494,7 @@ mod tests {
     #[test]
     fn mvnd_compile_error_preserves_diagnostics() {
         let i = include_str!("../../../tests/fixtures/mvnd_compile_error_raw.txt");
-        let o = filter_compile(i);
+        let o = filter_compile(i, true);
         assert!(o.contains("Calc.java:[5,21] ';' expected"));
         assert!(o.contains("[INFO] BUILD FAILURE"));
         assert!(o.contains("[ERROR] Failed to execute goal"));
@@ -3099,7 +3508,7 @@ mod tests {
     #[test]
     fn mvnd_compile_error_savings() {
         let i = include_str!("../../../tests/fixtures/mvnd_compile_error_raw.txt");
-        let o = filter_compile(i);
+        let o = filter_compile(i, true);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
         assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
     }
@@ -3109,7 +3518,7 @@ mod tests {
     #[test]
     fn filter_surefire_pass_output_compact() {
         let i = include_str!("../../../tests/fixtures/mvn_test_pass_slice_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         // Passing fixture has 5 close lines; all should be dropped (no per-class line in output).
         assert!(!o.contains("Running org.apache.commons.cli.help.UtilTest"));
         assert!(!o.contains("Time elapsed: 1.023 s -- in"));
@@ -3124,7 +3533,7 @@ mod tests {
     #[test]
     fn filter_surefire_fail_keeps_signal() {
         let i = include_str!("../../../tests/fixtures/mvn_test_fail_slice_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(o.contains("BUILD FAILURE"));
         assert!(o.contains("Failures: 1"));
     }
@@ -3132,7 +3541,7 @@ mod tests {
     #[test]
     fn surefire_drops_passing_block() {
         let i = include_str!("../../../tests/fixtures/mvn_test_pass_slice_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(
             !o.contains("at org.junit."),
             "framework frames stripped; got:\n{}",
@@ -3158,7 +3567,7 @@ mod tests {
     #[test]
     fn surefire_preserves_failing_signal() {
         let i = include_str!("../../../tests/fixtures/mvn_test_fail_slice_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(
             o.contains("Failures: 1"),
             "failing aggregate preserved; got:\n{}",
@@ -3186,7 +3595,7 @@ mod tests {
     #[test]
     fn surefire_matches_legacy_2x_close_line() {
         let i = "[INFO] -----< x >-----\n[INFO] Running x.Foo\n[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.123 s - in x.Foo\n[INFO] BUILD SUCCESS\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         // CLOSE matched → passing block dropped silently.
         assert!(
             !o.contains("Running x.Foo"),
@@ -3205,7 +3614,7 @@ mod tests {
     #[test]
     fn surefire_matches_warning_skipped_close_line() {
         let i = "[INFO] -----< x >-----\n[INFO] Running x.Skip\n[WARNING] Tests run: 5, Failures: 0, Errors: 0, Skipped: 5, Time elapsed: 0.010 s -- in x.Skip\n[INFO] BUILD SUCCESS\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(
             !o.contains("Running x.Skip"),
             "[WARNING] close-line matched; block dropped; got:\n{}",
@@ -3227,7 +3636,7 @@ mod tests {
                  \tat org.junit.jupiter.api.Assertions.assertEquals(Assertions.java:1)\n\
                  \n\
                  [INFO] BUILD FAILURE\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(o.contains("AssertionFailedError"), "exception preserved; got:\n{}", o);
         assert!(o.contains("at x.Foo.bar"), "user frame preserved; got:\n{}", o);
         assert!(
@@ -3246,7 +3655,7 @@ mod tests {
     #[test]
     fn surefire_keeps_all_failures_in_multi_failure_class() {
         let i = include_str!("../../../tests/fixtures/mvn_test_multifail_slice_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(
             o.contains("AssertionFailedError: failOne: addition should equal five"),
             "first failure message preserved; got:\n{}",
@@ -3284,7 +3693,7 @@ mod tests {
     #[test]
     fn package_keeps_all_failures_in_multi_failure_class() {
         let i = include_str!("../../../tests/fixtures/mvn_test_multifail_slice_raw.txt");
-        let o = filter_package(i);
+        let o = filter_package(i, false);
         assert!(
             o.contains("AssertionFailedError: failOne: addition should equal five"),
             "first failure message preserved; got:\n{}",
@@ -3332,7 +3741,7 @@ mod tests {
                  \tat x.MultiFail.second(MultiFail.java:30)\n\
                  \n\
                  [INFO] BUILD FAILURE\n";
-        let o = filter_surefire_with_cap(i, 1);
+        let o = filter_surefire_with_cap(i, 1, false);
 
         assert!(o.contains("boomA"), "first class kept; got:\n{}", o);
         assert!(
@@ -3368,7 +3777,7 @@ mod tests {
                  [INFO] Results:\n\
                  [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0\n\
                  [INFO] BUILD FAILURE\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(o.contains("boomSecond"), "second block kept; got:\n{}", o);
         assert!(
             o.contains("[INFO] Results:"),
@@ -3397,7 +3806,7 @@ mod tests {
                  org.opentest4j.AssertionFailedError: boomSecond\n\
                  \n\
                  [INFO] BUILD FAILURE\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(o.contains("boomFirst"), "first block kept; got:\n{}", o);
         assert!(
             o.contains("boomSecond"),
@@ -3418,7 +3827,7 @@ mod tests {
     #[test]
     fn surefire_single_failure_output_unchanged() {
         let i = include_str!("../../../tests/fixtures/mvn_test_fail_slice_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         let expected = "[INFO] Scanning for projects...\n\
                         [INFO] ----------------------< commons-cli:commons-cli >-----------------------\n\
                         [INFO] Building Apache Commons CLI 1.11.1-SNAPSHOT\n\
@@ -3447,7 +3856,7 @@ mod tests {
     #[test]
     fn savings_mvn_test_multifail_slice() {
         let i = include_str!("../../../tests/fixtures/mvn_test_multifail_slice_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
         assert!(
             savings >= 30.0,
@@ -3463,7 +3872,7 @@ mod tests {
     #[test]
     fn surefire_drops_help_boilerplate_in_nonquiet_mode() {
         let i = include_str!("../../../tests/fixtures/mvn_test_multifail_slice_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(
             o.contains("[ERROR] Failed to execute goal"),
             "goal terminator kept; got:\n{}",
@@ -3512,7 +3921,7 @@ mod tests {
     #[test]
     fn surefire_keeps_compile_continuation_on_test_phase() {
         let i = include_str!("../../../tests/fixtures/mvn_test_compile_fail_slice_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(o.contains("cannot find symbol"), "ERROR line preserved; got:\n{}", o);
         assert!(
             o.contains("symbol:   variable bar"),
@@ -3534,7 +3943,7 @@ mod tests {
     #[test]
     fn package_still_keeps_compile_error_continuation_after_refactor() {
         let i = include_str!("../../../tests/fixtures/mvn_compile_error_slice_raw.txt");
-        let o = filter_package(i);
+        let o = filter_package(i, false);
         assert!(o.contains("cannot find symbol"), "ERROR line preserved; got:\n{}", o);
         assert!(
             o.contains("symbol:   variable bar"),
@@ -3572,23 +3981,23 @@ mod tests {
 
     #[test]
     fn surefire_root_lane_arms_broadly_without_file_coord() {
-        assert_root_lane_arms_broadly_without_file_coord(filter_surefire);
+        assert_root_lane_arms_broadly_without_file_coord(filter_surefire_plain);
     }
 
     #[test]
     fn compile_root_lane_arms_broadly_without_file_coord() {
-        assert_root_lane_arms_broadly_without_file_coord(filter_compile);
+        assert_root_lane_arms_broadly_without_file_coord(filter_compile_plain);
     }
 
     #[test]
     fn package_root_lane_arms_broadly_without_file_coord() {
-        assert_root_lane_arms_broadly_without_file_coord(filter_package);
+        assert_root_lane_arms_broadly_without_file_coord(filter_package_plain);
     }
 
     #[test]
     fn surefire_keeps_module_banner() {
         let i = "[INFO] Scanning for projects...\n[INFO] -----< com.example:myapp >-----\n[INFO] BUILD SUCCESS\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(o.contains("-----< com.example:myapp >-----"));
     }
 
@@ -3600,7 +4009,7 @@ mod tests {
     #[test]
     fn surefire_preserves_real_durations() {
         let i = "[INFO] -----< x >-----\n[INFO] Running x.Foo\n[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 2.341 s <<< FAILURE! - in x.Foo\n[INFO] BUILD FAILURE\n[INFO] Total time:  4.567 s\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(
             o.contains("2.341 s"),
             "raw close-line duration preserved; got:\n{}",
@@ -3621,7 +4030,7 @@ mod tests {
     #[test]
     fn footer_guard_french_passthrough() {
         let i = include_str!("../../../tests/fixtures/mvn_locale_fr_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         assert!(
             o.contains("BUILD ÉCHEC"),
             "footer-guard must pass through non-English output; got:\n{}",
@@ -3638,7 +4047,7 @@ mod tests {
     #[test]
     fn footer_guard_no_pom_passthrough() {
         let i = include_str!("../../../tests/fixtures/mvn_no_pom_raw.txt");
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, false);
         // No BUILD footer → passthrough; user sees the `[ERROR] no POM` line.
         assert!(
             o.contains("there is no POM"),
@@ -3660,9 +4069,9 @@ mod tests {
     fn surefire_handles_crlf_line_endings() {
         let i_lf = include_str!("../../../tests/fixtures/mvn_test_pass_slice_raw.txt")
             .replace("\r\n", "\n");
-        let o_lf = filter_surefire(&i_lf);
+        let o_lf = filter_surefire(&i_lf, false);
         let i_crlf = i_lf.replace('\n', "\r\n");
-        let o_crlf = filter_surefire(&i_crlf);
+        let o_crlf = filter_surefire(&i_crlf, false);
         assert_eq!(
             o_lf,
             o_crlf.replace("\r\n", "\n"),
@@ -3674,9 +4083,9 @@ mod tests {
     fn package_handles_crlf_line_endings() {
         let i_lf = include_str!("../../../tests/fixtures/mvn_install_slice_raw.txt")
             .replace("\r\n", "\n");
-        let o_lf = filter_package(&i_lf);
+        let o_lf = filter_package(&i_lf, false);
         let i_crlf = i_lf.replace('\n', "\r\n");
-        let o_crlf = filter_package(&i_crlf);
+        let o_crlf = filter_package(&i_crlf, false);
         assert_eq!(
             o_lf,
             o_crlf.replace("\r\n", "\n"),
@@ -3688,9 +4097,9 @@ mod tests {
     fn compile_handles_crlf_line_endings() {
         let i_lf = include_str!("../../../tests/fixtures/mvnd_compile_error_raw.txt")
             .replace("\r\n", "\n");
-        let o_lf = filter_compile(&i_lf);
+        let o_lf = filter_compile(&i_lf, false);
         let i_crlf = i_lf.replace('\n', "\r\n");
-        let o_crlf = filter_compile(&i_crlf);
+        let o_crlf = filter_compile(&i_crlf, false);
         assert_eq!(
             o_lf,
             o_crlf.replace("\r\n", "\n"),
@@ -3722,7 +4131,7 @@ mod tests {
         }
         i.push_str("[INFO] BUILD FAILURE\n");
 
-        let o = filter_surefire_with_cap(&i, 3);
+        let o = filter_surefire_with_cap(&i, 3, false);
 
         // First 3 blocks emitted with their close lines.
         for n in 1..=3 {
@@ -3778,7 +4187,7 @@ mod tests {
             ));
         }
         i.push_str("[INFO] BUILD FAILURE\n");
-        let o = filter_surefire_with_cap(&i, 0);
+        let o = filter_surefire_with_cap(&i, 0, false);
         for n in 1..=5 {
             assert!(
                 !o.contains(&format!("Running x.Fail{}", n)),
@@ -3816,7 +4225,7 @@ mod tests {
              [ERROR] Tests run: 100, Failures: 5, Errors: 0, Skipped: 0\n\
              [INFO] BUILD FAILURE\n",
         );
-        let o = filter_surefire_with_cap(&i, 3);
+        let o = filter_surefire_with_cap(&i, 3, false);
 
         // First 3 entries kept.
         for n in 1..=3 {
@@ -3860,7 +4269,7 @@ mod tests {
     #[test]
     fn reactor_summary_kept_on_multi_module_pass() {
         let i = include_str!("../../../tests/fixtures/mvn_reactor_pass_slice_raw.txt");
-        let o = filter_package(i);
+        let o = filter_package(i, false);
         assert!(
             o.contains("Reactor Summary for multi-module-skeleton"),
             "reactor summary header preserved; got:\n{}",
@@ -3890,7 +4299,7 @@ mod tests {
     #[test]
     fn reactor_summary_kept_on_multi_module_fail() {
         let i = include_str!("../../../tests/fixtures/mvn_reactor_fail_slice_raw.txt");
-        let o = filter_package(i);
+        let o = filter_package(i, false);
         assert!(
             o.contains("Reactor Summary for multi-module-skeleton"),
             "reactor summary header preserved; got:\n{}",
@@ -3936,7 +4345,7 @@ mod tests {
     #[test]
     fn filter_compile_error_compact() {
         let i = include_str!("../../../tests/fixtures/mvn_compile_error_slice_raw.txt");
-        let o = filter_compile(i);
+        let o = filter_compile(i, false);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
         assert!(
             savings >= 30.0,
@@ -3948,7 +4357,7 @@ mod tests {
     #[test]
     fn compile_preserves_error_continuation() {
         let i = include_str!("../../../tests/fixtures/mvn_compile_error_slice_raw.txt");
-        let o = filter_compile(i);
+        let o = filter_compile(i, false);
         assert!(o.contains("cannot find symbol"), "ERROR line preserved");
         assert!(
             o.contains("symbol:   variable bar"),
@@ -3969,7 +4378,7 @@ mod tests {
                  [WARNING] /b.java:[3,4] uses deprecated API\n\
                  [WARNING] /a.java:[5,6] unchecked cast\n\
                  [INFO] BUILD SUCCESS\n";
-        let o = filter_compile(i);
+        let o = filter_compile(i, false);
         let warns = o.matches("[WARNING]").count();
         assert_eq!(warns, 2, "dedup by normalised message; got:\n{}", o);
     }
@@ -3979,7 +4388,7 @@ mod tests {
     #[test]
     fn filter_package_install_compact() {
         let i = include_str!("../../../tests/fixtures/mvn_install_slice_raw.txt");
-        let o = filter_package(i);
+        let o = filter_package(i, false);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
         assert!(
             savings >= 50.0,
@@ -3991,7 +4400,7 @@ mod tests {
     #[test]
     fn package_keeps_install_lines() {
         let i = include_str!("../../../tests/fixtures/mvn_install_slice_raw.txt");
-        let o = filter_package(i);
+        let o = filter_package(i, false);
         assert!(
             o.contains("Installing"),
             "install line preserved; got:\n{}",
@@ -4015,7 +4424,7 @@ mod tests {
     #[ignore]
     fn print_savings_summary() {
         let pf = gunzip(include_bytes!("../../../tests/fixtures/mvn_test_pass_full_raw.txt.gz"));
-        let pf_out = filter_surefire(&pf);
+        let pf_out = filter_surefire(&pf, false);
         let pf_in_tok = count_tokens(&pf);
         let pf_out_tok = count_tokens(&pf_out);
         let pf_s = 100.0 - (pf_out_tok as f64 / pf_in_tok as f64 * 100.0);
@@ -4025,7 +4434,7 @@ mod tests {
         );
 
         let inst = gunzip(include_bytes!("../../../tests/fixtures/mvn_install_full_raw.txt.gz"));
-        let inst_out = filter_package(&inst);
+        let inst_out = filter_package(&inst, false);
         let inst_in_tok = count_tokens(&inst);
         let inst_out_tok = count_tokens(&inst_out);
         let inst_s = 100.0 - (inst_out_tok as f64 / inst_in_tok as f64 * 100.0);
@@ -4039,7 +4448,7 @@ mod tests {
     fn savings_mvn_test_pass_full() {
         let bytes = include_bytes!("../../../tests/fixtures/mvn_test_pass_full_raw.txt.gz");
         let i = gunzip(bytes);
-        let o = filter_surefire(&i);
+        let o = filter_surefire(&i, false);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(&i) as f64 * 100.0);
         assert!(
             savings >= 90.0,
@@ -4054,7 +4463,7 @@ mod tests {
     fn savings_mvn_install_full() {
         let bytes = include_bytes!("../../../tests/fixtures/mvn_install_full_raw.txt.gz");
         let i = gunzip(bytes);
-        let o = filter_package(&i);
+        let o = filter_package(&i, false);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(&i) as f64 * 100.0);
         assert!(
             savings >= 85.0,
@@ -4199,48 +4608,245 @@ mod tests {
     #[test]
     fn split_lane_requires_real_level_in_second_bracket() {
         assert_eq!(
-            split_lane("[child-a] [INFO] Running com.example.rtk.FooTest"),
+            split_lane("[child-a] [INFO] Running com.example.rtk.FooTest", true),
             (Some("child-a"), "[INFO] Running com.example.rtk.FooTest")
         );
         assert_eq!(
-            split_lane("[main] [status] app started"),
+            split_lane("[main] [status] app started", true),
             (None, "[main] [status] app started")
         );
         assert_eq!(
-            split_lane("[INFO] plain single-bracket line"),
+            split_lane("[INFO] plain single-bracket line", true),
             (Some(""), "[INFO] plain single-bracket line")
         );
         assert_eq!(
-            split_lane("at com.example.rtk.FooTest.bar(FooTest.java:1)"),
+            split_lane("at com.example.rtk.FooTest.bar(FooTest.java:1)", true),
             (None, "at com.example.rtk.FooTest.bar(FooTest.java:1)")
         );
         // Bracket-shaped but not Maven's own `[LEVEL] ...` output and not a
         // real `[tag] [LEVEL]` module line either: raw, not root-keyed.
         assert_eq!(
-            split_lane("[boom] weird bracket assertion line"),
+            split_lane("[boom] weird bracket assertion line", true),
             (None, "[boom] weird bracket assertion line")
         );
         assert_eq!(
-            split_lane("[1, 2] != [1, 3]"),
+            split_lane("[1, 2] != [1, 3]", true),
             (None, "[1, 2] != [1, 3]")
         );
         // No `"] "` substring at all: only Maven's own bare `[LEVEL]` blank
         // root-keys — a bracketed assertion-diff fragment with no `"] "`
         // anywhere is raw, same as the `"] "`-present case above.
-        assert_eq!(split_lane("[INFO]"), (Some(""), "[INFO]"));
-        assert_eq!(split_lane("[1, 2]"), (None, "[1, 2]"));
-        assert_eq!(split_lane("[boom]"), (None, "[boom]"));
+        assert_eq!(split_lane("[INFO]", true), (Some(""), "[INFO]"));
+        assert_eq!(split_lane("[1, 2]", true), (None, "[1, 2]"));
+        assert_eq!(split_lane("[boom]", true), (None, "[boom]"));
         // Empty tag: `""` is the root lane's reserved key, so `[] [LEVEL] …`
         // must not impersonate root-keyed routing — raw, not `(Some(""), …)`.
         assert_eq!(
-            split_lane("[] [INFO] started"),
+            split_lane("[] [INFO] started", true),
             (None, "[] [INFO] started")
         );
         // Tagged blank, no-trailing-space spelling (`[tag] [LEVEL]`, nothing
         // after — `lane_rest_level`'s documented other spelling of the
         // daemon-prefixed trail terminator, alongside `[tag] [LEVEL] `).
         // Pinned so the "both spellings" contract can't rot.
-        assert_eq!(split_lane("[child-a] [INFO]"), (Some("child-a"), "[INFO]"));
+        assert_eq!(split_lane("[child-a] [INFO]", true), (Some("child-a"), "[INFO]"));
+    }
+
+    // ── daemon gate: plain `mvn` never routes through the lane layer ────────
+
+    /// Cold-preclear finding (upstream PR #3199, third review round), SLF4J
+    /// probe: an SLF4J/Logback `[%thread] [%level] %msg` layout produces
+    /// lines syntactically identical to a real mvnd module line. Critically,
+    /// `is_lane_opener`'s `RUNNING` arm is intentionally permissive (any
+    /// `[INFO] Running …`, no `FILE_COORD` guard like the `[ERROR]` arm
+    /// has) — an app log line that merely happens to start with "Running"
+    /// (`[main] [INFO] Running the widget pipeline`) is exactly as
+    /// opener-shaped as a genuine mvnd module's own `Running` line. Pre-fix,
+    /// this minted a phantom `main` lane on *plain* `mvn` output (`daemon ==
+    /// false`), opened a block that never closed, and detached the
+    /// failure's own context lines so they printed after the build footer,
+    /// reading as belonging to nothing. Post-fix, `daemon == false`
+    /// short-circuits `split_lane` before any bracket parsing happens at
+    /// all, so this is structurally impossible: the context lines stay
+    /// exactly where base would keep them — inside the failing block,
+    /// before the footer.
+    #[test]
+    fn slf4j_thread_tag_does_not_mint_phantom_lane_in_plain_mvn() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [INFO] Running com.example.rtk.MyTest\n\
+                  [main] [INFO] Running the widget pipeline\n\
+                  [main] [INFO] connecting to db\n\
+                  [main] [INFO] connection refused\n\
+                  [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE! -- in com.example.rtk.MyTest\n\
+                  [ERROR] com.example.rtk.MyTest.testFoo -- Time elapsed: 0.05 s <<< FAILURE!\n\
+                  java.lang.AssertionError: boom\n\
+                  \tat com.example.rtk.MyTest.testFoo(MyTest.java:10)\n\
+                  \n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter_surefire(i, false);
+        let pipeline = o
+            .find("Running the widget pipeline")
+            .expect("app-log Running-shaped line kept");
+        let db = o.find("connecting to db").expect("first context line kept");
+        let refused = o.find("connection refused").expect("second context line kept");
+        let footer = o.rfind("BUILD FAILURE").expect("footer kept");
+        assert!(
+            pipeline < db && db < refused && refused < footer,
+            "context lines stay attached to their failing block, in order, \
+             before the footer — never detached and reordered after it; got:\n{o}"
+        );
+    }
+
+    /// Cold-preclear finding (upstream PR #3199, third review round),
+    /// timestamp probe: a `[timestamp] [LEVEL] …` layout is exactly as
+    /// lane-shaped as an SLF4J thread tag. Pre-fix, 300 uniquely-timestamped
+    /// lines each minted their own phantom lane on plain `mvn` output —
+    /// base drops every one of them (none match any keep-list pattern), but
+    /// the lane bug resurrected all 300 at end-of-stream. Post-fix, `daemon
+    /// == false` means none of these lines are ever bracket-parsed at all,
+    /// so they fall through the same keep-list check as base and are
+    /// dropped identically.
+    #[test]
+    fn timestamp_tag_does_not_mint_phantom_lanes_in_plain_mvn() {
+        let mut i = String::from("[INFO] Scanning for projects...\n");
+        for n in 0..300 {
+            i.push_str(&format!("[2026-08-29 10:00:00] [INFO] Building segment {n}\n"));
+        }
+        i.push_str("[INFO] BUILD SUCCESS\n");
+        let o = filter_surefire(&i, false);
+        assert!(
+            !o.contains("Building segment"),
+            "timestamp-tagged app log lines are dropped, exactly like base \
+             (none match any keep-list pattern); got:\n{o}"
+        );
+    }
+
+    /// Cold-preclear finding #2 (upstream PR #3199, third review round): a
+    /// module whose *only* failures are integration-test (Failsafe) ones —
+    /// never Surefire — must still get a fresh budget for its own summary.
+    /// child-a exhausts cap=2 in the Surefire phase (3 failures, 1 dropped);
+    /// child-b's failsafe banner (a *different* goal string from child-a's
+    /// surefire banner) is the phase-marker boundary that resets the budget
+    /// before child-b's own (first-ever-sighting, never-repeating) header is
+    /// processed — so its one integration-test failure survives instead of
+    /// sharing Surefire's already-spent budget.
+    #[test]
+    fn failsafe_only_module_gets_fresh_budget_via_phase_marker() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [child-a] [INFO] --- surefire:3.5.5:test (default-test) @ child-a ---\n\
+                  [child-a] [INFO] Running com.example.rtk.AMultiFailTest\n\
+                  [child-a] [ERROR] Tests run: 3, Failures: 3, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE! -- in com.example.rtk.AMultiFailTest\n\
+                  [child-a] [ERROR] com.example.rtk.AMultiFailTest.one -- Time elapsed: 0.02 s <<< FAILURE!\n\
+                  java.lang.AssertionError: a1 boom\n\
+                  \tat com.example.rtk.AMultiFailTest.one(AMultiFailTest.java:10)\n\
+                  [child-a] [INFO] \n\
+                  [child-a] [ERROR] com.example.rtk.AMultiFailTest.two -- Time elapsed: 0.02 s <<< FAILURE!\n\
+                  java.lang.AssertionError: a2 boom\n\
+                  \tat com.example.rtk.AMultiFailTest.two(AMultiFailTest.java:20)\n\
+                  [child-a] [INFO] \n\
+                  [child-a] [ERROR] com.example.rtk.AMultiFailTest.three -- Time elapsed: 0.02 s <<< FAILURE!\n\
+                  java.lang.AssertionError: a3 boom\n\
+                  \tat com.example.rtk.AMultiFailTest.three(AMultiFailTest.java:30)\n\
+                  [child-a] [INFO] \n\
+                  [child-a] [INFO] Results:\n\
+                  [child-a] [ERROR] Failures: \n\
+                  [child-a] [ERROR]   AMultiFailTest.one:10 a1 boom\n\
+                  [child-a] [ERROR]   AMultiFailTest.two:20 a2 boom\n\
+                  [child-a] [ERROR]   AMultiFailTest.three:30 a3 boom\n\
+                  [child-a] [ERROR] Tests run: 3, Failures: 3, Errors: 0, Skipped: 0\n\
+                  [child-b] [INFO] --- failsafe:3.5.5:integration-test (default-integration-test) @ child-b ---\n\
+                  [child-b] [INFO] Running com.example.rtk.BIT\n\
+                  [child-b] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE! -- in com.example.rtk.BIT\n\
+                  [child-b] [ERROR] com.example.rtk.BIT.only -- Time elapsed: 0.02 s <<< FAILURE!\n\
+                  java.lang.AssertionError: b1 boom\n\
+                  \tat com.example.rtk.BIT.only(BIT.java:5)\n\
+                  [child-b] [INFO] \n\
+                  [child-b] [INFO] Results:\n\
+                  [child-b] [ERROR] Failures: \n\
+                  [child-b] [ERROR]   BIT.only:5 b1 boom\n\
+                  [child-b] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter_package_with_cap(i, 2, true);
+        assert!(
+            o.contains("AMultiFailTest.one:10 a1 boom") && o.contains("AMultiFailTest.two:20 a2 boom"),
+            "child-a's first two entries fill its Surefire-phase budget; got:\n{o}"
+        );
+        assert!(
+            !o.contains("AMultiFailTest.three:30 a3 boom"),
+            "child-a's third entry is capped; got:\n{o}"
+        );
+        assert!(
+            o.contains("BIT.only:5 b1 boom"),
+            "child-b's Failsafe-only entry gets a fresh budget from the phase-marker \
+             boundary, not zero from Surefire's already-spent one; got:\n{o}"
+        );
+        assert_eq!(
+            o.matches("… +1 more failures").count(),
+            1,
+            "only child-a reports a drop (its own third entry); child-b's fresh \
+             budget covers its one entry with no tail; got:\n{o}"
+        );
+    }
+
+    /// Cold-preclear finding (upstream PR #3199, fourth review round): same
+    /// scenario as [`failsafe_only_module_gets_fresh_budget_via_phase_marker`],
+    /// but with Maven ≤3.8 / mvnd 0.x's banner spelling
+    /// (`maven-surefire-plugin:2.22.2:test` / `maven-failsafe-plugin:2.22.2:
+    /// integration-test`, not the bare `surefire:`/`failsafe:` shorthand).
+    /// Pre-fix, `TEST_PLUGIN_BANNER` didn't match either banner at all, so
+    /// `observe_plugin_banner` never fired and child-b's Failsafe-only entry
+    /// silently inherited child-a's already-spent budget (kept 0, not 1) —
+    /// the exact failure the phase marker exists to prevent.
+    #[test]
+    fn failsafe_only_module_gets_fresh_budget_with_old_plugin_banner_spelling() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [child-a] [INFO] --- maven-surefire-plugin:2.22.2:test (default-test) @ child-a ---\n\
+                  [child-a] [INFO] Running com.example.rtk.AMultiFailTest\n\
+                  [child-a] [ERROR] Tests run: 3, Failures: 3, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE! -- in com.example.rtk.AMultiFailTest\n\
+                  [child-a] [ERROR] com.example.rtk.AMultiFailTest.one -- Time elapsed: 0.02 s <<< FAILURE!\n\
+                  java.lang.AssertionError: a1 boom\n\
+                  \tat com.example.rtk.AMultiFailTest.one(AMultiFailTest.java:10)\n\
+                  [child-a] [INFO] \n\
+                  [child-a] [ERROR] com.example.rtk.AMultiFailTest.two -- Time elapsed: 0.02 s <<< FAILURE!\n\
+                  java.lang.AssertionError: a2 boom\n\
+                  \tat com.example.rtk.AMultiFailTest.two(AMultiFailTest.java:20)\n\
+                  [child-a] [INFO] \n\
+                  [child-a] [ERROR] com.example.rtk.AMultiFailTest.three -- Time elapsed: 0.02 s <<< FAILURE!\n\
+                  java.lang.AssertionError: a3 boom\n\
+                  \tat com.example.rtk.AMultiFailTest.three(AMultiFailTest.java:30)\n\
+                  [child-a] [INFO] \n\
+                  [child-a] [INFO] Results:\n\
+                  [child-a] [ERROR] Failures: \n\
+                  [child-a] [ERROR]   AMultiFailTest.one:10 a1 boom\n\
+                  [child-a] [ERROR]   AMultiFailTest.two:20 a2 boom\n\
+                  [child-a] [ERROR]   AMultiFailTest.three:30 a3 boom\n\
+                  [child-a] [ERROR] Tests run: 3, Failures: 3, Errors: 0, Skipped: 0\n\
+                  [child-b] [INFO] --- maven-failsafe-plugin:2.22.2:integration-test (default-integration-test) @ child-b ---\n\
+                  [child-b] [INFO] Running com.example.rtk.BIT\n\
+                  [child-b] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE! -- in com.example.rtk.BIT\n\
+                  [child-b] [ERROR] com.example.rtk.BIT.only -- Time elapsed: 0.02 s <<< FAILURE!\n\
+                  java.lang.AssertionError: b1 boom\n\
+                  \tat com.example.rtk.BIT.only(BIT.java:5)\n\
+                  [child-b] [INFO] \n\
+                  [child-b] [INFO] Results:\n\
+                  [child-b] [ERROR] Failures: \n\
+                  [child-b] [ERROR]   BIT.only:5 b1 boom\n\
+                  [child-b] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter_package_with_cap(i, 2, true);
+        assert!(
+            o.contains("AMultiFailTest.one:10 a1 boom") && o.contains("AMultiFailTest.two:20 a2 boom"),
+            "child-a's first two entries fill its Surefire-phase budget; got:\n{o}"
+        );
+        assert!(
+            !o.contains("AMultiFailTest.three:30 a3 boom"),
+            "child-a's third entry is capped; got:\n{o}"
+        );
+        assert!(
+            o.contains("BIT.only:5 b1 boom"),
+            "old-spelling `maven-failsafe-plugin:...` banner still fires the phase-marker \
+             reset, so child-b's Failsafe-only entry gets a fresh budget; got:\n{o}"
+        );
     }
 
     /// Reviewer probe (upstream PR #3199 finding 2): an application log line
@@ -4260,7 +4866,7 @@ mod tests {
                   \tat com.example.rtk.MyTest.testFoo(MyTest.java:10)\n\
                   \n\
                   [INFO] BUILD FAILURE\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, true);
         assert!(
             o.contains("app started with config=/etc/foo.yml"),
             "app log line kept in the committed block; got:\n{o}"
@@ -4287,7 +4893,7 @@ mod tests {
                   \tat com.example.rtk.FailTest.bar(FailTest.java:5)\n\
                   \n\
                   [INFO] BUILD FAILURE\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, true);
         assert!(
             o.contains("[child-a] [ERROR] Tests run: 1, Failures: 1"),
             "failing module's close kept; got:\n{o}"
@@ -4358,12 +4964,12 @@ mod tests {
 
     #[test]
     fn surefire_bracket_leading_trail_line_survives() {
-        assert_bracket_leading_trail_line_survives(filter_surefire);
+        assert_bracket_leading_trail_line_survives(filter_surefire_daemon);
     }
 
     #[test]
     fn package_bracket_leading_trail_line_survives() {
-        assert_bracket_leading_trail_line_survives(filter_package);
+        assert_bracket_leading_trail_line_survives(filter_package_daemon);
     }
 
     /// Reviewer probe (upstream PR #3199 finding 3): two `[tag] [ERROR] …`
@@ -4388,7 +4994,7 @@ mod tests {
                   \tat java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)\n\
                   \n\
                   [INFO] BUILD FAILURE\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, true);
         assert!(
             o.contains("at com.example.rtk.RealTest.foo(RealTest.java:5)"),
             "the single user frame survives; got:\n{o}"
@@ -4425,7 +5031,7 @@ mod tests {
                   \tat com.example.rtk.SlowTest.foo(SlowTest.java:5)\n\
                   [child-a] [INFO] \n\
                   [INFO] BUILD FAILURE\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, true);
         let running = o.find("Running com.example.rtk.SlowTest").expect("Running kept");
         let server = o
             .find("[Server] [ERROR] connection refused")
@@ -4464,7 +5070,7 @@ mod tests {
                   [child-a] [INFO] Running com.example.rtk.NextTest\n\
                   [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.NextTest\n\
                   [INFO] BUILD FAILURE\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, true);
         assert!(
             o.contains("at com.example.rtk.SlowTest.foo(SlowTest.java:5)"),
             "user frame survives; got:\n{o}"
@@ -4493,7 +5099,7 @@ mod tests {
                   [Server] [ERROR] connection refused\n\
                   [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.05 s -- in com.example.rtk.SlowTest\n\
                   [INFO] BUILD SUCCESS\n";
-        let o = filter_surefire(i);
+        let o = filter_surefire(i, true);
         assert!(
             !o.contains("[Server]") && !o.contains("connection refused"),
             "app-log line inside a green-closed block must be discarded with the rest \
@@ -4535,9 +5141,10 @@ mod tests {
 
         let mut lanes = Lanes::new();
         let mut classes = FailingClassCap::new(MAX_MVN_FAILING_CLASSES);
+        let mut summary = FailuresSummaryCap::new(MAX_MVN_FAILING_CLASSES, true);
         let mut out = String::new();
         for line in i.lines() {
-            drive_surefire_line(&mut lanes, line, &mut classes, &mut out);
+            drive_surefire_line(&mut lanes, line, &mut classes, &mut summary, true, &mut out);
         }
         assert!(
             lanes.lanes.len() <= MAX_LANES,
@@ -4545,7 +5152,7 @@ mod tests {
             lanes.lanes.len()
         );
 
-        let o = filter_surefire(&i);
+        let o = filter_surefire(&i, true);
         assert!(!o.is_empty(), "capped run still produces output");
         assert!(
             o.contains("Running com.example.rtk.OverflowTest")
