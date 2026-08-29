@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
-use crate::core::utils::strip_leading_bom;
+use crate::core::utils::{from_json_str, strip_leading_bom};
 use crate::hooks::constants::{
     CONFIG_DIR, COPILOT_HOME_ENV, COPILOT_HOOK_FILE, COPILOT_INSTRUCTIONS_FILE, COPILOT_USER_DIR,
     CURSOR_DIR, GEMINI_DIR, GITHUB_DIR, OPENCODE_PLUGIN_FILE, OPENCODE_SUBDIR, PLUGIN_SUBDIR,
@@ -602,7 +602,7 @@ fn remove_hook_from_settings(ctx: InitContext) -> Result<bool> {
         return Ok(false);
     }
 
-    let mut root: serde_json::Value = serde_json::from_str(content)
+    let mut root: serde_json::Value = from_json_str(content)
         .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?;
 
     let removed = remove_hook_from_json(&mut root);
@@ -972,7 +972,7 @@ fn patch_settings_json_command(
         if content.trim().is_empty() {
             serde_json::json!({})
         } else {
-            serde_json::from_str(content)
+            from_json_str(content)
                 .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?
         }
     } else {
@@ -1311,7 +1311,7 @@ fn remove_legacy_settings_entries(ctx: InitContext) -> Result<()> {
         return Ok(());
     }
 
-    let mut root: serde_json::Value = serde_json::from_str(content)
+    let mut root: serde_json::Value = from_json_str(content)
         .with_context(|| format!("Failed to parse {}", settings_path.display()))?;
 
     if !remove_legacy_hook_entries_from_json(&mut root) {
@@ -2965,7 +2965,7 @@ fn read_droid_json(path: &Path) -> Result<Option<serde_json::Value>> {
     if content.trim().is_empty() {
         return Ok(Some(serde_json::json!({})));
     }
-    serde_json::from_str(content)
+    from_json_str(content)
         .map(Some)
         .with_context(|| format!("Failed to parse {} as JSON", path.display()))
 }
@@ -3630,7 +3630,7 @@ fn patch_cursor_hooks_json(path: &Path, ctx: InitContext) -> Result<bool> {
         if content.trim().is_empty() {
             serde_json::json!({ "version": 1 })
         } else {
-            serde_json::from_str(content)
+            from_json_str(content)
                 .with_context(|| format!("Failed to parse {} as JSON", path.display()))?
         }
     } else {
@@ -3743,8 +3743,8 @@ fn remove_legacy_cursor_hooks_json_entries(path: &Path, ctx: InitContext) -> Res
         return Ok(());
     }
 
-    let mut root: serde_json::Value = serde_json::from_str(content)
-        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    let mut root: serde_json::Value =
+        from_json_str(content).with_context(|| format!("Failed to parse {}", path.display()))?;
 
     if !remove_legacy_cursor_hook_entries_from_json(&mut root) {
         return Ok(());
@@ -3823,7 +3823,7 @@ fn remove_cursor_hooks(ctx: InitContext) -> Result<Vec<String>> {
         let content = strip_leading_bom(&content);
 
         if !content.trim().is_empty() {
-            if let Ok(mut root) = serde_json::from_str::<serde_json::Value>(content) {
+            if let Ok(mut root) = from_json_str::<serde_json::Value>(content) {
                 if remove_cursor_hook_from_json(&mut root) {
                     if dry_run {
                         println!(
@@ -3897,7 +3897,7 @@ fn show_claude_config() -> Result<()> {
     let settings_path = claude_dir.join(SETTINGS_JSON);
     let binary_hook_registered = if settings_path.exists() {
         let content = fs::read_to_string(&settings_path).unwrap_or_default();
-        if let Ok(root) = serde_json::from_str::<serde_json::Value>(strip_leading_bom(&content)) {
+        if let Ok(root) = from_json_str::<serde_json::Value>(&content) {
             hook_already_present(&root, CLAUDE_HOOK_COMMAND)
         } else {
             false
@@ -4019,7 +4019,7 @@ fn show_claude_config() -> Result<()> {
         let content = fs::read_to_string(&settings_path)?;
         let content = strip_leading_bom(&content);
         if !content.trim().is_empty() {
-            if let Ok(root) = serde_json::from_str::<serde_json::Value>(content) {
+            if let Ok(root) = from_json_str::<serde_json::Value>(content) {
                 if hook_already_present(&root, CLAUDE_HOOK_COMMAND) {
                     println!("[ok] settings.json: RTK hook configured");
                 } else {
@@ -4056,8 +4056,7 @@ fn show_claude_config() -> Result<()> {
         // Check for binary command in hooks.json first
         let cursor_binary_registered = if cursor_hooks_json.exists() {
             let content = fs::read_to_string(&cursor_hooks_json).unwrap_or_default();
-            if let Ok(root) = serde_json::from_str::<serde_json::Value>(strip_leading_bom(&content))
-            {
+            if let Ok(root) = from_json_str::<serde_json::Value>(&content) {
                 cursor_hook_already_present(&root)
             } else {
                 false
@@ -4279,7 +4278,14 @@ fn patch_gemini_settings(
     let mut settings: serde_json::Value = if settings_path.exists() {
         let content = fs::read_to_string(&settings_path)
             .with_context(|| format!("Failed to read {}", settings_path.display()))?;
-        serde_json::from_str(strip_leading_bom(&content)).unwrap_or(serde_json::json!({}))
+        let content = strip_leading_bom(&content);
+
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            from_json_str(content)
+                .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?
+        }
     } else {
         serde_json::json!({})
     };
@@ -4421,9 +4427,7 @@ fn uninstall_gemini(ctx: InitContext) -> Result<Vec<String>> {
     let settings_path = gemini_dir.join(SETTINGS_JSON);
     if settings_path.exists() {
         let content = fs::read_to_string(&settings_path)?;
-        if let Ok(mut settings) =
-            serde_json::from_str::<serde_json::Value>(strip_leading_bom(&content))
-        {
+        if let Ok(mut settings) = from_json_str::<serde_json::Value>(&content) {
             let bt_pointer = format!("/hooks/{}", BEFORE_TOOL_KEY);
             if let Some(arr) = settings
                 .pointer_mut(&bt_pointer)
@@ -6964,6 +6968,38 @@ mod tests {
                 result.err()
             );
         });
+    }
+
+    #[test]
+    fn test_patch_gemini_settings_malformed_json_errors_without_overwriting() {
+        // A parse failure (not a BOM) must propagate as an error, not get
+        // swallowed into an empty object that then overwrites the user's
+        // existing settings on write-back.
+        let tmp = TempDir::new().unwrap();
+        let gemini_dir = tmp.path().join(".gemini");
+        fs::create_dir_all(&gemini_dir).unwrap();
+        let settings_path = gemini_dir.join(SETTINGS_JSON);
+        let original = "{\"model\": \"foo\", \"mcpServers\": {},"; // trailing comma
+        fs::write(&settings_path, original).unwrap();
+
+        let result = patch_gemini_settings(
+            &gemini_dir,
+            Path::new("/fake/hook/path"),
+            PatchMode::Auto,
+            InitContext::default(),
+        );
+
+        let err = result.expect_err("malformed JSON must fail, not silently reset");
+        assert!(
+            err.to_string().contains("Failed to parse"),
+            "error must carry the parse context, got: {err:#}"
+        );
+
+        let content = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(
+            content, original,
+            "settings.json must not be overwritten when parsing fails"
+        );
     }
 
     #[test]
