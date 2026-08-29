@@ -7,13 +7,16 @@ use crate::core::utils::{resolved_command, strip_ansi, tool_exists, truncate};
 use anyhow::Result;
 use regex::Regex;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
 
-/// Unparseable failure output is limited to this many non-empty lines. The
-/// runner tees the full raw output and prints a recovery hint, except when tee
-/// is disabled (`RTK_TEE=0` or `config.tee.enabled = false`): then these lines
-/// are the only surviving copy, which is why both ends are kept.
+/// Unparseable failure output is limited to this many non-empty lines, split
+/// between head and tail. The runner tees the full raw output and prints a
+/// recovery hint, so the hidden middle stays reachable, with two exceptions the
+/// cap accounts for: output under `MIN_TEE_SIZE` bytes gets no tee, so it is
+/// printed whole; and with tee disabled (`RTK_TEE=0` or
+/// `config.tee.enabled = false`) these lines are the only surviving copy, which
+/// is why both ends are kept.
 const MAX_UNPARSED_LINES: usize = CAP_WARNINGS;
 /// Deviation: tsc and npx print the cause first (`Unknown compiler option`,
 /// `This is not the tsc command`) and boilerplate after it, so a plain tail
@@ -62,6 +65,12 @@ fn parse_diagnostic(line: &str) -> Option<Diagnostic<'_>> {
         code: caps.get(2)?.as_str(),
         message: caps.get(3)?.as_str(),
     })
+}
+
+/// One line of the raw failure dump: width-capped like every other emission.
+fn push_dump_line(summary: &mut String, line: &str) {
+    summary.push_str(&truncate(line, 120));
+    summary.push('\n');
 }
 
 fn clean_line(line: &str) -> Cow<'_, str> {
@@ -158,30 +167,55 @@ impl BlockHandler for TscHandler {
             // no project, unparseable output). "No errors found" would be a
             // false green, so report the failure with the head and tail of the
             // raw output; only the retained lines are ANSI-stripped.
-            let lines: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
             let mut summary = format!(
                 "TypeScript: compiler exited with code {exit_code}, but RTK parsed no diagnostics\n"
             );
 
-            if lines.len() <= MAX_UNPARSED_LINES {
-                for line in lines {
-                    summary.push_str(clean_line(line).as_ref());
-                    summary.push('\n');
+            if raw.len() < crate::core::tee::MIN_TEE_SIZE {
+                for line in raw.lines() {
+                    let line = clean_line(line);
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    push_dump_line(&mut summary, line.as_ref());
                 }
                 return Some(summary);
             }
 
             let head_len = MAX_UNPARSED_HEAD_LINES.min(MAX_UNPARSED_LINES);
             let tail_len = MAX_UNPARSED_LINES.saturating_sub(head_len);
-            let hidden = lines.len() - head_len - tail_len;
-            for line in &lines[..head_len] {
-                summary.push_str(clean_line(line).as_ref());
-                summary.push('\n');
+            let mut head: Vec<Cow<'_, str>> = Vec::with_capacity(head_len);
+            let mut tail: VecDeque<Cow<'_, str>> = VecDeque::with_capacity(tail_len);
+            let mut total = 0;
+
+            for line in raw.lines() {
+                let line = clean_line(line);
+                if line.trim().is_empty() {
+                    continue;
+                }
+                total += 1;
+                if head.len() < head_len {
+                    head.push(line);
+                    continue;
+                }
+                if tail_len == 0 {
+                    continue;
+                }
+                if tail.len() == tail_len {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
             }
-            summary.push_str(&format!("... +{hidden} more lines\n"));
-            for line in &lines[lines.len() - tail_len..] {
-                summary.push_str(clean_line(line).as_ref());
-                summary.push('\n');
+
+            let hidden = total - head.len() - tail.len();
+            for line in head {
+                push_dump_line(&mut summary, line.as_ref());
+            }
+            if hidden > 0 {
+                summary.push_str(&format!("... +{hidden} more lines\n"));
+            }
+            for line in tail {
+                push_dump_line(&mut summary, line.as_ref());
             }
             return Some(summary);
         }
@@ -555,20 +589,72 @@ src/app.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.
 
     #[test]
     fn test_tsc_stream_failed_unparsed_output_keeps_head_and_tail() {
-        let input: String = (1..=30).map(|i| format!("junk line {i}\n")).collect();
+        let padding = "x".repeat(30);
+        let input: String = (1..=30)
+            .map(|i| format!("junk line {i} {padding}\n"))
+            .collect();
         let mut f = BlockStreamFilter::new(TscHandler::new());
         let result = run_block_filter(&mut f, &input, 2);
         assert!(result.contains("compiler exited with code 2"), "got: {}", result);
         for i in 1..=5 {
-            assert!(result.contains(&format!("junk line {i}\n")), "got: {}", result);
+            assert!(result.contains(&format!("junk line {i} {padding}\n")), "got: {}", result);
         }
         assert!(result.contains("... +20 more lines"), "got: {}", result);
         for i in 26..=30 {
-            assert!(result.contains(&format!("junk line {i}\n")), "got: {}", result);
+            assert!(result.contains(&format!("junk line {i} {padding}\n")), "got: {}", result);
         }
-        assert!(!result.contains("junk line 6\n"), "got: {}", result);
-        assert!(!result.contains("junk line 25\n"), "got: {}", result);
+        assert!(!result.contains(&format!("junk line 6 {padding}\n")), "got: {}", result);
+        assert!(!result.contains(&format!("junk line 25 {padding}\n")), "got: {}", result);
         assert_eq!(result.lines().count(), 1 + 5 + 1 + 5);
+    }
+
+    #[test]
+    fn test_tsc_stream_failed_unparsed_output_ignores_escape_only_lines() {
+        let padding = "x".repeat(30);
+        let mut input = "\x1b[0m\n\x1b[32m\x1b[0m\n\x1b[0m\n".to_string();
+        for i in 1..=30 {
+            input.push_str(&format!("real line {i} {padding}\n"));
+        }
+
+        let mut f = BlockStreamFilter::new(TscHandler::new());
+        let result = run_block_filter(&mut f, &input, 2);
+        for i in 1..=5 {
+            assert!(result.contains(&format!("real line {i} {padding}\n")), "got: {}", result);
+        }
+        assert!(result.contains("... +20 more lines"), "got: {}", result);
+        for i in 26..=30 {
+            assert!(result.contains(&format!("real line {i} {padding}\n")), "got: {}", result);
+        }
+        assert!(!result.contains("\n\n"), "got: {}", result);
+        assert_eq!(result.lines().count(), 1 + 5 + 1 + 5);
+    }
+
+    #[test]
+    fn test_tsc_stream_failed_unparsed_output_under_tee_floor_is_complete() {
+        let input: String = (1..=15).map(|i| format!("short {i}\n")).collect();
+        let mut f = BlockStreamFilter::new(TscHandler::new());
+        let result = run_block_filter(&mut f, &input, 1);
+
+        for i in 1..=15 {
+            assert!(result.contains(&format!("short {i}\n")), "got: {}", result);
+        }
+        assert!(!result.contains("... +"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_tsc_stream_failed_unparsed_output_caps_line_width() {
+        let long_line = "z".repeat(300);
+        let padding = "x".repeat(30);
+        let mut input = format!("{long_line}\n");
+        for i in 1..=10 {
+            input.push_str(&format!("padding line {i} {padding}\n"));
+        }
+
+        let mut f = BlockStreamFilter::new(TscHandler::new());
+        let result = run_block_filter(&mut f, &input, 1);
+        let emitted_long_line = result.lines().nth(1).expect("long line should be emitted");
+        assert!(emitted_long_line.chars().count() <= 120, "got: {}", result);
+        assert!(emitted_long_line.ends_with("..."), "got: {}", result);
     }
 
     #[test]
