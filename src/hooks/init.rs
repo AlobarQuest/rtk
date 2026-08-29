@@ -4263,6 +4263,17 @@ pub fn run_gemini(
     Ok(())
 }
 
+/// Print the manual-setup instructions for ~/.gemini/settings.json, shared by
+/// PatchMode::Skip and the unparseable-settings fallback in
+/// `patch_gemini_settings`.
+fn print_gemini_manual_setup(settings_path: &Path) {
+    println!(
+        "\nManual setup needed: add RTK hook to {}\n\
+         See: https://github.com/rtk-ai/rtk#gemini-cli",
+        settings_path.display()
+    );
+}
+
 /// Patch ~/.gemini/settings.json with the BeforeTool hook
 fn patch_gemini_settings(
     gemini_dir: &Path,
@@ -4283,8 +4294,23 @@ fn patch_gemini_settings(
         if content.trim().is_empty() {
             serde_json::json!({})
         } else {
-            from_json_str(content)
-                .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?
+            match from_json_str(content) {
+                Ok(v) => v,
+                Err(e) => {
+                    // A parse failure must not abort the whole `rtk init` run
+                    // (run_gemini has already written the hook script,
+                    // GEMINI.md, and the integrity baseline by this point).
+                    // Treat it like PatchMode::Skip: warn, tell the user how
+                    // to patch it themselves, and leave the file untouched.
+                    eprintln!(
+                        "Warning: failed to parse {} as JSON: {}",
+                        settings_path.display(),
+                        e
+                    );
+                    print_gemini_manual_setup(&settings_path);
+                    return Ok(());
+                }
+            }
         }
     } else {
         serde_json::json!({})
@@ -4308,11 +4334,7 @@ fn patch_gemini_settings(
 
     // Ask user before patching
     if patch_mode == PatchMode::Skip {
-        println!(
-            "\nManual setup needed: add RTK hook to {}\n\
-             See: https://github.com/rtk-ai/rtk#gemini-cli",
-            settings_path.display()
-        );
+        print_gemini_manual_setup(&settings_path);
         return Ok(());
     }
 
@@ -6971,10 +6993,13 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_gemini_settings_malformed_json_errors_without_overwriting() {
-        // A parse failure (not a BOM) must propagate as an error, not get
-        // swallowed into an empty object that then overwrites the user's
-        // existing settings on write-back.
+    fn test_patch_gemini_settings_malformed_json_warns_without_overwriting() {
+        // A parse failure (not a BOM) must not abort `rtk init` — by the time
+        // patch_gemini_settings runs, run_gemini has already written the hook
+        // script, GEMINI.md, and the integrity baseline, so aborting here
+        // would leave a half-installed state with no summary. Treat it like
+        // PatchMode::Skip: warn and continue, same as Skip's Ok(()) return,
+        // and critically still never overwrite the unparsed file.
         let tmp = TempDir::new().unwrap();
         let gemini_dir = tmp.path().join(".gemini");
         fs::create_dir_all(&gemini_dir).unwrap();
@@ -6989,10 +7014,10 @@ mod tests {
             InitContext::default(),
         );
 
-        let err = result.expect_err("malformed JSON must fail, not silently reset");
         assert!(
-            err.to_string().contains("Failed to parse"),
-            "error must carry the parse context, got: {err:#}"
+            result.is_ok(),
+            "unparseable settings.json must not abort the install: {:?}",
+            result.err()
         );
 
         let content = fs::read_to_string(&settings_path).unwrap();

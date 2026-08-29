@@ -2,7 +2,7 @@
 
 use crate::core::guard::never_worse;
 use crate::core::tracking;
-use crate::core::utils::from_json_str;
+use crate::core::utils::{from_json_str, strip_leading_bom};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::fs;
@@ -49,18 +49,13 @@ pub fn run(file: &Path, max_depth: usize, schema_only: bool, verbose: u8) -> Res
     let content = fs::read_to_string(file)
         .with_context(|| format!("Failed to read file: {}", file.display()))?;
 
-    let output = if schema_only {
-        filter_json_string(&content, max_depth)?
-    } else {
-        filter_json_compact(&content, max_depth)?
-    };
-    let shown = never_worse(&content, &output);
+    let shown = render_json(&content, max_depth, schema_only)?;
     println!("{}", shown);
     timer.track(
         &format!("cat {}", file.display()),
         "rtk json",
         &content,
-        shown,
+        &shown,
     );
     Ok(())
 }
@@ -79,15 +74,25 @@ pub fn run_stdin(max_depth: usize, schema_only: bool, verbose: u8) -> Result<()>
         .read_to_string(&mut content)
         .context("Failed to read from stdin")?;
 
-    let output = if schema_only {
-        filter_json_string(&content, max_depth)?
-    } else {
-        filter_json_compact(&content, max_depth)?
-    };
-    let shown = never_worse(&content, &output);
+    let shown = render_json(&content, max_depth, schema_only)?;
     println!("{}", shown);
-    timer.track("cat - (stdin)", "rtk json -", &content, shown);
+    timer.track("cat - (stdin)", "rtk json -", &content, &shown);
     Ok(())
+}
+
+/// Filter `content` and fall back to it verbatim if the filtered form isn't
+/// smaller. Strips a leading BOM once, up front, and compares/falls back
+/// against the *stripped* content — otherwise a raw fallback would still
+/// carry the BOM into piped output (`rtk json foo.json | jq .` failing to
+/// parse it) even though `filter_json_*` already tolerates a BOM on input.
+fn render_json(content: &str, max_depth: usize, schema_only: bool) -> Result<String> {
+    let content = strip_leading_bom(content);
+    let output = if schema_only {
+        filter_json_string(content, max_depth)?
+    } else {
+        filter_json_compact(content, max_depth)?
+    };
+    Ok(never_worse(content, &output).to_string())
 }
 
 /// Parse a JSON string and return compact representation with values preserved.
@@ -375,6 +380,30 @@ mod tests {
         assert!(output.contains("string"));
         assert!(output.contains("int"));
         assert_eq!(output, filter_json_string(&json[3..], 5).unwrap());
+    }
+
+    #[test]
+    fn test_render_json_fallback_strips_bom_when_filtered_is_larger() {
+        // A minified BOM-prefixed package.json: compact_json pretty-prints
+        // with indentation, so `filtered` ends up larger than the minified
+        // raw and never_worse falls back to raw. If that comparison (and the
+        // returned string) still carries the BOM, `rtk json foo.json | jq .`
+        // fails to parse — the exact bug this fix closes.
+        let raw = "\u{feff}{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5}";
+        let stripped = strip_leading_bom(raw);
+
+        // render_json takes the raw, un-stripped content directly — the same
+        // shape run()/run_stdin() hand it after fs::read_to_string /
+        // reading stdin. It must strip internally, not rely on the caller.
+        let shown = render_json(raw, 5, false).expect("must render");
+
+        // Sanity: this exercises the raw-fallback path, not the filtered one.
+        assert_eq!(shown, stripped, "expected the raw (BOM-stripped) fallback");
+        assert!(
+            !shown.starts_with('\u{feff}'),
+            "fallback output must not carry a BOM into piped output: {shown:?}"
+        );
+        let _: Value = serde_json::from_str(&shown).expect("fallback output must parse as JSON");
     }
 
     #[test]

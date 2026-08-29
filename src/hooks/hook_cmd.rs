@@ -228,49 +228,46 @@ fn copilot_cli_response_from_decision(
 /// Run the Gemini CLI BeforeTool hook.
 pub fn run_gemini() -> Result<()> {
     let input = read_stdin_limited()?;
+    let output = run_gemini_inner(&input).context("Failed to parse hook input as JSON")?;
+    let _ = writeln!(io::stdout(), "{output}");
+    Ok(())
+}
 
-    let json: Value = serde_json::from_str(&input).context("Failed to parse hook input as JSON")?;
+/// Parse the Gemini BeforeTool stdin payload, decide, and render the
+/// response JSON — no stdin/stdout I/O. Used by `run_gemini` itself (not
+/// just tests), so a regression here (e.g. dropping the BOM strip) fails
+/// for real rather than only in a duplicate test copy.
+fn run_gemini_inner(input: &str) -> Option<String> {
+    let input = strip_leading_bom(input);
+    let json: Value = serde_json::from_str(input).ok()?;
 
     let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-
     if tool_name != "run_shell_command" {
-        print_allow();
-        return Ok(());
+        return Some(gemini_json("allow", None));
     }
 
     let cmd = json
         .pointer("/tool_input/command")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-
     if cmd.is_empty() {
-        print_allow();
-        return Ok(());
+        return Some(gemini_json("allow", None));
     }
 
-    match decide_hook_action(cmd, permissions::Host::Gemini) {
+    Some(match decide_hook_action(cmd, permissions::Host::Gemini) {
         HookDecision::Deny => {
-            let _ = writeln!(
-                io::stdout(),
-                r#"{{"decision":"deny","reason":"Blocked by RTK permission rule"}}"#
-            );
+            r#"{"decision":"deny","reason":"Blocked by RTK permission rule"}"#.to_string()
         }
         HookDecision::AllowRewrite(ref rewritten) => {
             audit_log("rewrite", cmd, rewritten);
-            print_gemini("allow", Some(rewritten));
+            gemini_json("allow", Some(rewritten))
         }
         HookDecision::AskRewrite(ref rewritten) => {
             audit_log("ask", cmd, rewritten);
-            print_gemini("ask_user", Some(rewritten));
+            gemini_json("ask_user", Some(rewritten))
         }
-        HookDecision::Defer => print_gemini("ask_user", None),
-    }
-
-    Ok(())
-}
-
-fn print_allow() {
-    let _ = writeln!(io::stdout(), r#"{{"decision":"allow"}}"#);
+        HookDecision::Defer => gemini_json("ask_user", None),
+    })
 }
 
 fn gemini_json(decision: &str, rewrite: Option<&str>) -> String {
@@ -279,10 +276,6 @@ fn gemini_json(decision: &str, rewrite: Option<&str>) -> String {
         output["hookSpecificOutput"] = serde_json::json!({ "tool_input": { "command": cmd } });
     }
     output.to_string()
-}
-
-fn print_gemini(decision: &str, rewrite: Option<&str>) {
-    let _ = writeln!(io::stdout(), "{}", gemini_json(decision, rewrite));
 }
 
 // ── Audit logging ─────────────────────────────────────────────
@@ -399,7 +392,7 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
 pub fn run_claude() -> Result<()> {
     let input = read_stdin_limited()?;
 
-    let input = input.trim();
+    let input = strip_leading_bom(&input).trim();
     if input.is_empty() {
         return Ok(());
     }
@@ -432,6 +425,7 @@ pub fn run_claude() -> Result<()> {
 
 #[cfg(test)]
 fn run_claude_inner(input: &str) -> Option<String> {
+    let input = strip_leading_bom(input);
     let v: Value = serde_json::from_str(input).ok()?;
     match process_claude_payload(&v) {
         PayloadAction::Rewrite { output, .. } => Some(output.to_string()),
@@ -1137,6 +1131,22 @@ mod tests {
         assert!(run_claude_inner(&input).is_none());
     }
 
+    #[test]
+    fn test_claude_strips_utf8_bom() {
+        // Windows hosts may prepend a UTF-8 BOM to hook stdin (confirmed for
+        // Cursor). Without stripping, str::trim leaves U+FEFF in place,
+        // serde_json::from_str fails, run_claude logs to stderr and returns
+        // Ok(()) — every command silently stops being rewritten.
+        let payload = claude_input("git status");
+        let with_bom = format!("\u{feff}{}", payload);
+        let result = run_claude_inner(&with_bom).expect("BOM-prefixed payload must parse");
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            v["hookSpecificOutput"]["updatedInput"]["command"],
+            "rtk git status"
+        );
+    }
+
     // --- Cursor handler ---
 
     fn cursor_input(cmd: &str) -> String {
@@ -1461,6 +1471,30 @@ mod tests {
             HookDecision::AskRewrite(r) => gemini_json("ask_user", Some(&r)),
             HookDecision::Defer => gemini_json("ask_user", None),
         }
+    }
+
+    #[test]
+    fn test_gemini_strips_utf8_bom() {
+        // Windows hosts may prepend a UTF-8 BOM to hook stdin (confirmed for
+        // Cursor; run_gemini must survive it too). Without stripping,
+        // serde_json rejects the payload, `rtk hook gemini` exits non-zero,
+        // and the tool call is blocked. Goes through the real
+        // run_gemini_inner (also used by production run_gemini), not a
+        // test-local copy of the parse logic.
+        let payload = json!({
+            "tool_name": "run_shell_command",
+            "tool_input": { "command": "git status" }
+        })
+        .to_string();
+        let with_bom = format!("\u{feff}{payload}");
+        let result = run_gemini_inner(&with_bom).expect("BOM-prefixed payload must parse");
+        let v: Value = serde_json::from_str(&result).unwrap();
+        // No config in the test environment: default-to-ask semantics.
+        assert_eq!(v["decision"], "ask_user");
+        assert_eq!(
+            v["hookSpecificOutput"]["tool_input"]["command"],
+            "rtk git status"
+        );
     }
 
     #[test]
