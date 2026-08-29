@@ -3,6 +3,7 @@
 use anyhow::Result;
 use regex::Regex;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::sync::LazyLock;
 
@@ -29,8 +30,9 @@ static RESULT_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
 static RESULT_TERMINATOR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[\d.]+\s+sec\s*$").expect("invalid ctest result terminator regex")
 });
-static START_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*Start\s+\d+:").expect("invalid ctest start regex"));
+static START_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*Start\s+(\d+):\s*(.*?)\s*$").expect("invalid ctest start regex")
+});
 static SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*\d+%\s+tests passed,\s+(\d+)\s+tests failed out of\s+(\d+)")
         .expect("invalid ctest summary regex")
@@ -138,8 +140,12 @@ pub(crate) fn filter_ctest_output(output: &str) -> String {
 
     let lines = build_logical_lines(&clean);
     let tests = parse_tests(&lines);
-    let summary = lines.iter().find_map(|line| parse_summary(line));
-    let total_time = lines.iter().find_map(|line| parse_total_time(line));
+    let framing_lines = collect_framing_line_indices(&lines, &tests);
+    let summary = lines.iter().rev().find_map(|line| parse_summary(line));
+    let total_time = lines
+        .iter()
+        .rev()
+        .find_map(|line| parse_total_time(line));
 
     if tests.is_empty() && summary.is_none() {
         if lines.iter().any(|line| is_no_tests_line(line)) {
@@ -153,7 +159,7 @@ pub(crate) fn filter_ctest_output(output: &str) -> String {
         |summary| summary.failed > 0,
     );
     if has_failures {
-        return format_failure(&lines, &tests, summary, total_time);
+        return format_failure(&lines, &tests, &framing_lines, summary, total_time);
     }
 
     format_success(&tests, summary, total_time)
@@ -289,6 +295,42 @@ fn parse_total_time(line: &str) -> Option<f64> {
     TIME_RE.captures(line)?.get(1)?.as_str().parse().ok()
 }
 
+/// Line indices that are genuine CTest framing. A test may print lines shaped
+/// like `Start N:` or the summary, so `Start` lines are validated against the
+/// parsed test set (number and name must both match) and the trailer lines are
+/// honoured only at their last occurrence, where ctest prints them.
+fn collect_framing_line_indices(lines: &[String], tests: &[TestCase]) -> HashSet<usize> {
+    let mut framing_lines: HashSet<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| parse_test_line(line, index).map(|_| index))
+        .collect();
+
+    framing_lines.extend(lines.iter().enumerate().filter_map(|(index, line)| {
+        let captures = START_RE.captures(line)?;
+        let number = captures.get(1)?.as_str().parse::<u32>().ok()?;
+        let name = captures.get(2)?.as_str().trim();
+        tests
+            .iter()
+            .any(|test| test.number == number && test.name == name)
+            .then_some(index)
+    }));
+
+    for pattern in [&*SUMMARY_RE, &*TIME_RE] {
+        if let Some(index) = lines.iter().rposition(|line| pattern.is_match(line)) {
+            framing_lines.insert(index);
+        }
+    }
+    if let Some(index) = lines
+        .iter()
+        .rposition(|line| line.trim() == "The following tests FAILED:")
+    {
+        framing_lines.insert(index);
+    }
+
+    framing_lines
+}
+
 fn format_success(
     tests: &[TestCase],
     summary: Option<CtestSummary>,
@@ -329,6 +371,7 @@ fn format_success(
 fn format_failure(
     lines: &[String],
     tests: &[TestCase],
+    framing_lines: &HashSet<usize>,
     summary: Option<CtestSummary>,
     total_time: Option<f64>,
 ) -> String {
@@ -352,11 +395,15 @@ fn format_failure(
     out.push_str(&format_meta(total_time));
     if !failed_tests.is_empty() {
         out.push('\n');
-        out.push_str(&format_failed_section(lines, &failed_tests));
+        out.push_str(&format_failed_section(
+            lines,
+            &failed_tests,
+            framing_lines,
+        ));
     }
     append_skipped_list(&mut out, tests);
 
-    let trailer = collect_failed_trailer(lines);
+    let trailer = collect_failed_trailer(lines, framing_lines);
     if !trailer.is_empty() {
         out.push_str("\n\n");
         out.push_str(&trailer.join("\n"));
@@ -415,34 +462,72 @@ fn slowest_tests(tests: &[TestCase]) -> Vec<&TestCase> {
     slowest
 }
 
-fn format_failed_section(lines: &[String], failed_tests: &[&TestCase]) -> String {
-    let entries: Vec<String> = failed_tests
-        .iter()
-        .map(|test| format_failed_entry(lines, test))
-        .collect();
-    let mut full_section = String::from("failed:");
-    for entry in &entries {
-        full_section.push('\n');
-        full_section.push_str(entry);
-    }
-    if entries.len() <= MAX_FAILED_LIST_LINES {
-        return full_section;
-    }
-
-    let mut rendered = String::from("failed:");
-    for entry in entries.iter().take(MAX_FAILED_LIST_LINES) {
-        rendered.push('\n');
-        rendered.push_str(entry);
-    }
-    let hidden = entries.len() - MAX_FAILED_LIST_LINES;
-    rendered.push_str(&format!("\n  ... +{hidden} more failed"));
-    if let Some(hint) = crate::core::tee::force_tee_hint(&full_section, "ctest-failed") {
-        rendered.push_str(&format!("\n  {hint}"));
+fn format_failed_section(
+    lines: &[String],
+    failed_tests: &[&TestCase],
+    framing_lines: &HashSet<usize>,
+) -> String {
+    let section = build_failed_section(lines, failed_tests, framing_lines);
+    let mut rendered = section.rendered;
+    if section.truncated {
+        if let Some(hint) = crate::core::tee::force_tee_hint(&section.full, "ctest-failed") {
+            rendered.push_str(&format!("\n  {hint}"));
+        }
     }
     rendered
 }
 
-fn format_failed_entry(lines: &[String], test: &TestCase) -> String {
+/// The `failed:` section as shown, the untruncated text behind it, and whether
+/// anything was hidden (so one section-level tee is owed).
+struct FailedSection {
+    rendered: String,
+    full: String,
+    truncated: bool,
+}
+
+/// Every block is collected untruncated before the list cap so a single tee
+/// can hold the whole section; rendering then caps entries at
+/// `MAX_FAILED_LIST_LINES` and each block at head+tail.
+fn build_failed_section(
+    lines: &[String],
+    failed_tests: &[&TestCase],
+    framing_lines: &HashSet<usize>,
+) -> FailedSection {
+    let blocks: Vec<Vec<String>> = failed_tests
+        .iter()
+        .map(|test| collect_failure_block(lines, test, framing_lines))
+        .collect();
+    let any_block_truncated = blocks.iter().any(|block| block.len() > MAX_FAILURE_LINES);
+    let list_capped = failed_tests.len() > MAX_FAILED_LIST_LINES;
+
+    let mut full = String::from("failed:");
+    for (test, block) in failed_tests.iter().zip(&blocks) {
+        full.push('\n');
+        full.push_str(&format_failed_entry(test, block));
+    }
+
+    let mut rendered = String::from("failed:");
+    for (test, block) in failed_tests
+        .iter()
+        .zip(&blocks)
+        .take(MAX_FAILED_LIST_LINES)
+    {
+        rendered.push('\n');
+        rendered.push_str(&format_failed_entry(test, &render_failure_block(block)));
+    }
+    if list_capped {
+        let hidden = failed_tests.len() - MAX_FAILED_LIST_LINES;
+        rendered.push_str(&format!("\n  ... +{hidden} more failed"));
+    }
+
+    FailedSection {
+        rendered,
+        full,
+        truncated: any_block_truncated || list_capped,
+    }
+}
+
+fn format_failed_entry(test: &TestCase, details: &[String]) -> String {
     let mut entry = format!(
         "  #{} {} ({}, {})",
         test.number,
@@ -450,19 +535,42 @@ fn format_failed_entry(lines: &[String], test: &TestCase) -> String {
         test.status,
         format_seconds(test.duration)
     );
-    for detail in collect_failure_block(lines, test) {
+    if let Some(reason) = &test.reason {
         entry.push_str("\n    ");
-        entry.push_str(&detail);
+        entry.push_str(reason);
+    }
+    for detail in details {
+        entry.push_str("\n    ");
+        entry.push_str(detail);
     }
     entry
 }
 
-fn collect_failure_block(lines: &[String], test: &TestCase) -> Vec<String> {
+fn render_failure_block(block: &[String]) -> Vec<String> {
+    if block.len() <= MAX_FAILURE_LINES {
+        return block.to_vec();
+    }
+
+    let hidden = block.len() - MAX_FAILURE_LINES;
+    // Preserve setup context at the head and assertion evidence at the tail.
+    let tail_lines = truncate::reduced(MAX_FAILURE_LINES, MAX_FAILURE_HEAD_LINES);
+    let mut rendered = Vec::with_capacity(MAX_FAILURE_LINES + 1);
+    rendered.extend(block.iter().take(MAX_FAILURE_HEAD_LINES).cloned());
+    rendered.push(format!("... +{hidden} more lines"));
+    rendered.extend(block[block.len() - tail_lines..].iter().cloned());
+    rendered
+}
+
+fn collect_failure_block(
+    lines: &[String],
+    test: &TestCase,
+    framing_lines: &HashSet<usize>,
+) -> Vec<String> {
     let mut block = Vec::new();
     let result_index = test.line_index;
-    let boundary = lines[..result_index]
-        .iter()
-        .rposition(|line| is_ctest_boundary(line));
+    let boundary = (0..result_index)
+        .rev()
+        .find(|index| framing_lines.contains(index));
 
     // Under -j, lines following another result belong to that completed test.
     if let Some(start) = boundary.filter(|index| START_RE.is_match(&lines[*index])) {
@@ -475,43 +583,21 @@ fn collect_failure_block(lines: &[String], test: &TestCase) -> Vec<String> {
 
     let mut index = result_index + 1;
     while index < lines.len() {
-        let line = &lines[index];
-        if is_ctest_boundary(line) {
+        if framing_lines.contains(&index) {
             break;
         }
-        block.push(line.trim_end().to_string());
+        block.push(lines[index].trim_end().to_string());
         index += 1;
     }
 
     trim_blank_edges(&mut block);
-    let mut rendered = Vec::new();
-    if let Some(reason) = &test.reason {
-        rendered.push(reason.clone());
-    }
-
-    if block.len() > MAX_FAILURE_LINES {
-        let hidden = block.len() - MAX_FAILURE_LINES;
-        let full_block = block.join("\n");
-        // Preserve setup context at the head and assertion evidence at the tail.
-        let tail_lines = truncate::reduced(MAX_FAILURE_LINES, MAX_FAILURE_HEAD_LINES);
-        rendered.extend(block.iter().take(MAX_FAILURE_HEAD_LINES).cloned());
-        rendered.push(format!("... +{hidden} more lines"));
-        rendered.extend(block[block.len() - tail_lines..].iter().cloned());
-        if let Some(hint) = crate::core::tee::force_tee_hint(&full_block, "ctest-failure") {
-            rendered.push(hint);
-        }
-    } else {
-        rendered.extend(block);
-    }
-
-    rendered
+    block
 }
 
-fn collect_failed_trailer(lines: &[String]) -> Vec<String> {
-    let Some(start) = lines
-        .iter()
-        .position(|line| line.trim() == "The following tests FAILED:")
-    else {
+fn collect_failed_trailer(lines: &[String], framing_lines: &HashSet<usize>) -> Vec<String> {
+    let Some(start) = (0..lines.len()).rev().find(|index| {
+        framing_lines.contains(index) && lines[*index].trim() == "The following tests FAILED:"
+    }) else {
         return Vec::new();
     };
     let mut trailer: Vec<String> = lines[start + 1..]
@@ -521,15 +607,6 @@ fn collect_failed_trailer(lines: &[String]) -> Vec<String> {
         .collect();
     trim_blank_edges(&mut trailer);
     trailer
-}
-
-fn is_ctest_boundary(line: &str) -> bool {
-    let trimmed = line.trim();
-    START_RE.is_match(line)
-        || parse_test_line(line, 0).is_some()
-        || parse_summary(line).is_some()
-        || parse_total_time(line).is_some()
-        || trimmed == "The following tests FAILED:"
 }
 
 fn trim_blank_edges(lines: &mut Vec<String>) {
@@ -639,6 +716,9 @@ failed:
 
 Errors while running CTest"#
         );
+        assert!(!filtered.contains("[full output:"));
+        let (_, _, truncated) = failed_section_parts(output);
+        assert!(!truncated);
     }
 
     #[test]
@@ -741,6 +821,16 @@ Total Test time (real) =   0.01 sec
             .join("\n")
     }
 
+    fn failed_section_parts(input: &str) -> (String, String, bool) {
+        let lines = build_logical_lines(input);
+        let tests = parse_tests(&lines);
+        let framing_lines = collect_framing_line_indices(&lines, &tests);
+        let failed_tests: Vec<&TestCase> =
+            tests.iter().filter(|test| test.is_failure()).collect();
+        let section = build_failed_section(&lines, &failed_tests, &framing_lines);
+        (section.rendered, section.full, section.truncated)
+    }
+
     #[test]
     fn recognizes_only_the_exact_no_tests_line() {
         let no_tests = "Test project /tmp/build\nNo tests were found!!!\n";
@@ -817,12 +907,68 @@ Errors while running CTest"#
     }
 
     #[test]
+    fn rejects_spoofed_framing_and_uses_the_final_summary() {
+        let input = include_str!("../../../tests/fixtures/ctest_spoofed_framing_raw.txt");
+        let filtered = filter_ctest_output(input);
+
+        assert_eq!(
+            filtered,
+            r#"ctest: 1/3 passed, 2 failed (0.01 sec)
+failed:
+  #1 nested_out (Failed, 0.00 sec)
+    setup ok
+        Start 3: inner phase
+    ASSERT FAILED: values differ
+    expected 1 got 2
+  #3 summary_spoof (Failed, 0.00 sec)
+    running inner suite
+    100% tests passed, 0 tests failed out of 1
+    Total Test time (real) =   0.01 sec
+    FAIL: outer check broke
+
+Errors while running CTest"#
+        );
+        assert!(!filtered.contains("... +"));
+        assert!(!filtered.contains("[full output:"));
+    }
+
+    #[test]
+    fn parallel_start_cluster_rejects_wrong_name_spoof() {
+        let output = r#"Test project /tmp/build
+    Start 1: failing_case
+    Start 2: passing_case
+1/2 Test #1: failing_case .....................***Failed    0.01 sec
+setup complete
+    Start 2: inner phase
+assertion failed after inner phase
+2/2 Test #2: passing_case .....................   Passed    0.01 sec
+
+50% tests passed, 1 tests failed out of 2
+
+Total Test time (real) =   0.02 sec
+"#;
+
+        let filtered = filter_ctest_output(output);
+
+        assert_eq!(
+            filtered,
+            r#"ctest: 1/2 passed, 1 failed (0.02 sec)
+failed:
+  #1 failing_case (Failed, 0.01 sec)
+    setup complete
+        Start 2: inner phase
+    assertion failed after inner phase"#
+        );
+    }
+
+    #[test]
     fn caps_noisy_failure_output_head_and_tail() {
         let input =
             include_str!("../../../tests/fixtures/ctest_noisy_fail_output_on_failure_raw.txt");
+        let filtered = filter_ctest_output(input);
 
         assert_eq!(
-            without_tee_hints(&filter_ctest_output(input)),
+            without_tee_hints(&filtered),
             r#"ctest: 1/2 passed, 1 failed (0.01 sec)
 failed:
   #10 noisy_fail (Failed, 0.01 sec)
@@ -840,6 +986,24 @@ failed:
 
 Errors while running CTest"#
         );
+        assert_eq!(
+            filtered
+                .lines()
+                .filter(|line| line.trim_start().starts_with("[full output:"))
+                .count(),
+            1
+        );
+
+        let (_, full_section, truncated) = failed_section_parts(input);
+        assert!(truncated);
+        assert_eq!(
+            full_section
+                .lines()
+                .filter(|line| line.trim_start().starts_with("noise line "))
+                .count(),
+            120
+        );
+        assert!(!full_section.contains("... +"));
     }
 
     #[test]
@@ -919,18 +1083,23 @@ Errors while running CTest"#
     }
 
     #[test]
-    fn caps_failed_test_entries_with_recovery_hint() {
+    fn caps_failed_test_entries_with_one_complete_section_tee() {
         let mut input = String::from("Test project /tmp/build\n");
         for number in 1..=25 {
             input.push_str(&format!(
                 "    Start {number}: failing_{number}\n{number}/25 Test #{number}: failing_{number} ................***Failed    0.00 sec\n"
             ));
+            for detail in 1..=30 {
+                input.push_str(&format!("detail {number}.{detail}\n"));
+            }
         }
         input.push_str(
             "\n0% tests passed, 25 tests failed out of 25\n\nTotal Test time (real) =   0.01 sec\n",
         );
 
         let filtered = filter_ctest_output(&input);
+        let (rendered_section, full_section, truncated) = failed_section_parts(&input);
+        assert!(truncated);
 
         assert_eq!(
             filtered
@@ -940,7 +1109,32 @@ Errors while running CTest"#
             MAX_FAILED_LIST_LINES
         );
         assert!(filtered.contains("  ... +5 more failed"));
-        assert!(filtered.contains("  [full output:"));
+        assert_eq!(
+            filtered
+                .lines()
+                .filter(|line| line.trim_start().starts_with("[full output:"))
+                .count(),
+            1
+        );
+        // The hint is appended by the tee step, never by the pure builder.
+        assert!(rendered_section.contains("  ... +5 more failed"));
+        assert!(!rendered_section.contains("[full output:"));
+        assert_eq!(
+            full_section
+                .lines()
+                .filter(|line| line.starts_with("  #"))
+                .count(),
+            25
+        );
+        assert_eq!(
+            full_section
+                .lines()
+                .filter(|line| line.trim_start().starts_with("detail "))
+                .count(),
+            25 * 30
+        );
+        assert!(full_section.contains("detail 25.30"));
+        assert!(!full_section.contains("... +"));
     }
 
     #[test]
