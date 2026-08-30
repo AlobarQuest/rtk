@@ -173,9 +173,8 @@ fn condense_unified_diff(diff: &str) -> String {
             if line.starts_with("+++ ") {
                 if !current_file.is_empty() && (added > 0 || removed > 0) {
                     result.push(format!("[file] {} (+{} -{})", current_file, added, removed));
-                    for c in &changes {
-                        result.push(format!("  {}", c));
-                    }
+                    // Column 0: anchored greps (`^[+-]`) must match these.
+                    result.append(&mut changes);
                 }
                 current_file = line
                     .trim_start_matches("+++ ")
@@ -197,9 +196,8 @@ fn condense_unified_diff(diff: &str) -> String {
     // Last file
     if !current_file.is_empty() && (added > 0 || removed > 0) {
         result.push(format!("[file] {} (+{} -{})", current_file, added, removed));
-        for c in &changes {
-            result.push(format!("  {}", c));
-        }
+        // Column 0: anchored greps (`^[+-]`) must match these.
+        result.append(&mut changes);
     }
 
     result.join("\n")
@@ -392,6 +390,38 @@ diff --git a/b.rs b/b.rs
         let result = condense_unified_diff(diff);
         assert!(result.contains("a.rs"));
         assert!(result.contains("b.rs"));
+    }
+
+    #[test]
+    fn test_condense_unified_diff_markers_at_column_0() {
+        // Indented markers make anchored greps (`^[+-]`) match nothing, so a
+        // "was anything removed?" audit answers no while the content is there.
+        //
+        // Two files on purpose. A file's changes are flushed at two separate
+        // sites: once per `+++` for the preceding file, once after the loop for
+        // the last one. A single-file fixture only ever reaches the second, so
+        // the first could be reverted with the whole suite still green.
+        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new() {}\ndiff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-let x = 1;\n+let x = 2;\n";
+        let result = condense_unified_diff(diff);
+        for want in ["-fn old() {}", "+fn new() {}", "-let x = 1;", "+let x = 2;"] {
+            assert!(
+                result.lines().any(|l| l == want),
+                "missing {want:?} at column 0 in:\n{}",
+                result
+            );
+        }
+        // Match on leading whitespace rather than a single space: the indent
+        // this guards against is two spaces, so `" +"` / `" -"` would never
+        // fire and the assertion would pass on the very code it rejects.
+        assert!(
+            !result.lines().any(|l| {
+                let trimmed = l.trim_start();
+                trimmed.len() != l.len()
+                    && (trimmed.starts_with('+') || trimmed.starts_with('-'))
+            }),
+            "change lines must not be indented:\n{}",
+            result
+        );
     }
 
     #[test]
