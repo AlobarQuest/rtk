@@ -1408,10 +1408,15 @@ make[1]: Leaving directory '/home/user/project/docs'
     #[test]
     fn test_spring_boot_match_command_requires_spring_named_jar() {
         let filters = make_filters(BUILTIN_TOML);
+        let spring_boot = filters
+            .iter()
+            .find(|f| f.name == "spring-boot")
+            .expect("spring-boot filter must exist");
 
         assert!(
-            find_filter_in("java -jar build/libs/my-other-tool.jar", &filters)
-                .is_none_or(|f| f.name != "spring-boot"),
+            !spring_boot
+                .match_regex
+                .is_match("java -jar build/libs/my-other-tool.jar"),
             "a non-Spring jar must not activate the spring-boot filter"
         );
 
@@ -1428,21 +1433,44 @@ make[1]: Leaving directory '/home/user/project/docs'
         assert_eq!(capitalized.name, "spring-boot");
 
         assert!(
-            find_filter_in(
-                "java -jar /opt/spring-cache/other-tool.jar",
-                &filters
-            )
-            .is_none_or(|f| f.name != "spring-boot"),
+            !spring_boot
+                .match_regex
+                .is_match("java -jar /opt/spring-cache/other-tool.jar"),
             "'spring' appearing only in a directory segment (not the jar filename itself) must not activate the spring-boot filter"
+        );
+
+        // Windows paths: '\' must be treated as a path separator too, not swallowed
+        // into the filename-only match (the exact bug this guard exists to catch).
+        assert!(
+            !spring_boot
+                .match_regex
+                .is_match(r"java -jar C:\spring-cache\other.jar"),
+            "'spring' appearing only in a Windows directory segment must not activate the spring-boot filter"
+        );
+        assert!(
+            !spring_boot
+                .match_regex
+                .is_match(r"java -jar C:\dev\spring-workspace\build\other-tool.jar"),
+            "'spring' appearing only in a nested Windows directory segment must not activate the spring-boot filter"
+        );
+        assert!(
+            spring_boot
+                .match_regex
+                .is_match(r"java -jar C:\dev\my-spring-app.jar"),
+            "a Windows-path jar with 'spring' in its own filename must still match"
         );
     }
 
     #[test]
     fn test_liquibase_match_command_ignores_path_substring() {
         let filters = make_filters(BUILTIN_TOML);
+        let liquibase = filters
+            .iter()
+            .find(|f| f.name == "liquibase")
+            .expect("liquibase filter must exist");
 
         assert!(
-            find_filter_in("rm -rf /opt/liquibase", &filters).is_none_or(|f| f.name != "liquibase"),
+            !liquibase.match_regex.is_match("rm -rf /opt/liquibase"),
             "'liquibase' appearing only as a path argument must not activate the liquibase filter"
         );
 
@@ -1450,21 +1478,32 @@ make[1]: Leaving directory '/home/user/project/docs'
             .expect("bare liquibase invocation must still match");
         assert_eq!(bare.name, "liquibase");
 
-        let full_path = find_filter_in("/usr/local/bin/liquibase update", &filters)
-            .expect("path-qualified liquibase invocation must still match");
-        assert_eq!(full_path.name, "liquibase");
+        // Production callers (run_fallback in src/main.rs, strip_absolute_path in
+        // src/discover/registry.rs) always basename argv[0] before this regex runs,
+        // so a raw path-qualified string must NOT match on its own — the regex has
+        // no path-prefix branch to fall back on.
+        assert!(
+            !liquibase
+                .match_regex
+                .is_match("/usr/local/bin/liquibase update"),
+            "a raw path-qualified invocation must not match — callers basename argv[0] before matching"
+        );
     }
 
     #[test]
     fn test_ssh_match_command_excludes_ssh_dash_utilities() {
         let filters = make_filters(BUILTIN_TOML);
+        let ssh = filters
+            .iter()
+            .find(|f| f.name == "ssh")
+            .expect("ssh filter must exist");
 
         assert!(
-            find_filter_in("ssh-keygen -t ed25519", &filters).is_none_or(|f| f.name != "ssh"),
+            !ssh.match_regex.is_match("ssh-keygen -t ed25519"),
             "ssh-keygen must not activate the plain ssh connection filter"
         );
         assert!(
-            find_filter_in("ssh-add ~/.ssh/id_ed25519", &filters).is_none_or(|f| f.name != "ssh"),
+            !ssh.match_regex.is_match("ssh-add ~/.ssh/id_ed25519"),
             "ssh-add must not activate the plain ssh connection filter"
         );
 
