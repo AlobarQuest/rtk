@@ -22,8 +22,8 @@ use cmds::ruby::{rake_cmd, rspec_cmd, rubocop_cmd};
 use cmds::rust::{cargo_cmd, runner};
 use cmds::scala::sbt_cmd;
 use cmds::system::{
-    deps, env_cmd, find_cmd, format_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd, read, search,
-    summary, tree, wc_cmd,
+    ctest_cmd, deps, env_cmd, find_cmd, format_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd,
+    read, search, summary, tree, wc_cmd,
 };
 
 use anyhow::{Context, Result};
@@ -55,6 +55,8 @@ pub enum AgentTarget {
     Hermes,
     /// Factory Droid CLI
     Droid,
+    /// Mistral Vibe CLI
+    Vibe,
 }
 
 #[derive(Parser)]
@@ -315,7 +317,13 @@ enum Commands {
         #[arg(short = 'l', long, default_value = "80")]
         max_len: usize,
         /// Max results to show
-        #[arg(short, long, default_value = "200")]
+        // No short: `-m` is GNU grep's --max-count (stop after N matches per
+        // file). Deriving it to RTK's --max (a display cap) silently swallowed
+        // `-m N` so grep never saw the real --max-count. Without the short, `-m`
+        // flows to extra_args and is forwarded verbatim to grep/rg, which applies
+        // genuine --max-count while RTK still compacts (matches how `rtk rg -m`
+        // already behaves). --max keeps its long form.
+        #[arg(long, default_value = "200")]
         max: usize,
         /// Show only match context (not full line)
         #[arg(long)]
@@ -495,6 +503,14 @@ enum Commands {
     /// Vitest commands with compact output
     Vitest {
         /// Additional vitest arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// CTest with compact output
+    #[command(disable_help_flag = true, disable_version_flag = true)]
+    Ctest {
+        /// Additional ctest arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -866,6 +882,8 @@ enum HookCommands {
     Copilot,
     /// Process Factory Droid PreToolUse hook (reads JSON from stdin)
     Droid,
+    /// Process Mistral Vibe CLI pre_tool hook (reads JSON from stdin)
+    Vibe,
     /// Check how a command would be rewritten by the hook engine (dry-run)
     Check {
         /// Target agent
@@ -1340,8 +1358,8 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
         match result {
             Ok(output) => {
                 let exit_code = core::utils::exit_code_from_output(&output, &raw_command);
-                let stdout_raw = String::from_utf8_lossy(&output.stdout);
-                let stderr_raw = String::from_utf8_lossy(&output.stderr);
+                let stdout_raw = core::utils::decode_process_output(&output.stdout);
+                let stderr_raw = core::utils::decode_process_output(&output.stderr);
 
                 // Merge stderr into the text to filter when filter_stderr is enabled;
                 // otherwise emit stderr directly so it is always visible.
@@ -1566,6 +1584,8 @@ where
         uninstall_hermes(ctx)
     } else if agent == Some(AgentTarget::Droid) {
         hooks::init::uninstall_droid(global, ctx)
+    } else if agent == Some(AgentTarget::Vibe) {
+        hooks::init::uninstall_vibe(ctx)
     } else {
         let cursor = agent == Some(AgentTarget::Cursor);
         let pi = agent == Some(AgentTarget::Pi);
@@ -2068,6 +2088,15 @@ fn run_cli() -> Result<i32> {
                 hooks::init::run_hermes_mode(ctx)?;
             } else if agent == Some(AgentTarget::Droid) {
                 hooks::init::run_droid_mode(global, ctx)?;
+            } else if agent == Some(AgentTarget::Vibe) {
+                let patch_mode = if auto_patch {
+                    hooks::init::PatchMode::Auto
+                } else if no_patch {
+                    hooks::init::PatchMode::Skip
+                } else {
+                    hooks::init::PatchMode::Ask
+                };
+                hooks::init::run_vibe_mode(global, hook_only, patch_mode, ctx)?;
             } else {
                 let install_opencode = opencode;
                 let install_claude = !opencode;
@@ -2182,6 +2211,8 @@ fn run_cli() -> Result<i32> {
         Commands::Jest { ref args } | Commands::Vitest { ref args } => {
             vitest_cmd::run_test(&cli.command, args, cli.verbose)?
         }
+
+        Commands::Ctest { args } => ctest_cmd::run(&args, cli.verbose)?,
 
         Commands::Prisma { command } => match command {
             PrismaCommands::Generate { args } => {
@@ -2438,6 +2469,10 @@ fn run_cli() -> Result<i32> {
                 hooks::hook_cmd::run_droid()?;
                 0
             }
+            HookCommands::Vibe => {
+                hooks::hook_cmd::run_vibe()?;
+                0
+            }
             HookCommands::Check { agent: _, command } => {
                 use crate::discover::registry::rewrite_command;
                 let raw = command.join(" ");
@@ -2657,8 +2692,8 @@ fn run_cli() -> Result<i32> {
                 .join()
                 .map_err(|_| anyhow::anyhow!("stderr streaming thread panicked"))??;
 
-            let stdout = String::from_utf8_lossy(&stdout_bytes);
-            let stderr = String::from_utf8_lossy(&stderr_bytes);
+            let stdout = core::utils::decode_process_output(&stdout_bytes);
+            let stderr = core::utils::decode_process_output(&stderr_bytes);
             let full_output = format!("{}{}", stdout, stderr);
 
             // Track usage (input = output since no filtering)
@@ -2739,6 +2774,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Rg { .. }
             | Commands::Wget { .. }
             | Commands::Vitest { .. }
+            | Commands::Ctest { .. }
             | Commands::Prisma { .. }
             | Commands::Tsc { .. }
             | Commands::Next { .. }
@@ -2957,6 +2993,24 @@ mod tests {
     }
 
     #[test]
+    fn test_try_parse_grep_dash_m_is_max_count() {
+        // Regression: `-m` is GNU grep's --max-count, not RTK's --max. It must
+        // parse (not consume the pattern), keep `max` at its default, and reach
+        // extra_args so it is forwarded to grep as a real --max-count.
+        let cli = Cli::try_parse_from(["rtk", "grep", "-m", "5", "pattern", "file"]).unwrap();
+
+        match cli.command {
+            Commands::Grep {
+                max, extra_args, ..
+            } => {
+                assert_eq!(max, 200, "max must stay at its default, not consume `-m`");
+                assert_eq!(extra_args, vec!["-m", "5", "pattern", "file"]);
+            }
+            _ => panic!("Expected Grep command"),
+        }
+    }
+
+    #[test]
     fn test_try_parse_init_agent_hermes_uninstall() {
         let cli = Cli::try_parse_from(["rtk", "init", "--agent", "hermes", "--uninstall"]).unwrap();
         match cli.command {
@@ -3121,6 +3175,7 @@ mod tests {
             "wc",
             "jest",
             "vitest",
+            "ctest",
             "prisma",
             "tsc",
             "next",
@@ -3193,6 +3248,17 @@ mod tests {
                 assert_eq!(args, vec!["echo", "hello"]);
             }
             _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_ctest_help_and_version_passthrough_args() {
+        for flag in ["--help", "--version"] {
+            let cli = Cli::try_parse_from(["rtk", "ctest", flag]).unwrap();
+            match cli.command {
+                Commands::Ctest { args } => assert_eq!(args, vec![flag]),
+                _ => panic!("Expected Ctest command"),
+            }
         }
     }
 
