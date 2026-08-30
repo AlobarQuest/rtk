@@ -176,10 +176,6 @@ fn condense_unified_diff(diff: &str) -> String {
                     for c in &changes {
                         result.push(format!("  {}", c));
                     }
-                    let total = added + removed;
-                    if total > 10 {
-                        result.push(format!("  ... +{} more", total - 10));
-                    }
                 }
                 current_file = line
                     .trim_start_matches("+++ ")
@@ -203,10 +199,6 @@ fn condense_unified_diff(diff: &str) -> String {
         result.push(format!("[file] {} (+{} -{})", current_file, added, removed));
         for c in &changes {
             result.push(format!("  {}", c));
-        }
-        let total = added + removed;
-        if total > 10 {
-            result.push(format!("  ... +{} more", total - 10));
         }
     }
 
@@ -408,7 +400,7 @@ diff --git a/b.rs b/b.rs
         assert!(result.is_empty());
     }
 
-    // --- truncation accuracy ---
+    // --- overflow indicator ---
 
     fn make_large_unified_diff(added: usize, removed: usize) -> String {
         let mut lines = vec![
@@ -427,26 +419,29 @@ diff --git a/b.rs b/b.rs
     }
 
     #[test]
-    fn test_condense_unified_diff_overflow_count_accuracy() {
-        // 100 added + 100 removed = 200 total changes, only 10 shown
-        // True overflow = 200 - 10 = 190
-        // Bug: changes vec capped at 15, so old code showed "+5 more" (15-10) instead of "+190 more"
+    fn test_condense_unified_diff_large_no_false_overflow_indicator() {
+        // All 200 changes are shown in full (never truncate diff content).
+        // No misleading "... +N more" should appear.
         let diff = make_large_unified_diff(100, 100);
         let result = condense_unified_diff(&diff);
         assert!(
-            result.contains("+190 more"),
-            "Expected '+190 more' but got:\n{}",
+            !result.contains("more"),
+            "No overflow indicator expected when all lines are shown, got:\n{}",
             result
         );
         assert!(
-            !result.contains("+5 more"),
-            "Bug still present: showing '+5 more' instead of true overflow"
+            result.contains("+new_value_99"),
+            "Last added line must be present (no truncation)"
+        );
+        assert!(
+            result.contains("-old_value_99"),
+            "Last removed line must be present (no truncation)"
         );
     }
 
     #[test]
     fn test_condense_unified_diff_no_false_overflow() {
-        // 8 changes total — all fit within the 10-line display cap, no overflow message
+        // Counter-case to the 200-change test above: no indicator at small sizes either.
         let diff = make_large_unified_diff(4, 4);
         let result = condense_unified_diff(&diff);
         assert!(
