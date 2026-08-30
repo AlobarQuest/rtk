@@ -316,6 +316,55 @@ fn small_grep_not_worse_than_plain() {
     );
 }
 
+// --- #2628: rtk's own long options still bind after the short forms were removed ---
+
+#[test]
+fn max_len_long_option_still_binds_to_rtk() {
+    if !rg_available() {
+        return;
+    }
+    // The other half of #2628: dropping the `-l` short must not stop the long
+    // form from reaching rtk's truncation. Needs a bulky match set -- a small
+    // result passes through uncompressed under the never-worse-than-plain
+    // guard, so a one-line file would prove nothing either way.
+    let body: String = (0..60)
+        .map(|i| format!("MATCH {i} {}\n", "x".repeat(400)))
+        .collect();
+    let (_dir, path) = write_temp(&body);
+    let file = path.to_str().unwrap();
+
+    // Measure matched lines only. rtk's own trailer ("+N more ... [see
+    // remaining: tail ...]") is fixed-width chrome that --max-len does not
+    // govern, and it is the longest line in either run.
+    let widest_match = |args: &[&str]| -> usize {
+        let out = rtk().args(args).output().expect("rtk grep");
+        assert!(
+            out.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("MATCH "))
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+
+    let narrow = widest_match(&["grep", "--max-len", "40", "MATCH", file]);
+    let default = widest_match(&["grep", "MATCH", file]);
+
+    assert!(
+        narrow > 0 && default > 0,
+        "expected matched lines in both runs"
+    );
+    assert!(
+        narrow < default,
+        "--max-len must still bind after the short form was removed \
+         (narrow={narrow}, default={default})"
+    );
+}
+
 // --- #2543: bundled files-with-matches cluster (-rln / -ln) lists files, not "0 matches" ---
 
 #[test]
