@@ -15,6 +15,11 @@ const MAX_SLOWEST: usize = 3;
 const MAX_FAILURE_LINES: usize = CAP_WARNINGS;
 const MAX_FAILURE_HEAD_LINES: usize = 2;
 const MAX_FAILED_LIST_LINES: usize = CAP_LIST;
+const MAX_DETECT_PREAMBLE_LINES: usize = 4;
+// Failure entries carry a header plus up to `MAX_FAILURE_LINES` detail lines each,
+// so this list deviates below `CAP_LIST`; the single-line skipped and raw-trailer
+// lists keep the full cap.
+const MAX_FAILED_BLOCK_ENTRIES: usize = truncate::reduced(CAP_LIST, 5);
 
 static TEST_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -56,6 +61,7 @@ struct TestCase {
 struct ParsedTests {
     tests: Vec<TestCase>,
     result_lines: Vec<usize>,
+    run_total: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,10 +115,6 @@ fn should_passthrough(args: &[String]) -> bool {
                 | "--show-only"
                 | "--print-labels"
                 | "--dashboard"
-                | "-M"
-                | "--test-model"
-                | "-T"
-                | "--test-action"
                 | "-S"
                 | "--script"
                 | "-SP"
@@ -121,9 +123,60 @@ fn should_passthrough(args: &[String]) -> bool {
         ) || arg.starts_with("-D")
             || arg.starts_with("--show-only=")
             || arg.starts_with("--help-")
-    })
+    }) || dashboard_action_changes_output(args)
 }
 
+/// `-T Test` is the canonical CI invocation and prints ordinary test output, so
+/// it stays filtered. Every other action prints something else entirely
+/// (`-T Coverage` opens with `Performing coverage`), and a test model with no
+/// action to pair it with is left alone rather than guessed at.
+fn dashboard_action_changes_output(args: &[String]) -> bool {
+    let mut actions = Vec::new();
+    let mut has_model = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let (flag, inline_value) = arg.split_once('=').map_or((arg, None), |(flag, value)| {
+            (flag, Some(value))
+        });
+        match flag {
+            "-T" | "--test-action" => {
+                match inline_value.map(str::to_string).or_else(|| {
+                    let value = args.get(index + 1).cloned();
+                    index += usize::from(value.is_some());
+                    value
+                }) {
+                    // A valueless action is not an invocation ctest would run;
+                    // leave it alone rather than assume it means `Test`.
+                    Some(value) => actions.push(value),
+                    None => actions.push(String::new()),
+                }
+            }
+            "-M" | "--test-model" => {
+                has_model = true;
+                if inline_value.is_none() && args.get(index + 1).is_some() {
+                    index += 1;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    let runs_tests = actions
+        .iter()
+        .any(|action| action.eq_ignore_ascii_case("test"));
+    actions
+        .iter()
+        .any(|action| !action.eq_ignore_ascii_case("test"))
+        || (has_model && !runs_tests)
+}
+
+/// CTest prints diagnostics ahead of the project banner in ordinary runs
+/// (`Internal ctest changing into directory: `, or a repeated `Cannot find file:
+/// ...DartConfiguration.tcl` under `-T`), so the banner is looked up within a
+/// short leading window instead of being required first. A result or no-tests
+/// line must still follow it, which is what keeps unrelated output out.
 pub(crate) fn looks_like_ctest_output(output: &str) -> bool {
     let clean = strip_ansi(output);
     let logical_lines = build_logical_lines(&clean);
@@ -131,20 +184,11 @@ pub(crate) fn looks_like_ctest_output(output: &str) -> bool {
         .iter()
         .map(String::as_str)
         .filter(|line| !line.trim().is_empty());
-    let Some(mut first) = lines.next() else {
-        return false;
-    };
-    if first
-        .trim_start()
-        .starts_with("Internal ctest changing into directory: ")
-    {
-        let Some(project_line) = lines.next() else {
-            return false;
-        };
-        first = project_line;
-    }
 
-    first.trim_start().starts_with("Test project ")
+    lines
+        .by_ref()
+        .take(MAX_DETECT_PREAMBLE_LINES + 1)
+        .any(|line| line.trim_start().starts_with("Test project "))
         && lines.any(|line| is_no_tests_line(line) || parse_test_line(line, 0).is_some())
 }
 
@@ -163,15 +207,15 @@ pub(crate) fn filter_ctest_output(output: &str) -> String {
         &parsed_tests.result_lines,
     );
     let tests = parsed_tests.tests;
-    let summary = lines.iter().rev().find_map(|line| parse_summary(line));
+    let summary = find_run_summary(&lines, &tests, &framing_lines, parsed_tests.run_total);
     let total_time = lines
         .iter()
         .rev()
         .find_map(|line| parse_total_time(line));
 
     if tests.is_empty() && summary.is_none() {
-        if lines.iter().any(|line| is_no_tests_line(line)) {
-            return "ctest: no tests found".to_string();
+        if let Some(index) = lines.iter().rposition(|line| is_no_tests_line(line)) {
+            return format_no_tests(&lines[index + 1..]);
         }
         return trimmed.to_string();
     }
@@ -246,6 +290,21 @@ fn build_logical_lines(output: &str) -> Vec<String> {
     logical_lines
 }
 
+/// `--no-tests=error` exits non-zero and says so after the no-tests line, so the
+/// lines behind it are kept: on their own, `ctest: no tests found` reads as a
+/// benign outcome for a run that actually failed.
+fn format_no_tests(rest: &[String]) -> String {
+    let mut trailer: Vec<String> = rest.iter().map(|line| line.trim_end().to_string()).collect();
+    trim_blank_edges(&mut trailer);
+
+    let mut out = String::from("ctest: no tests found");
+    for line in trailer {
+        out.push('\n');
+        out.push_str(&line);
+    }
+    out
+}
+
 fn is_no_tests_line(line: &str) -> bool {
     line.trim() == "No tests were found!!!"
 }
@@ -284,6 +343,7 @@ fn parse_tests(lines: &[String]) -> ParsedTests {
     ParsedTests {
         tests,
         result_lines,
+        run_total,
     }
 }
 
@@ -314,13 +374,59 @@ fn split_status_reason(raw: &str) -> (String, Option<String>) {
     let reason = reason
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ")
-        .replace(" ]", "]");
+        .join(" ");
+    let reason = match reason.strip_suffix(" ]") {
+        Some(head) => format!("{head}]"),
+        None => reason,
+    };
 
     (
         status.trim().to_string(),
         (!reason.is_empty()).then_some(reason),
     )
+}
+
+/// A test that forwards a nested ctest run echoes that run's summary too, so the
+/// last summary in the stream is this run's only when this run reached its own.
+/// A killed run never does, and the forwarded summary describes the nested suite:
+/// left alone it reports a failing run green, because `has_failures` trusts a
+/// summary over the result lines.
+///
+/// CTest prints its summary once every test has finished, so a validated `Start`
+/// behind a summary places that summary inside a test's output. That is the rule
+/// that identifies a forwarded suite whatever its size. Two bounds cover a kill
+/// landing between the forwarded summary and the next `Start`: the run total caps
+/// a genuine total -- it equals it in a plain run, and exceeds it when tests were
+/// scheduled but not counted (`--stop-on-failure`) or counted but not summarized
+/// (disabled tests) -- and a summary cannot report fewer failures than the result
+/// lines already validated for this run.
+fn find_run_summary(
+    lines: &[String],
+    tests: &[TestCase],
+    framing_lines: &HashSet<usize>,
+    run_total: Option<u32>,
+) -> Option<CtestSummary> {
+    let last_start = lines
+        .iter()
+        .enumerate()
+        .filter(|(index, line)| framing_lines.contains(index) && START_RE.is_match(line))
+        .map(|(index, _)| index)
+        .next_back();
+    let parsed_failures = tests.iter().filter(|test| test.is_failure()).count();
+
+    lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, line)| parse_summary(line).map(|summary| (index, summary)))
+        .filter(|(index, _)| last_start.is_none_or(|last_start| last_start < *index))
+        .filter(|(_, summary)| {
+            run_total.is_none_or(|run_total| {
+                u32::try_from(summary.total).is_ok_and(|total| total <= run_total)
+            })
+        })
+        .filter(|(_, summary)| summary.failed >= parsed_failures)
+        .map(|(_, summary)| summary)
 }
 
 fn parse_summary(line: &str) -> Option<CtestSummary> {
@@ -536,7 +642,7 @@ struct FailedSection {
 
 /// Every block is collected untruncated before the list cap so a single tee
 /// can hold the whole section; rendering then caps entries at
-/// `MAX_FAILED_LIST_LINES` and each block at head+tail.
+/// `MAX_FAILED_BLOCK_ENTRIES` and each block at head+tail.
 fn build_failed_section(
     lines: &[String],
     failed_tests: &[&TestCase],
@@ -547,7 +653,7 @@ fn build_failed_section(
         .map(|test| collect_failure_block(lines, test, framing_lines))
         .collect();
     let any_block_truncated = blocks.iter().any(|block| block.len() > MAX_FAILURE_LINES);
-    let list_capped = failed_tests.len() > MAX_FAILED_LIST_LINES;
+    let list_capped = failed_tests.len() > MAX_FAILED_BLOCK_ENTRIES;
 
     let mut full = String::from("failed:");
     for (test, block) in failed_tests.iter().zip(&blocks) {
@@ -559,13 +665,13 @@ fn build_failed_section(
     for (test, block) in failed_tests
         .iter()
         .zip(&blocks)
-        .take(MAX_FAILED_LIST_LINES)
+        .take(MAX_FAILED_BLOCK_ENTRIES)
     {
         rendered.push('\n');
         rendered.push_str(&format_failed_entry(test, &render_failure_block(block)));
     }
     if list_capped {
-        let hidden = failed_tests.len() - MAX_FAILED_LIST_LINES;
+        let hidden = failed_tests.len() - MAX_FAILED_BLOCK_ENTRIES;
         rendered.push_str(&format!("\n  ... +{hidden} more failed"));
     }
 
@@ -971,6 +1077,36 @@ Total Test time (real) =   0.01 sec
             assert!(should_passthrough(&[dashboard_arg.to_string()]));
         }
         assert!(!should_passthrough(&["--output-on-failure".to_string()]));
+    }
+
+    #[test]
+    fn the_test_action_stays_filtered_and_other_actions_do_not() {
+        for filtered in [
+            vec!["-T", "Test"],
+            vec!["-T", "test"],
+            vec!["--test-action", "Test"],
+            vec!["--test-action=Test"],
+            vec!["-M", "Nightly", "-T", "Test"],
+            vec!["-T", "Test", "--output-on-failure"],
+        ] {
+            let args: Vec<String> = filtered.iter().map(ToString::to_string).collect();
+            assert!(!should_passthrough(&args), "{filtered:?} should be filtered");
+        }
+
+        for passthrough in [
+            vec!["-T", "Coverage"],
+            vec!["-T", "MemCheck"],
+            vec!["--test-action", "Submit"],
+            vec!["-T", "Test", "-T", "Coverage"],
+            vec!["-M", "Nightly"],
+            vec!["--test-model", "Continuous"],
+        ] {
+            let args: Vec<String> = passthrough.iter().map(ToString::to_string).collect();
+            assert!(
+                should_passthrough(&args),
+                "{passthrough:?} should pass through"
+            );
+        }
     }
 
     fn count_tokens(s: &str) -> usize {
@@ -1433,6 +1569,130 @@ Errors while running CTest"#
     }
 
     #[test]
+    fn rejects_a_forwarded_summary_from_a_killed_run() {
+        let input = include_str!("../../../tests/fixtures/ctest_killed_forwarded_suite_raw.txt");
+
+        assert_eq!(
+            filter_ctest_output(input),
+            r#"ctest: 0/1 passed, 1 failed (0.02 sec)
+failed:
+  #1 wrapper (Failed, 0.02 sec)
+    Test project /tmp/inner/build
+        Start 1: inner_a
+    1/3 Test #1: inner_a ..........................   Passed    0.00 sec
+        Start 2: inner_b
+    2/3 Test #2: inner_b ..........................   Passed    0.01 sec
+        Start 3: inner_c
+    3/3 Test #3: inner_c ..........................   Passed    0.01 sec"#
+        );
+    }
+
+    #[test]
+    fn rejects_a_forwarded_summary_smaller_than_the_run() {
+        let input =
+            include_str!("../../../tests/fixtures/ctest_killed_smaller_forwarded_suite_raw.txt");
+
+        assert_eq!(
+            filter_ctest_output(input),
+            r#"ctest: 0/1 passed, 1 failed (0.02 sec)
+failed:
+  #1 wrapper (Failed, 0.02 sec)
+    Test project /tmp/inner/build
+        Start 1: inner_a
+    1/3 Test #1: inner_a ..........................   Passed    0.01 sec
+        Start 2: inner_b
+    2/3 Test #2: inner_b ..........................   Passed    0.01 sec
+        Start 3: inner_c
+    3/3 Test #3: inner_c ..........................   Passed    0.00 sec"#
+        );
+    }
+
+    #[test]
+    fn keeps_a_bracket_that_belongs_to_the_regex_reason() {
+        let input = r#"Test project /tmp/build
+    Start 1: bracket
+1/1 Test #1: bracket ..........................***Failed  Required regular expression not found. Regex=[zzz[0-9 ]end
+]  0.01 sec
+
+0% tests passed, 1 tests failed out of 1
+
+Total Test time (real) =   0.01 sec
+"#;
+
+        assert!(filter_ctest_output(input).contains("Regex=[zzz[0-9 ]end]"));
+    }
+
+    #[test]
+    fn keeps_the_error_trailer_when_no_tests_ran() {
+        let input = r#"Test project /tmp/build
+No tests were found!!!
+Errors while running CTest
+"#;
+
+        assert_eq!(
+            filter_ctest_output(input),
+            "ctest: no tests found\nErrors while running CTest"
+        );
+    }
+
+    #[test]
+    fn reports_a_clean_empty_run_without_an_error_trailer() {
+        let input = "Test project /tmp/build\nNo tests were found!!!\n";
+
+        assert_eq!(filter_ctest_output(input), "ctest: no tests found");
+    }
+
+    #[test]
+    fn detects_ctest_output_behind_a_dashboard_preamble() {
+        let input = r#"Cannot find file: /tmp/build/DartConfiguration.tcl
+Cannot find file: /tmp/build/DartConfiguration.tcl
+Test project /tmp/build
+    Start 1: a_pass
+1/1 Test #1: a_pass ...........................   Passed    0.01 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Total Test time (real) =   0.01 sec
+"#;
+
+        assert!(looks_like_ctest_output(input));
+    }
+
+    #[test]
+    fn detects_ctest_output_behind_the_internal_directory_preamble() {
+        let input = r#"Internal ctest changing into directory: /tmp/build
+Test project /tmp/build
+    Start 1: a_pass
+1/1 Test #1: a_pass ...........................   Passed    0.01 sec
+"#;
+
+        assert!(looks_like_ctest_output(input));
+    }
+
+    #[test]
+    fn rejects_a_banner_buried_past_the_preamble_window() {
+        let mut input = String::new();
+        for line in 1..=MAX_DETECT_PREAMBLE_LINES + 1 {
+            input.push_str(&format!("unrelated preamble {line}\n"));
+        }
+        input.push_str(
+            "Test project /tmp/build\n1/1 Test #1: a ................   Passed    0.01 sec\n",
+        );
+
+        assert!(!looks_like_ctest_output(&input));
+    }
+
+    #[test]
+    fn rejects_a_banner_without_any_result_line() {
+        let input = r#"Cannot find file: /tmp/build/DartConfiguration.tcl
+Test project /tmp/build
+some unrelated tail
+"#;
+
+        assert!(!looks_like_ctest_output(input));
+    }
+
+    #[test]
     fn caps_failed_test_entries_with_one_complete_section_tee() {
         let mut input = String::from("Test project /tmp/build\n");
         for number in 1..=25 {
@@ -1456,9 +1716,9 @@ Errors while running CTest"#
                 .lines()
                 .filter(|line| line.starts_with("  #"))
                 .count(),
-            MAX_FAILED_LIST_LINES
+            MAX_FAILED_BLOCK_ENTRIES
         );
-        assert!(filtered.contains("  ... +5 more failed"));
+        assert!(filtered.contains("  ... +10 more failed"));
         assert_eq!(
             filtered
                 .lines()
@@ -1467,7 +1727,7 @@ Errors while running CTest"#
             1
         );
         // The hint is appended by the tee step, never by the pure builder.
-        assert!(rendered_section.contains("  ... +5 more failed"));
+        assert!(rendered_section.contains("  ... +10 more failed"));
         assert!(!rendered_section.contains("[full output:"));
         assert_eq!(
             full_section
