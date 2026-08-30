@@ -487,6 +487,7 @@ pub fn run_vibe() -> Result<()> {
 }
 
 fn run_vibe_inner(input: &str) -> Option<String> {
+    let input = strip_leading_bom(input);
     let json: Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(e) => {
@@ -2233,6 +2234,23 @@ mod tests {
         assert!(
             v.get("system_message").is_some(),
             "expected system_message for UI visibility"
+        );
+    }
+
+    #[test]
+    fn test_vibe_strips_utf8_bom() {
+        // Sixth hook stdin entry point, and the last one that did not strip.
+        // Windows hosts may prepend a UTF-8 BOM (confirmed for Cursor);
+        // without stripping, serde_json rejects the payload, run_vibe_inner
+        // logs to stderr and returns None, and the command silently stops
+        // being rewritten.
+        let input = format!("\u{feff}{}", vibe_input("bash", "git status"));
+        let out = run_vibe_inner(&input).expect("BOM-prefixed payload must parse");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.pointer("/hook_specific_output/tool_input/command")
+                .and_then(|c| c.as_str()),
+            Some("rtk git status")
         );
     }
 
