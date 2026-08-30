@@ -215,13 +215,14 @@ rtk grep <pattern> [chemin] [options]
 
 | Option | Court | Defaut | Description |
 |--------|-------|--------|-------------|
-| `--max-len` | `-l` | 80 | Longueur maximale de ligne |
+| `--max-len` |  | 80 | Longueur maximale de ligne (pas de raccourci, `-l` est reserve a `grep --files-with-matches`) |
 | `--max` |  | 200 | Nombre maximum de resultats (pas de raccourci, `-m` est reserve a `grep --max-count`) |
 | `--context-only` |  | non | Afficher uniquement le contexte du match (pas de raccourci, `-c` est reserve a `grep --count`) |
-| `--file-type` | `-t` | tous | Filtrer par type (ts, py, rust, etc.) |
 | `--line-numbers` | `-n` | oui | Numeros de ligne (toujours actif) |
 
 Les arguments supplementaires sont transmis a `rg` (ripgrep). Les flags qui changent le format de sortie (`-c`, `-l`, `-L`, `-o`, `-Z`) passent directement a `rg`/`grep` sans filtrage RTK.
+
+Il n'y a pas d'option `--file-type` : `-t TYPE` est propre a ripgrep et est transmis tel quel au moteur. `rtk rg -t rust` filtre donc par type, tandis que `rtk grep -t rust` remonte l'erreur de grep lui-meme (`invalid option -- 't'`), grep n'ayant pas ce flag.
 
 **Avant / Apres :**
 ```
