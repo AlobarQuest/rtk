@@ -33,6 +33,17 @@ const MAX_LANES: usize = 256;
 /// `[INFO] Running com.example.app.FooTest`
 static RUNNING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\[INFO\] Running ").unwrap());
 
+/// Genuine mvnd module opener shape for `Running`: Surefire emits `"Running
+/// " + clazz.getName()` — a single whitespace-free dotted FQCN, never
+/// whitespace (a Java class name cannot contain a space). Confirmed against
+/// all 22 `Running` lines across all 16 real fixtures. Used only in
+/// [`is_lane_opener`] to narrow the never-seen-tag admission case; every
+/// other `RUNNING` call site (block open/reset) is untouched — an app log
+/// merely shaped `[main] [INFO] Running the widget pipeline` (multi-word
+/// argument) no longer qualifies as a lane opener.
+static RUNNING_MODULE_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[INFO\] Running \S+\s*$").unwrap());
+
 /// Surefire/Failsafe per-class close line. Captures `Failures` and `Errors`.
 /// Tolerates the optional `<<< FAILURE!` / `<<< ERROR!` marker (3.5.5 emits
 /// `<<< FAILURE!` even for errors-only classes — see
@@ -346,59 +357,53 @@ fn lane_rest_level(rest: &str) -> Option<&str> {
 /// [`Lanes::route`] uses to admit a never-seen tag as a new lane rather
 /// than falling back to raw-line ownership.
 ///
-/// Reviewer finding #1 (upstream PR #3199, second review round): a blanket
-/// `[ERROR]`-prefix rule (no `FILE_COORD` requirement) let *any*
-/// `[ERROR]`-shaped app log on a never-seen tag (e.g. `[Server] [ERROR]
-/// connection refused`) mint a lane. The claim it opens stays inert either
-/// way (a continuation only ever arms on a genuine compiler diagnostic —
-/// see the `FILE_COORD` guard at each `keep_continuation` arm site), but
-/// *minting the lane at all* was itself observable: routed to its own fresh
-/// (empty, `in_block == false`) lane instead of falling back to
-/// [`Lanes::raw_owner`], such a line bypassed whichever other lane's buffered
-/// block was genuinely open around it — written to `out` immediately via the
-/// outside-block keep-list while that other block was still buffering,
-/// re-ordering it ahead of the `Running` line it followed in the input, and
-/// on a green close (block discarded, not written at all) letting it survive
-/// as a stray line the whole rest of the passing block was correctly dropped
-/// for. Requiring `FILE_COORD` here fixes both: a non-diagnostic `[ERROR]`
-/// line on a never-seen tag is no longer an opener, so `route` falls back to
-/// `raw_owner`, which (with exactly one lane's block open) buffers it into
-/// *that* lane at its correct input position — preserved in order on a
-/// failing close, discarded with the rest on a green one. A genuine
-/// `file.java:[line,col]` compiler diagnostic is unaffected (mvnd's
-/// compile-error-first-sight case: no `Running`/`Building` line ever
-/// precedes it). A Surefire close whose module is never otherwise seen
-/// (`[ERROR] Tests run: … <<< FAILURE!`) is unaffected too — it's admitted
-/// by the separate `CLOSE.is_match` arm above, not this one.
+/// Enforced contract: every arm requires the tool's own emission shape for
+/// that line kind, not just a matching prefix — `RUNNING`:
+/// [`RUNNING_MODULE_HEADER`]'s single whitespace-free dotted FQCN (Surefire
+/// emits `"Running " + clazz.getName()`; a Java class name cannot contain a
+/// space — confirmed against all 22 `Running` lines across all 16 real
+/// fixtures); `Building`: [`BUILDING_MODULE_HEADER`]'s trailing `[n/m]`
+/// reactor-position counter; `[ERROR]`: [`FILE_COORD`]'s `file.java:[l,c]`
+/// coordinate; `CLOSE`/`MODULE_BANNER`/`PLUGIN_BANNER` are already
+/// structurally specific. An app log merely shaped like one of these (a
+/// multi-word `[main] [INFO] Running the widget pipeline`, a `[pool-1]
+/// [INFO] Building segment N of the data pipeline`, a `[Server] [ERROR]
+/// connection refused`) never qualifies — it falls back to
+/// [`Lanes::raw_owner`] like any other raw line instead of minting a
+/// phantom lane.
 ///
-/// The `RUNNING` arm is *not* narrowed the way `[ERROR]`/`Building` are: a
-/// genuine mvnd `Running` line carries no extra marker beyond `[INFO]
-/// Running <text>` (confirmed against every real fixture — unlike
-/// `Building`'s trailing `[n/m]` reactor-position counter, there is nothing
-/// fixture-grounded to gate on), so an app log merely shaped `[main] [INFO]
-/// Running the widget pipeline` still mints a tagged lane in daemon mode.
-/// Contract for that lane: it is bounded to the lines that opened and fed
-/// it — its unconfirmed tag's block never closes (no genuine `CLOSE` line
-/// ever arrives for it), so it flushes verbatim, in its own input order,
-/// at end-of-stream (i.e. after everything else, including the build
-/// footer). Over-keep and reorder of exactly those lines, never loss and
-/// never touching any other lane's content — see
-/// `app_log_running_line_mints_tagged_lane_and_flushes_at_end_of_stream`.
+/// Reviewer finding #1 (upstream PR #3199, second review round) established
+/// this pattern for the `[ERROR]` arm: a blanket `[ERROR]`-prefix rule (no
+/// `FILE_COORD` requirement) let *any* `[ERROR]`-shaped app log on a
+/// never-seen tag (e.g. `[Server] [ERROR] connection refused`) mint a lane.
+/// The claim it opens stays inert either way (a continuation only ever arms
+/// on a genuine compiler diagnostic — see the `FILE_COORD` guard at each
+/// `keep_continuation` arm site), but *minting the lane at all* was itself
+/// observable: routed to its own fresh (empty, `in_block == false`) lane
+/// instead of falling back to [`Lanes::raw_owner`], such a line bypassed
+/// whichever other lane's buffered block was genuinely open around it —
+/// written to `out` immediately via the outside-block keep-list while that
+/// other block was still buffering, re-ordering it ahead of the `Running`
+/// line it followed in the input, and on a green close (block discarded, not
+/// written at all) letting it survive as a stray line the whole rest of the
+/// passing block was correctly dropped for. Requiring `FILE_COORD` here
+/// fixes both: a non-diagnostic `[ERROR]` line on a never-seen tag is no
+/// longer an opener, so `route` falls back to `raw_owner`, which (with
+/// exactly one lane's block open) buffers it into *that* lane at its correct
+/// input position — preserved in order on a failing close, discarded with
+/// the rest on a green one. A genuine `file.java:[line,col]` compiler
+/// diagnostic is unaffected (mvnd's compile-error-first-sight case: no
+/// `Running`/`Building` line ever precedes it). A Surefire close whose
+/// module is never otherwise seen (`[ERROR] Tests run: … <<< FAILURE!`) is
+/// unaffected too — it's admitted by the separate `CLOSE.is_match` arm
+/// above, not this one.
 ///
 /// Lane growth itself is bounded by [`MAX_LANES`] regardless, so an
 /// adversarial run of uniquely-tagged opener-shaped lines can mint at most
 /// that many lanes, keeping `route`'s scan O(`MAX_LANES`) regardless of how
 /// many distinct tags the input contains.
-///
-/// Cold-preclear finding (upstream PR #3199, fourth review round): the
-/// `Building` arm used a bare `starts_with` — any `[pool-1] [INFO] Building
-/// segment N of the data pipeline` app log qualified. This function is only
-/// ever consulted for a *never-seen* tag (see [`Lanes::route`]), i.e. always
-/// a candidate *tagged* lane, never root — so it can require the real mvnd
-/// module shape unconditionally: [`BUILDING_MODULE_HEADER`]'s trailing
-/// `[n/m]` reactor-position counter.
 fn is_lane_opener(core: &str) -> bool {
-    RUNNING.is_match(core)
+    RUNNING_MODULE_HEADER.is_match(core)
         || CLOSE.is_match(core)
         || MODULE_BANNER.is_match(core)
         || PLUGIN_BANNER.is_match(core)
@@ -1896,39 +1901,74 @@ mod tests {
         );
     }
 
-    /// Cold-preclear pin (upstream PR #3199, fourth review round): unlike
-    /// `[ERROR]`/`Building`, `is_lane_opener`'s `RUNNING` arm has no
-    /// fixture-grounded shape to narrow on, so an app log merely shaped
-    /// `[main] [INFO] Running the widget pipeline` still mints a tagged lane
-    /// in daemon mode. Enforced contract (see `is_lane_opener`'s doc
-    /// comment): that lane's unconfirmed tag never gets a genuine `CLOSE`
-    /// line, so its block flushes verbatim, in its own order, at
-    /// end-of-stream — after every other lane's content, including the
-    /// build footer. Bounded to exactly that one line: nothing else
-    /// reorders, nothing is lost, no other lane's content is touched.
+    /// KuSh's exact probe (resolving the round-5 RUNNING residual, upstream
+    /// PR #3199, fifth review round): 200 multi-word `[main] [INFO] Running
+    /// …` app-log lines inside an otherwise-green module. Pre-fix (`RUNNING`
+    /// itself as the opener test), each one minted its own phantom lane and
+    /// flushed at end-of-stream — 3.1% savings on the equivalent full-size
+    /// probe. Post-fix (`RUNNING_MODULE_HEADER`'s whitespace-free-FQCN
+    /// requirement), none of them are lane-openers, so they fall back to
+    /// `raw_owner` and are dropped like any other unkeyed `[INFO]` line
+    /// outside a keep-list — 98%+ savings.
     #[test]
-    fn app_log_running_line_mints_tagged_lane_and_flushes_at_end_of_stream() {
+    fn app_log_running_lines_dropped_in_green_daemon_run() {
+        let mut i = String::from(
+            "[INFO] Scanning for projects...\n\
+             [child-a] [INFO] Running com.example.rtk.APassTest\n\
+             [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.APassTest\n",
+        );
+        for n in 0..200 {
+            i.push_str(&format!(
+                "[main] [INFO] Running the widget pipeline for tenant acme {n}\n"
+            ));
+        }
+        i.push_str("[INFO] BUILD SUCCESS\n");
+        let o = filter_surefire(&i, true);
+        assert!(
+            !o.contains("widget pipeline"),
+            "multi-word Running-shaped app log lines are dropped, not kept via a \
+             phantom lane; got:\n{o}"
+        );
+        assert!(
+            o.len() < 500,
+            "savings recover once the phantom lanes stop minting (input was {} bytes); \
+             got {} bytes:\n{o}",
+            i.len(),
+            o.len()
+        );
+    }
+
+    /// Same multi-word Running-shaped app-log line, but landing inside a
+    /// module's genuinely open (failing) block instead of a green run: with
+    /// no fixture-grounded shape to open its own lane on, it falls back to
+    /// `Lanes::raw_owner`, which routes it to the one uniquely open block —
+    /// same rule any other raw app-log line follows — so it's buffered into
+    /// that block and survives at its own input position (between the
+    /// `Running` line it followed and the failing close), not lost and not
+    /// reordered to end-of-stream.
+    #[test]
+    fn app_log_running_line_rides_raw_owner_inside_failing_block() {
         let i = "[INFO] Scanning for projects...\n\
-                  [child-a] [INFO] Running com.example.rtk.APassTest\n\
-                  [child-a] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s -- in com.example.rtk.APassTest\n\
-                  [main] [INFO] Running the widget pipeline\n\
-                  [INFO] BUILD SUCCESS\n";
+                  [child-a] [INFO] Running com.example.rtk.AFailTest\n\
+                  [main] [INFO] Running the widget pipeline for tenant acme\n\
+                  [child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.05 s <<< FAILURE! -- in com.example.rtk.AFailTest\n\
+                  [child-a] [ERROR] com.example.rtk.AFailTest.foo -- Time elapsed: 0.02 s <<< FAILURE!\n\
+                  java.lang.AssertionError: boom\n\
+                  \tat com.example.rtk.AFailTest.foo(AFailTest.java:10)\n\
+                  [INFO] BUILD FAILURE\n";
         let o = filter_surefire(i, true);
-        assert_eq!(
-            o.matches("Running the widget pipeline").count(),
-            1,
-            "the app-log line survives exactly once, not lost or duplicated; got:\n{o}"
-        );
-        let pipeline = o.find("Running the widget pipeline").expect("line kept");
-        let footer = o.find("BUILD SUCCESS").expect("footer kept");
+        let running = o.find("Running com.example.rtk.AFailTest").expect("Running kept");
+        let pipeline = o
+            .find("Running the widget pipeline for tenant acme")
+            .expect("app-log line kept, buffered inside the block");
+        let close = o
+            .find("<<< FAILURE! -- in com.example.rtk.AFailTest")
+            .expect("close line kept");
         assert!(
-            footer < pipeline,
-            "the unconfirmed tag's block flushes at end-of-stream, after the footer \
-             (bounded over-keep + reorder of exactly this one line); got:\n{o}"
-        );
-        assert!(
-            o.contains("Scanning for projects"),
-            "unrelated content is untouched; got:\n{o}"
+            running < pipeline && pipeline < close,
+            "app-log line stays at its own input position inside the block \
+             (Running, then the app log, then the close), not lost or moved \
+             to end-of-stream; got:\n{o}"
         );
     }
 
