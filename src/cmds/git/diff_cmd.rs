@@ -400,7 +400,7 @@ diff --git a/b.rs b/b.rs
         assert!(result.is_empty());
     }
 
-    // --- truncation accuracy ---
+    // --- overflow indicator ---
 
     fn make_large_unified_diff(added: usize, removed: usize) -> String {
         let mut lines = vec![
@@ -441,7 +441,7 @@ diff --git a/b.rs b/b.rs
 
     #[test]
     fn test_condense_unified_diff_no_false_overflow() {
-        // 8 changes total — all fit within the 10-line display cap, no overflow message
+        // Counter-case to the 200-change test above: no indicator at small sizes either.
         let diff = make_large_unified_diff(4, 4);
         let result = condense_unified_diff(&diff);
         assert!(
