@@ -258,22 +258,13 @@ fi
 section "Grep"
 
 # All three need -r: `grep PATTERN <dir>` without it exits 2 ("Is a directory"),
-# which made the first two assertions red and the third one INERT -- assert_fails
-# passed on the directory error whether or not `-t` was handled correctly.
+# which made the first two assertions red and the third one inert.
 assert_ok      "rtk grep pattern"             rtk grep -r "pub fn" src/
 assert_contains "rtk grep finds results"      "pub fn" rtk grep -r "pub fn" src/
-# `-t` is rg-only. rtk used to swallow it via its own --file-type option, which
-# never reached the engine, so the old assertion here pinned a silent no-op.
-#
-# This form is deliberate and fragile to get right. The pattern MUST match and
-# the path MUST be a single file with `-t` FIRST, so that the only reason the
-# command can fail is `-t` itself:
-#   - re-add --file-type with `short = 't'`  -> -t binds, "fn main" matches,
-#                                               exit 0, and assert_fails fires.
-#   - as shipped                             -> -t reaches grep, exit 2.
-# A directory path (exit 2, "Is a directory"), a non-matching pattern (exit 1),
-# or `-t` after another flag (trailing_var_arg swallows it before clap sees it)
-# all make this assertion inert -- it passes either way.
+# `-t` is rg-only. The form matters: the pattern must match, the path must be a
+# single file, and `-t` must come first, so the only reason to fail is `-t`
+# itself -- a directory, a non-matching pattern, or `-t` after another flag all
+# make this assertion pass either way.
 assert_fails   "rtk grep -t rejected by grep"  rtk grep -t rust "fn main" src/main.rs
 if command -v rg >/dev/null 2>&1; then
     assert_ok  "rtk rg with file type"         rtk rg "pub fn" src/ -t rust

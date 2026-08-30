@@ -39,7 +39,7 @@ fn write_temp(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 
 #[test]
 fn single_file_context_shown_without_header() {
-    if !rg_available() {
+    if !grep_available() {
         return;
     }
     let long = "x".repeat(120);
@@ -64,7 +64,7 @@ fn single_file_context_shown_without_header() {
 
 #[test]
 fn after_context_uses_dash_separator_for_context_lines() {
-    if !rg_available() {
+    if !grep_available() {
         return;
     }
     let (_dir, path) = write_temp("MATCH\nafter1\n");
@@ -83,7 +83,7 @@ fn after_context_uses_dash_separator_for_context_lines() {
 
 #[test]
 fn capped_single_file_shows_header() {
-    if !rg_available() {
+    if !grep_available() {
         return;
     }
     let filler: String = (0..40).map(|i| format!("w{i} ")).collect();
@@ -103,7 +103,7 @@ fn capped_single_file_shows_header() {
 
 #[test]
 fn true_no_match_exits_1() {
-    if !rg_available() {
+    if !grep_available() {
         return;
     }
     let (_dir, path) = write_temp("hello world\n");
@@ -145,7 +145,7 @@ fn no_line_number_flag_produces_output_not_zero_matches() {
 
 #[test]
 fn no_filename_flag_produces_output_not_zero_matches() {
-    if !rg_available() {
+    if !grep_available() {
         return;
     }
     let (_dir, path) = write_temp("hello world\n");
@@ -242,7 +242,7 @@ fn count_tokens(s: &str) -> usize {
 // Covers #545: grep savings are measured against the real grep output.
 #[test]
 fn bulky_grep_yields_token_savings() {
-    if !rg_available() {
+    if !rg_available() || !grep_available() {
         return;
     }
     let filler: String = (0..50).map(|i| format!("word{i} ")).collect();
@@ -275,7 +275,7 @@ fn bulky_grep_yields_token_savings() {
 
 #[test]
 fn grep_only_flags_fall_back_to_system_grep() {
-    if !rg_available() {
+    if !grep_available() {
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");
@@ -307,7 +307,7 @@ fn grep_only_flags_fall_back_to_system_grep() {
 
 #[test]
 fn small_grep_not_worse_than_plain() {
-    if !rg_available() {
+    if !grep_available() {
         return;
     }
     let (_dir, path) = write_temp("foo\n");
@@ -327,7 +327,7 @@ fn small_grep_not_worse_than_plain() {
     );
 }
 
-// --- #2628: a numeric pattern must not bind to rtk's removed `-l` short ---
+// --- a numeric pattern must not bind to rtk's removed `-l` short ---
 
 #[test]
 fn numeric_pattern_with_files_with_matches_flag() {
@@ -428,7 +428,7 @@ fn max_len_long_option_still_binds_to_rtk() {
 
 #[test]
 fn bundled_files_with_matches_cluster_lists_files() {
-    if !rg_available() {
+    if !grep_available() {
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");

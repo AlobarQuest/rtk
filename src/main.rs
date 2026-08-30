@@ -313,46 +313,15 @@ enum Commands {
 
     /// Compact grep - strips whitespace, truncates, groups by file
     Grep {
-        // NOTE: rtk's own tuning options here are intentionally long-only.
-        // Their natural short forms collide with native grep/rg flags of the
-        // same letter, which users routinely pass. A short option here shadows
-        // the native flag and either crashes clap or silently applies the wrong
-        // semantics, defeating the `extra_args` passthrough. Keep them long-only
-        // so native flags reach src/cmds/system/search.rs, the shared filter
-        // behind both `rtk grep` and `rtk rg`. (Continues the `-v`/`-n`/pattern/
-        // path cleanup from 84616d1.)
-        //
-        // This does NOT clear every shadowed short. Clap's auto `-h` still wins
-        // over grep/rg's --no-filename before the first positional, and after it
-        // `-h` reaches search.rs's --version/--help check and execs unfiltered.
-        // Help handling is #2532's scope, not this variant's -- do not "finish"
-        // it here by adding disable_help_flag without reading that PR first.
-        //
-        // Removing a short here also does not make the flag safe end-to-end.
-        // search.rs shares one VALUE_FLAGS_SHORT table across both engines, so a
-        // letter that takes a value in rg but not grep (`-t`, `-T`, `-r`) still
-        // eats the next token inside a cluster: `rtk grep -rt FOO .` consumes
-        // FOO as -t's value regardless of what clap does. That is a search.rs
-        // defect, tracked separately.
+        // rtk's own options here are long-only: a short form shadows the native
+        // grep/rg flag of the same letter and captures it before it can reach
+        // src/cmds/system/search.rs, the shared filter behind `rtk grep` and
+        // `rtk rg`.
         /// Max line length
-        // No short: `-l` is grep's --files-with-matches. Binding it to --max-len
-        // (a `usize`) split behavior on whether the PATTERN parsed as a number.
-        //
-        // Non-numeric pattern: clap rejected it, run_fallback re-ran raw grep,
-        // and the user got the right answer. Wasteful, not harmful -- and note
-        // `-l` is a has_format_flag passthrough on the fixed path too, so no
-        // compaction was "lost"; there is none to lose for this flag.
-        //
-        // Numeric pattern: clap ACCEPTED it. `rtk grep -l 8080 a.txt b.txt` set
-        // max_len=8080 and left a.txt as the pattern, b.txt as the only path --
-        // no error, no fallback, silently empty output and exit 1 on a file that
-        // does match. With a single file it is worse: the filename becomes the
-        // pattern, no path is left, and rtk falls back to reading stdin -- which
-        // exits 1 on /dev/null and hangs outright on an interactive terminal.
-        // That silent wrong answer, reached through a hook the user never opted
-        // into, is the real reason this short had to go.
-        // Pinned by tests::test_grep_parse_files_with_matches_l (clap layer) and
-        // numeric_pattern_with_files_with_matches_flag (end to end).
+        // No short: `-l` is grep's --files-with-matches. Bound to a `usize` it
+        // accepted numeric patterns -- `rtk grep -l 8080 a.txt b.txt` set
+        // max_len=8080, took a.txt as the pattern, and returned empty output
+        // with no error.
         #[arg(long, default_value = "80")]
         max_len: usize,
         /// Max results to show
@@ -367,11 +336,9 @@ enum Commands {
         /// Show only match context (not full line)
         #[arg(long)]
         context_only: bool,
-        // No --file-type / `-t`: `-t TYPE` is rg's type filter, and the option
-        // never did anything under `rtk grep` -- it was destructured away at the
-        // call site and never reached the engine. Removed rather than left as a
-        // parse-only no-op; `rtk rg -t rust` still filters by type, since it
-        // forwards `-t` to real ripgrep.
+        // No --file-type: `-t TYPE` is rg's type filter and the option never
+        // reached the engine, so `rtk rg -t rust` filters by type while
+        // `rtk grep -t rust` surfaces grep's own error.
         /// Pattern, path, and any grep/rg flags (e.g. -v, -i, -A 3, --glob, --version)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
@@ -3738,13 +3705,9 @@ mod tests {
 
     // --- grep argument routing (clap layer) ---
     //
-    // The `Grep` variant funnels the pattern, path, and every native grep/rg
-    // flag into a single `trailing_var_arg` slot so `src/cmds/system/search.rs`
-    // -- the shared filter behind both `rtk grep` and `rtk rg` -- can parse them
-    // with full grep/rg semantics. Commit 84616d1 ("fix(grep): stabilize
-    // argument parsing") moved to this design but left the struct's own short
-    // options in place, where they still shadowed native flags of the same
-    // letter. These tests pin the routing.
+    // The `Grep` variant funnels the pattern, path, and every native grep/rg flag
+    // into one trailing slot so `src/cmds/system/search.rs` parses them with full
+    // grep/rg semantics. These tests pin that routing.
 
     /// Parse `rtk grep …` and return the captured `extra_args`, or `None` if
     /// clap rejects the invocation (e.g. a colliding short option mis-binds).
@@ -3754,9 +3717,6 @@ mod tests {
             _ => None,
         }
     }
-
-    // Characterization: behavior that must be PRESERVED (passes today, untested
-    // until now). Guards the 84616d1 design against regression.
 
     #[test]
     fn test_grep_parse_simple_pattern_path() {
@@ -3787,8 +3747,8 @@ mod tests {
 
     #[test]
     fn test_grep_parse_invert_match_v_not_shadowed() {
-        // Regression guard for 84616d1: `-v` (invert-match) must reach grep,
-        // not be captured as rtk's top-level verbose flag.
+        // `-v` (invert-match) must reach grep, not be captured as rtk's
+        // top-level verbose flag.
         assert_eq!(
             grep_extra_args(&["rtk", "grep", "-v", "FOO", "file"]).unwrap(),
             vec!["-v", "FOO", "file"]
@@ -3797,17 +3757,12 @@ mod tests {
 
     #[test]
     fn test_grep_parse_alternation_pattern_intact() {
-        // Extended-regex alternation must pass through untouched (#1436 lineage).
+        // Extended-regex alternation must pass through untouched.
         assert_eq!(
             grep_extra_args(&["rtk", "grep", "-nE", "a|b", "file"]).unwrap(),
             vec!["-nE", "a|b", "file"]
         );
     }
-
-    // The fix: native `-l`/`-m`/`-t` must route to search.rs, not be captured by
-    // the struct's own short options. `-l` mis-bound to `max_len: usize`, so clap
-    // rejected the pattern outright; `-m`/`-t` silently swallowed their value with
-    // the wrong semantics. (`-m` was fixed separately in #3259; pinned here too.)
 
     #[test]
     fn test_grep_parse_files_with_matches_l() {
@@ -3820,11 +3775,8 @@ mod tests {
 
     #[test]
     fn test_grep_parse_type_t_forwarded() {
-        // `-t TYPE` is rg-only, so it must reach the engine rather than binding
-        // to an rtk option. search.rs lists `t` in VALUE_FLAGS_SHORT and forwards
-        // it verbatim: under `rtk rg` it filters by type, under `rtk grep` it
-        // surfaces grep's own `invalid option -- 't'` instead of being silently
-        // dropped.
+        // `-t TYPE` is rg-only and must reach the engine: `rtk rg` filters by
+        // type, `rtk grep` surfaces grep's own `invalid option -- 't'`.
         assert_eq!(
             grep_extra_args(&["rtk", "grep", "-t", "rust", "FOO", "src/"]).unwrap(),
             vec!["-t", "rust", "FOO", "src/"]
@@ -3833,18 +3785,14 @@ mod tests {
 
     #[test]
     fn test_grep_file_type_option_is_gone() {
-        // `--file-type` was removed, not merely un-shorted. Guard against it
-        // creeping back: an unknown long flag is NOT a clap error here (the
-        // trailing slot accepts it), it must route to extra_args and be the
-        // engine's problem. If someone re-adds the option, clap binds it and
-        // extra_args loses these two tokens.
+        // `--file-type` was removed, not merely un-shorted: an unknown long flag
+        // routes to extra_args and is the engine's problem. Re-adding the option
+        // would bind it here and cost extra_args these two tokens.
         assert_eq!(
             grep_extra_args(&["rtk", "grep", "--file-type", "rust", "FOO", "src/"]).unwrap(),
             vec!["--file-type", "rust", "FOO", "src/"]
         );
     }
-
-    // --- additional grep characterization (preserved behavior, was untested) ---
 
     /// Parse `rtk grep …` into the full `Grep` field set for inspection.
     fn parse_grep(args: &[&str]) -> Result<(usize, usize, bool, Vec<String>), clap::Error> {
@@ -3861,9 +3809,8 @@ mod tests {
 
     #[test]
     fn test_grep_long_options_bind_before_pattern() {
-        // rtk's tuning knobs are long-only (the short forms were removed to stop
-        // shadowing native grep flags). They must still bind when placed before
-        // the pattern, and only the pattern/path land in extra_args.
+        // Long-only knobs must still bind when placed before the pattern, with
+        // only the pattern/path landing in extra_args.
         let (max_len, max, context_only, extra_args) = parse_grep(&[
             "rtk",
             "grep",
@@ -3884,12 +3831,9 @@ mod tests {
 
     #[test]
     fn test_grep_options_after_pattern_stay_in_extra_args() {
-        // Positional gotcha: once the pattern starts the trailing slot, later
-        // tokens — even rtk's own `--max-len` — are NOT parsed as options; they
-        // pass through verbatim. (Native grep ordering: flags come before the
-        // pattern.) The mechanism is `allow_hyphen_values` on `extra_args`, not
-        // `trailing_var_arg` — dropping the latter leaves this behavior intact,
-        // so do not read this test as a guard on `trailing_var_arg`.
+        // Once the pattern starts the trailing slot, later tokens — even rtk's
+        // own `--max-len` — pass through verbatim rather than binding as options.
+        // The mechanism is `allow_hyphen_values`, not `trailing_var_arg`.
         let (max_len, _, _, extra_args) =
             parse_grep(&["rtk", "grep", "FOO", "--max-len", "40"]).unwrap();
         assert_eq!(
