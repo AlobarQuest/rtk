@@ -17,6 +17,17 @@ fn rg_available() -> bool {
         .unwrap_or(false)
 }
 
+/// `rtk grep` shells out to `grep`, never `rg` (`search.rs`: `Engine::Grep => "grep"`).
+/// Guarding a grep-engine test on `rg_available()` makes it silently skip -- and
+/// report success -- on a box without ripgrep, which is a false green.
+fn grep_available() -> bool {
+    Command::new("grep")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn write_temp(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("test.txt");
@@ -320,7 +331,7 @@ fn small_grep_not_worse_than_plain() {
 
 #[test]
 fn max_len_long_option_still_binds_to_rtk() {
-    if !rg_available() {
+    if !grep_available() {
         return;
     }
     // The other half of #2628: dropping the `-l` short must not stop the long
