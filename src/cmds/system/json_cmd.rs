@@ -102,9 +102,12 @@ fn render_json<'a>(
         filter_json_compact(content, max_depth)?
     };
     let shown = never_worse(content, &output);
-    // never_worse returns one of its two inputs verbatim (no allocation);
-    // compare addresses to tell which, instead of re-deriving the decision.
-    Ok(if std::ptr::eq(shown.as_ptr(), content.as_ptr()) {
+    // never_worse hands back one of its two inputs (no allocation); compare
+    // the `&str` fat pointers to tell which, instead of re-deriving the
+    // decision. Comparing the whole slice, not just `as_ptr()`, so a future
+    // never_worse that returns a sub-slice of `content` is not mistaken for
+    // `content` itself -- that would silently re-expand the output.
+    Ok(if std::ptr::eq(shown, content) {
         Cow::Borrowed(content)
     } else {
         Cow::Owned(output)

@@ -633,13 +633,10 @@ fn droid_response_from_decision(v: &Value, cmd: &str, decision: HookDecision) ->
 /// Run the Factory Droid PreToolUse hook natively.
 pub fn run_droid() -> Result<()> {
     let input = read_stdin_limited()?;
-    let input = strip_leading_bom(&input).trim();
-    if input.is_empty() {
-        return Ok(());
-    }
 
-    let v: Value = match serde_json::from_str(input) {
-        Ok(v) => v,
+    let v = match droid_payload(&input) {
+        Ok(Some(v)) => v,
+        Ok(None) => return Ok(()),
         Err(e) => {
             let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
             return Ok(());
@@ -650,6 +647,19 @@ pub fn run_droid() -> Result<()> {
         let _ = writeln!(io::stdout(), "{output}");
     }
     Ok(())
+}
+
+/// Normalize and parse a raw Droid PreToolUse payload: strip a leading BOM
+/// (Windows hosts prepend one), trim, and report an empty payload as nothing
+/// to do. Shared by `run_droid` and the test entry points so droid's own
+/// tests exercise the real BOM handling rather than a stripped-down copy of
+/// the parse.
+fn droid_payload(input: &str) -> serde_json::Result<Option<Value>> {
+    let input = strip_leading_bom(input).trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(input).map(Some)
 }
 
 /// Hermetic test path: no Droid settings (empty rules).
@@ -666,7 +676,7 @@ fn run_droid_inner_with_rules(
     ask_rules: &[String],
     allow_rules: &[String],
 ) -> Option<String> {
-    let v: Value = serde_json::from_str(input).ok()?;
+    let v: Value = droid_payload(input).ok().flatten()?;
     let cmd = droid_execute_command(&v)?;
     let verdict = permissions::check_command_with_rules(cmd, deny_rules, ask_rules, allow_rules);
     droid_response_from_decision(&v, cmd, decide_from_verdict(cmd, verdict)).map(|o| o.to_string())
@@ -1623,6 +1633,23 @@ mod tests {
             v.pointer("/hookSpecificOutput/permissionDecision")
                 .is_none(),
             "RTK must never assert a permission decision for Droid"
+        );
+    }
+
+    #[test]
+    fn test_droid_strips_utf8_bom() {
+        // Windows hosts may prepend a UTF-8 BOM to hook stdin (confirmed for
+        // Cursor). run_droid stripped it, but the test entry point re-parsed
+        // without stripping, so the strip had no coverage at all: deleting it
+        // left every test green while BOM-prefixed droid payloads silently
+        // stopped being rewritten. Both paths now share droid_payload.
+        let input = format!("\u{feff}{}", droid_input("Execute", "git status"));
+        let out = run_droid_inner(&input).expect("BOM-prefixed payload must parse");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/updatedInput/command")
+                .and_then(|c| c.as_str()),
+            Some("rtk git status")
         );
     }
 
