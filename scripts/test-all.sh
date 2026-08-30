@@ -259,7 +259,15 @@ section "Grep"
 
 assert_ok      "rtk grep pattern"             rtk grep "pub fn" src/
 assert_contains "rtk grep finds results"      "pub fn" rtk grep "pub fn" src/
-assert_ok      "rtk grep with file type"      rtk grep "pub fn" src/ -t rust
+# `-t` is rg-only. rtk used to swallow it via its own --file-type option, which
+# never reached the engine, so this asserted a silent no-op. --file-type is gone;
+# `-t` now flows to the engine, so pin it against the engine that has it.
+assert_fails   "rtk grep -t rejected by grep"  rtk grep "pub fn" src/ -t rust
+if command -v rg >/dev/null 2>&1; then
+    assert_ok  "rtk rg with file type"         rtk rg "pub fn" src/ -t rust
+else
+    skip_test  "rtk rg with file type"         "rg not installed"
+fi
 
 section "Grep (extra args passthrough)"
 

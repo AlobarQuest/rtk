@@ -218,7 +218,6 @@ rtk grep <pattern> [chemin] [options]
 | `--max-len` |  | 80 | Longueur maximale de ligne (pas de raccourci, `-l` est reserve a `grep --files-with-matches`) |
 | `--max` |  | 200 | Nombre maximum de resultats (pas de raccourci, `-m` est reserve a `grep --max-count`) |
 | `--context-only` |  | non | Afficher uniquement le contexte du match (pas de raccourci, `-c` est reserve a `grep --count`) |
-| `--line-numbers` | `-n` | oui | Numeros de ligne (toujours actif) |
 
 Les arguments supplementaires sont transmis a `rg` (ripgrep). Les flags qui changent le format de sortie (`-c`, `-l`, `-L`, `-o`, `-Z`) passent directement a `rg`/`grep` sans filtrage RTK.
 
