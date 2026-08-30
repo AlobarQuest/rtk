@@ -1459,6 +1459,17 @@ make[1]: Leaving directory '/home/user/project/docs'
                 .is_match(r"java -jar C:\dev\my-spring-app.jar"),
             "a Windows-path jar with 'spring' in its own filename must still match"
         );
+
+        // argv reaches this regex as one space-joined string, so a path containing spaces
+        // is indistinguishable from a following argument. Widening the prefix across
+        // whitespace would let a later 'spring'-named jar argument re-trigger the filter,
+        // so jars under such a path stay on full passthrough instead.
+        assert!(
+            !spring_boot
+                .match_regex
+                .is_match(r"java -jar C:\Program Files\app\my-spring-app.jar"),
+            "a jar under a path containing spaces is deliberately left to full passthrough"
+        );
     }
 
     #[test]
@@ -1503,7 +1514,7 @@ make[1]: Leaving directory '/home/user/project/docs'
             "ssh-keygen must not activate the plain ssh connection filter"
         );
         assert!(
-            !ssh.match_regex.is_match("ssh-add ~/.ssh/id_ed25519"),
+            !ssh.match_regex.is_match("ssh-add id_ed25519"),
             "ssh-add must not activate the plain ssh connection filter"
         );
 
