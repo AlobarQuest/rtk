@@ -76,22 +76,39 @@ static PLUGIN_BANNER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[INFO\] --- .* @ .* ---$").unwrap());
 
 /// Surefire/Failsafe plugin execution banner specifically — captures the
-/// goal identifier (`plugin:version:goal (execution-id)`, e.g.
-/// `surefire:3.5.5:test (default-test)` vs `failsafe:3.5.5:integration-test
-/// (default-integration-test)`) so a phase transition between the two can be
-/// detected independent of lane/module identity (see
-/// [`FailuresSummaryCap::observe_plugin_banner`]). Deliberately narrower
-/// than [`PLUGIN_BANNER`], which matches *any* plugin's banner
-/// (`compiler:...`, `resources:...`, `clean:...`, …) — those never open a
-/// failures summary and must never trigger a budget reset.
-/// Widened per cold-preclear finding (upstream PR #3199, fourth review
-/// round): Maven ≤3.8 / mvnd 0.x spell the plugin coordinate
-/// `maven-surefire-plugin:2.22.2` / `maven-failsafe-plugin:2.22.2`, not the
-/// bare `surefire:`/`failsafe:` shorthand newer Maven emits — missing that
-/// spelling silently disabled the generation reset on older daemons, the
-/// exact failure mode the phase marker exists to prevent.
+/// *plugin family* (`surefire` or `failsafe`) from
+/// `[INFO] --- <plugin>:<version>:<goal> (<execution-id>) @ <module> ---`,
+/// so a unit-test → integration-test transition can be detected independent
+/// of lane/module identity (see
+/// [`FailuresSummaryCap::observe_plugin_banner`]).
+///
+/// The family is the whole key on purpose: version, goal and execution id
+/// are all per-module configuration, so keying on them would make two
+/// modules that merely pin different Surefire versions — or name their
+/// executions differently — look like separate phases and each collect a
+/// fresh budget. Both coordinate spellings normalize to the same family, so
+/// `maven-surefire-plugin:2.22.2:test` (Maven ≤3.8 / mvnd 0.x) and
+/// `surefire:3.5.5:test` are one phase, not two.
+///
+/// The accepted cost is the other direction: a build that runs two *Surefire*
+/// executions (unit tests, then integration tests without Failsafe) shares one
+/// budget across both, so the second execution's entries can collapse into its
+/// `… +N more failures` tail. The count is still reported; over-reporting a
+/// phase boundary that isn't one was the worse failure, since it silently
+/// multiplied the reactor-wide cap.
+///
+/// Neither key bounds a parallel `verify`, where one module can reach
+/// Failsafe while another is still in Surefire: the families alternate and
+/// each flip starts a fresh budget, so the cap multiplies. Keying on the goal
+/// string flips at least as often, so this is no worse than before — but the
+/// reactor-wide cap is not a guarantee under interleaved phases.
+///
+/// Deliberately narrower than [`PLUGIN_BANNER`], which matches *any*
+/// plugin's banner (`compiler:…`, `resources:…`, `clean:…`, …) — those never
+/// open a failures summary and must never trigger a budget reset.
 static TEST_PLUGIN_BANNER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\[INFO\] --- ((?:maven-)?(?:surefire|failsafe)(?:-plugin)?:\S+ \([^)]*\)) @ .* ---$").unwrap()
+    Regex::new(r"^\[INFO\] --- (?:maven-)?(surefire|failsafe)(?:-plugin)?:\S+ \([^)]*\) @ .* ---$")
+        .unwrap()
 });
 
 /// A genuine mvnd reactor module header: `Building <name> <version>
@@ -343,7 +360,8 @@ fn lane_rest_level(rest: &str) -> Option<&str> {
 
 /// Whether `core` (the tag-stripped remainder of a candidate lane-keyed
 /// line) is a genuine Maven/mvnd module-establishing line: a test class
-/// starting (`RUNNING`), a plugin or module banner, a `Building` line, a
+/// starting ([`RUNNING_MODULE_HEADER`]), a plugin or module banner, a
+/// `Building` line, a
 /// per-class result (`CLOSE`), or a genuine compiler diagnostic — a
 /// `file.java:[line,col]`-coordinate `[ERROR]` line ([`FILE_COORD`]; compiler
 /// errors are always the first line mvnd emits for a module that fails to
@@ -455,17 +473,19 @@ fn reactor_summary_keep(line: &str, in_reactor_summary: &mut bool) -> bool {
     *in_reactor_summary
 }
 
-/// `gate_building`: cold-preclear finding (upstream PR #3199, fourth review
-/// round) — a bare `[INFO] Building ` keeper let `[pool-1] [INFO] Building
-/// segment N of the data pipeline` app logs on a *tagged* mvnd lane through
-/// wholesale (probe: 2000 such lines in a green run, ~0.1% savings). The
-/// root lane's own `Building` header (plain `mvn`, single-module — never
-/// reactor-numbered) must stay on the unconditional check, so the caller
-/// passes `gate_building = daemon && idx != ROOT_LANE`: `true` narrows the
-/// `[INFO] Building ` keeper to [`BUILDING_MODULE_HEADER`]'s real
-/// `[n/m]`-numbered shape; `false` (root, or plain `mvn`) keeps the original
-/// unconditional check. `Building war:`/`jar:`/`ear:` (artifact-packaging
-/// lines, a different shape entirely) are never gated.
+/// `gate_building` narrows the `[INFO] Building ` keeper to
+/// [`BUILDING_MODULE_HEADER`]'s reactor-numbered `[n/m]` shape. Callers pass
+/// `daemon && is_tag_prefixed(line, core)`: a line that arrived under a
+/// module tag can never be plain `mvn`'s own single-module `Building` header,
+/// so requiring the real shape there rejects `[pool-1] [INFO] Building
+/// segment N of the data pipeline` app logs while leaving untagged headers
+/// (plain `mvn`, and mvnd's own unprefixed output) on the unconditional
+/// check. `Building war:`/`jar:`/`ear:` are artifact-packaging lines, a
+/// different shape entirely, and are never gated.
+fn is_tag_prefixed(line: &str, core: &str) -> bool {
+    core.len() != line.len()
+}
+
 fn keep_outside_block(line: &str, gate_building: bool) -> bool {
     // Help boilerplate must be rejected before the `[ERROR]` catch-all below
     // (non-quiet parity with `filter_quiet`'s boilerplate stripping).
@@ -843,9 +863,9 @@ struct FailuresSummaryCap {
     /// plugin-banner phase transition ([`FailuresSummaryCap::
     /// observe_plugin_banner`]).
     daemon: bool,
-    /// mvnd only: the goal identifier (`plugin:version:goal (execution-id)`)
-    /// captured from the most recent Surefire/Failsafe plugin banner. `None`
-    /// until the first banner is seen.
+    /// mvnd only: the plugin family (`surefire` / `failsafe`) captured from
+    /// the most recent test-plugin banner. `None` until the first banner is
+    /// seen.
     phase: Option<String>,
 }
 
@@ -913,22 +933,20 @@ impl FailuresSummaryCap {
         }
     }
 
-    /// mvnd only (no-op for plain `mvn`): `goal` is the captured
-    /// `plugin:version:goal (execution-id)` from a Surefire/Failsafe plugin
-    /// banner (see [`TEST_PLUGIN_BANNER`]). A goal that differs from the
-    /// currently tracked phase is an unambiguous generation boundary —
-    /// every module's own banner within one phase carries the *same* goal
-    /// string (module identity isn't part of the capture), so repeated
-    /// banners for different modules in the same phase never trigger a
-    /// reset; only a genuine Surefire → Failsafe (or vice versa) transition
-    /// does, regardless of whether any lane's summary header happens to
-    /// repeat across it.
-    fn observe_plugin_banner(&mut self, goal: &str) {
+    /// mvnd only (no-op for plain `mvn`): `family` is the plugin family
+    /// captured from a Surefire/Failsafe banner (see
+    /// [`TEST_PLUGIN_BANNER`]). Entering a family other than the one
+    /// currently tracked is a genuine unit → integration phase boundary and
+    /// starts a fresh reactor-wide budget; every module's banner within one
+    /// phase carries the same family, so repeated banners across modules
+    /// never reset, regardless of the versions or execution ids those
+    /// modules configure.
+    fn observe_plugin_banner(&mut self, family: &str) {
         if !self.daemon {
             return;
         }
-        if self.phase.as_deref() != Some(goal) {
-            self.phase = Some(goal.to_string());
+        if self.phase.as_deref() != Some(family) {
+            self.phase = Some(family.to_string());
             self.emitted = 0;
         }
     }
@@ -1323,7 +1341,7 @@ fn filter_surefire_with_cap(raw: &str, cap: usize, daemon: bool) -> String {
         // Order matters: call reactor_summary_keep first so its BUILD_FOOT
         // clears-flag side effect always runs regardless of `||` short-circuit.
         let reactor_keep = reactor_summary_keep(core, &mut in_reactor_summary);
-        if reactor_keep || keep_outside_block(core, daemon && idx != ROOT_LANE) {
+        if reactor_keep || keep_outside_block(core, daemon && is_tag_prefixed(line, core)) {
             let lane = lanes.get(idx);
             // Pre-emit this lane's own summary tail when we're about to
             // write its own AGG (never another lane's — see the attribution
@@ -1437,7 +1455,8 @@ pub fn filter_compile(raw: &str, daemon: bool) -> String {
         // see the cold-preclear finding on that function's doc comment.
         if BUILD_FOOT.is_match(core)
             || (core.starts_with("[INFO] Building ")
-                && (!(daemon && idx != ROOT_LANE) || BUILDING_MODULE_HEADER.is_match(core)))
+                && (!(daemon && is_tag_prefixed(line, core))
+                    || BUILDING_MODULE_HEADER.is_match(core)))
             || core.starts_with("[INFO] Total time:")
             || core.starts_with("[INFO] Finished at:")
             || core.starts_with("[INFO] Scanning ")
@@ -1563,7 +1582,10 @@ fn filter_package_with_cap(raw: &str, cap: usize, daemon: bool) -> String {
         // clears-flag side effect always runs regardless of `||` short-circuit.
         let reactor_keep = reactor_summary_keep(core, &mut in_reactor_summary);
         // Outside any Surefire block: compile-keep AND surefire-outside-keep merge.
-        if reactor_keep || MODULE_BANNER.is_match(core) || keep_outside_block(core, daemon && idx != ROOT_LANE) {
+        if reactor_keep
+            || MODULE_BANNER.is_match(core)
+            || keep_outside_block(core, daemon && is_tag_prefixed(line, core))
+        {
             let lane = lanes.get(idx);
             summary.handle_aggregate(core, &mut lane.dropped, &mut out, &mut lane.in_summary);
             summary.handle_header(core, &mut lane.in_summary, &mut lane.dropped);
@@ -1627,6 +1649,35 @@ fn filter_package_with_cap(raw: &str, cap: usize, daemon: bool) -> String {
 
 // ── Quiet-mode filter ───────────────────────────────────────────────────────
 
+/// Strip an mvnd module prefix (`[module] `) so quiet-mode classification
+/// sees the same line shape it does for unprefixed output. Module tags are
+/// artifactIds — non-empty and whitespace-free — so a bracketed fragment
+/// that holds whitespace, or that is itself a log level, is left alone.
+/// Callers always emit the *original* line; this only decides how the line
+/// is classified.
+///
+/// Gated on `daemon` for the same reason [`split_lane`] is: `[tag] [LEVEL] …`
+/// is byte-identical whether `tag` is an mvnd module or an application thread
+/// name from `[%thread] [%level]` logging, and only the daemon emits the
+/// former. Applying the heuristic to plain `mvn` would let ordinary test
+/// stdout be classified — and therefore dropped — as Maven's own boilerplate.
+fn strip_module_tag(line: &str, daemon: bool) -> &str {
+    if !daemon {
+        return line;
+    }
+    let Some(rest) = line.strip_prefix('[') else {
+        return line;
+    };
+    let Some(end) = rest.find("] ") else {
+        return line;
+    };
+    let tag = &rest[..end];
+    if tag.is_empty() || tag.chars().any(char::is_whitespace) || is_log_level(tag) {
+        return line;
+    }
+    &rest[end + 2..]
+}
+
 /// Filter for `mvn -q` invocations.
 ///
 /// Under `-q`, Maven 3.x suppresses all `[INFO]` lines, so the standard
@@ -1642,7 +1693,7 @@ fn filter_package_with_cap(raw: &str, cap: usize, daemon: bool) -> String {
 ///   `[ERROR] Failed to execute goal` terminator. Drops framework stack
 ///   frames and the post-failure boilerplate block (`See …`, `[Help 1]`,
 ///   `Re-run Maven`, `To see the full stack trace`, etc.).
-pub fn filter_quiet(raw: &str) -> String {
+pub fn filter_quiet(raw: &str, daemon: bool) -> String {
     let stripped = strip_ansi(raw);
     if stripped.trim().is_empty() {
         return String::new();
@@ -1652,18 +1703,22 @@ pub fn filter_quiet(raw: &str) -> String {
     let mut failure_trail = false;
 
     for line in stripped.lines() {
+        // mvnd prefixes each parallel module's own log lines with `[module] `;
+        // classify on the unprefixed shape, emit the line as it arrived.
+        let core = strip_module_tag(line, daemon);
+
         // Surefire close-line for a failed class — keep + enter failure trail.
-        if CLOSE.is_match(line) {
+        if CLOSE.is_match(core) {
             out.push_str(line);
             out.push('\n');
             failure_trail =
-                line.contains("<<< FAILURE!") || line.contains("<<< ERROR!");
+                core.contains("<<< FAILURE!") || core.contains("<<< ERROR!");
             continue;
         }
 
         // Per-test failure subline: `[ERROR] FQN.method -- Time elapsed: … <<< FAILURE!`
         // (or `<<< ERROR!` for thrown exceptions).
-        if is_per_test_subline(line) {
+        if is_per_test_subline(core) {
             out.push_str(line);
             out.push('\n');
             failure_trail = true;
@@ -1672,12 +1727,20 @@ pub fn filter_quiet(raw: &str) -> String {
 
         // Failure-trail body: exception class, user-code frames; drop framework frames.
         if failure_trail {
-            if line.trim().is_empty() {
+            // A module's own blank line terminates its trail. mvnd's
+            // terminator carries the module prefix and is emitted as it
+            // arrived; plain `mvn`'s is a bare blank line, and base parity
+            // means emitting exactly that — including when the terminator is
+            // whitespace-only rather than empty.
+            if core.trim().is_empty() {
+                if daemon {
+                    out.push_str(line);
+                }
                 out.push('\n');
                 failure_trail = false;
                 continue;
             }
-            let t = line.trim_start();
+            let t = core.trim_start();
             if t.starts_with("at ") && is_framework_frame(t) {
                 continue;
             }
@@ -1687,11 +1750,11 @@ pub fn filter_quiet(raw: &str) -> String {
         }
 
         // Failure summary keepers.
-        if line.starts_with("[ERROR] Tests run:")
-            || line.starts_with("[ERROR] Failures:")
-            || line.starts_with("[ERROR] Errors:")
-            || line.starts_with("[ERROR]   ")
-            || line.starts_with("[ERROR] Failed to execute goal")
+        if core.starts_with("[ERROR] Tests run:")
+            || core.starts_with("[ERROR] Failures:")
+            || core.starts_with("[ERROR] Errors:")
+            || core.starts_with("[ERROR]   ")
+            || core.starts_with("[ERROR] Failed to execute goal")
         {
             out.push_str(line);
             out.push('\n');
@@ -1700,7 +1763,7 @@ pub fn filter_quiet(raw: &str) -> String {
 
         // Drop post-failure help boilerplate and bare `[ERROR]` dividers
         // (shared with the non-quiet filters — see BOILER_PREFIXES).
-        if is_boilerplate(line) {
+        if is_boilerplate(core) {
             continue;
         }
 
@@ -1790,7 +1853,7 @@ fn run_tool(args: &[String], daemon: bool, verbose: u8) -> Result<i32> {
             new_mvn_command(args, daemon),
             tool,
             &args_display,
-            filter_quiet,
+            |raw: &str| filter_quiet(raw, daemon),
             RunOptions::with_tee("mvn_quiet"),
         );
     }
@@ -1970,6 +2033,215 @@ mod tests {
              (Running, then the app log, then the close), not lost or moved \
              to end-of-stream; got:\n{o}"
         );
+    }
+
+    /// A real Surefire class-start line still opens its module's lane, so the
+    /// narrowing above cannot cost a genuine reactor module its routing.
+    #[test]
+    fn real_running_line_still_mints_a_lane() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [child-a] [INFO] Running com.example.rtk.AFailTest\n\
+                  [child-a] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.02 s <<< FAILURE! -- in com.example.rtk.AFailTest\n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter_surefire(i, true);
+        assert!(
+            o.contains("Running com.example.rtk.AFailTest"),
+            "a genuine class-start line opens the lane and is kept with its failing \
+             block; got:\n{o}"
+        );
+    }
+
+    /// An app log shaped like a module header is gated on how the line
+    /// *arrived* (tag-prefixed), not on which lane it was routed to: an
+    /// unrecognized tag falls back to `raw_owner`, which can land on the root
+    /// lane, and a gate keyed on the destination would switch itself off
+    /// exactly there.
+    #[test]
+    fn daemon_building_applog_dropped_with_no_block_open() {
+        let mut i = String::from("[INFO] Scanning for projects...\n[INFO] Building web 2.1.0 [1/1]\n");
+        for n in 0..10 {
+            i.push_str(&format!(
+                "[pool-1] [INFO] Building segment {n} of the data pipeline\n"
+            ));
+        }
+        i.push_str("[INFO] BUILD SUCCESS\n");
+        let o = filter_surefire(&i, true);
+        assert_eq!(
+            o.matches("of the data pipeline").count(),
+            0,
+            "tag-prefixed `Building` app logs never carry the reactor counter and \
+             are dropped even when no lane's block is open; got:\n{o}"
+        );
+        assert!(
+            o.contains("[INFO] Building web 2.1.0 [1/1]"),
+            "the real reactor-numbered module header survives; got:\n{o}"
+        );
+    }
+
+    /// The failures budget is keyed to the plugin *family*, so version and
+    /// execution-id differences between modules — both per-module
+    /// configuration — stay inside one phase and share one budget.
+    #[test]
+    fn summary_cap_survives_per_module_plugin_coordinates() {
+        let block = |tag: &str, banner: &str, p: &str| {
+            let mut s = format!("[{tag}] [INFO] --- {banner} @ {tag} ---\n");
+            s.push_str(&format!("[{tag}] [ERROR] Failures: \n"));
+            for n in 0..3 {
+                s.push_str(&format!("[{tag}] [ERROR]   {p}{n}:1{n} boom {p}{n}\n"));
+            }
+            s.push_str(&format!(
+                "[{tag}] [ERROR] Tests run: 3, Failures: 3, Errors: 0, Skipped: 0\n"
+            ));
+            s
+        };
+        for (label, b_banner) in [
+            ("same coordinates", "surefire:3.5.5:test (default-test)"),
+            ("different version", "surefire:3.2.2:test (default-test)"),
+            ("different execution id", "surefire:3.5.5:test (unit-tests)"),
+            ("legacy spelling", "maven-surefire-plugin:2.22.2:test (default-test)"),
+        ] {
+            let i = format!(
+                "[INFO] Scanning for projects...\n{}{}[INFO] BUILD FAILURE\n",
+                block("a", "surefire:3.5.5:test (default-test)", "A"),
+                block("b", b_banner, "B"),
+            );
+            let o = filter_package_with_cap(&i, 2, true);
+            assert_eq!(
+                o.matches("boom ").count(),
+                2,
+                "{label}: one phase, one reactor-wide budget; got:\n{o}"
+            );
+        }
+    }
+
+    /// A genuine Surefire -> Failsafe transition is still a phase boundary and
+    /// still earns its own budget.
+    #[test]
+    fn summary_cap_resets_on_surefire_to_failsafe() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [a] [INFO] --- surefire:3.5.5:test (default-test) @ a ---\n\
+                  [a] [ERROR] Failures: \n\
+                  [a] [ERROR]   A0:10 boom A0\n\
+                  [a] [ERROR]   A1:11 boom A1\n\
+                  [a] [ERROR]   A2:12 boom A2\n\
+                  [a] [ERROR] Tests run: 3, Failures: 3, Errors: 0, Skipped: 0\n\
+                  [a] [INFO] --- failsafe:3.5.5:integration-test (default-integration-test) @ a ---\n\
+                  [a] [ERROR] Failures: \n\
+                  [a] [ERROR]   C0:20 boom C0\n\
+                  [a] [ERROR]   C1:21 boom C1\n\
+                  [a] [ERROR]   C2:22 boom C2\n\
+                  [a] [ERROR] Tests run: 3, Failures: 3, Errors: 0, Skipped: 0\n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter_package_with_cap(i, 2, true);
+        assert_eq!(
+            o.matches("boom ").count(),
+            4,
+            "unit and integration phases each get their own budget; got:\n{o}"
+        );
+    }
+
+    /// Quiet mode classifies a module-prefixed reactor line exactly as it
+    /// classifies the same line unprefixed — mvnd's `[module] ` prefix is
+    /// presentation, not signal.
+    #[test]
+    fn quiet_mode_classifies_module_prefixed_lines() {
+        let plain = "[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.1 s <<< FAILURE! -- in com.example.a.T\n\
+                      [ERROR] com.example.a.T.x -- Time elapsed: 0.02 s <<< FAILURE!\n\
+                      org.opentest4j.AssertionFailedError: boom\n\
+                      \tat org.junit.jupiter.api.AssertionUtils.fail(AssertionUtils.java:38)\n\
+                      \tat com.example.a.T.x(T.java:42)\n\
+                      \n\
+                      [ERROR] -> [Help 1]\n";
+        let tagged: String = plain
+            .lines()
+            .map(|l| format!("[child-a] {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let o = filter_quiet(&tagged, true);
+        assert!(
+            o.contains("com.example.a.T.x(T.java:42)"),
+            "user-code frame kept; got:\n{o}"
+        );
+        assert!(
+            !o.contains("AssertionUtils.fail"),
+            "framework frame dropped; got:\n{o}"
+        );
+        assert!(!o.contains("[Help 1]"), "boilerplate dropped; got:\n{o}");
+        // Strongest form of the claim: strip the prefix back off and the two
+        // runs must agree line for line, not merely in line count.
+        let unprefixed: String = o
+            .lines()
+            .map(|l| l.strip_prefix("[child-a] ").unwrap_or(l).trim_end())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected: String = filter_quiet(plain, false)
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            unprefixed, expected,
+            "prefixed and unprefixed runs keep the same lines"
+        );
+    }
+
+    /// Plain `mvn` never emits a module prefix, so the tag heuristic must not
+    /// run there: `[%thread] [%level]` application logging is byte-identical
+    /// to a tagged Maven line, and classifying it would let ordinary test
+    /// diagnostics be dropped as Maven's own boilerplate.
+    #[test]
+    fn quiet_mode_keeps_thread_tagged_app_logs_for_plain_mvn() {
+        let i = "[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.1 s <<< FAILURE! -- in com.example.T\n\
+                  [ERROR] com.example.T.x -- Time elapsed: 0.02 s <<< FAILURE!\n\
+                  java.lang.AssertionError: boom\n\
+                  \tat com.example.T.x(T.java:42)\n\
+                  \n\
+                  [main] [ERROR] See https://docs.example.com/troubleshoot for details\n\
+                  [main] [ERROR] Re-run Maven with the flag we documented\n\
+                  [worker-1] [ERROR] For more information about the widget cache\n\
+                  [ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.5.5:test\n";
+        let o = filter_quiet(i, false);
+        for want in [
+            "See https://docs.example.com/troubleshoot",
+            "Re-run Maven with the flag we documented",
+            "For more information about the widget cache",
+        ] {
+            assert!(
+                o.contains(want),
+                "application diagnostics survive plain `mvn -q`; missing {want:?} in:\n{o}"
+            );
+        }
+    }
+
+    /// Maven prints a plugin's banner before any of that plugin's output, so
+    /// a module's lane is always minted by its `--- surefire:… @ mod ---`
+    /// banner before the first `Running` line arrives. That is what keeps the
+    /// [`RUNNING_MODULE_HEADER`] narrowing from costing a class its block: by
+    /// the time a `Running` line of any shape shows up, its tag is already a
+    /// known lane and `is_lane_opener` is no longer consulted for it.
+    #[test]
+    fn plugin_banner_mints_the_lane_before_any_running_line() {
+        let i = "[INFO] Scanning for projects...\n\
+                  [child-a] [INFO] --- surefire:3.5.5:test (default-test) @ child-a ---\n\
+                  [child-a] [INFO] Running Regression Tests\n\
+                  [child-a] [ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.4 s <<< FAILURE! -- in Regression Tests\n\
+                  [child-a] [ERROR] com.example.T.x -- Time elapsed: 0.02 s <<< FAILURE!\n\
+                  [child-a] java.lang.AssertionError: boom\n\
+                  [child-a] \tat com.example.T.x(T.java:42)\n\
+                  [INFO] BUILD FAILURE\n";
+        let o = filter_surefire(i, true);
+        for want in [
+            "Running Regression Tests",
+            "Tests run: 3, Failures: 1",
+            "java.lang.AssertionError: boom",
+            "T.java:42",
+        ] {
+            assert!(
+                o.contains(want),
+                "a banner-minted lane keeps its failing class whole, whatever \
+                 shape the `Running` line takes; missing {want:?} in:\n{o}"
+            );
+        }
     }
 
     // Thin `daemon`-fixed wrappers so the bulk of the test suite (written
@@ -4538,8 +4810,8 @@ mod tests {
     /// Green `mvn -q test` emits zero bytes; filter must return empty.
     #[test]
     fn quiet_green_run_is_empty() {
-        assert_eq!(filter_quiet(""), "");
-        assert_eq!(filter_quiet("   \n\n  \n"), "");
+        assert_eq!(filter_quiet("", false), "");
+        assert_eq!(filter_quiet("   \n\n  \n", false), "");
     }
 
     /// Failure under `-q`: keep close-line, exception, user frame, summary,
@@ -4547,7 +4819,7 @@ mod tests {
     #[test]
     fn quiet_fail_strips_framework_and_boilerplate() {
         let i = include_str!("../../../tests/fixtures/mvn_quiet_fail_raw.txt");
-        let o = filter_quiet(i);
+        let o = filter_quiet(i, false);
 
         // Kept: failure signal.
         assert!(
@@ -4615,7 +4887,7 @@ mod tests {
     #[test]
     fn savings_mvn_quiet_fail() {
         let i = include_str!("../../../tests/fixtures/mvn_quiet_fail_raw.txt");
-        let o = filter_quiet(i);
+        let o = filter_quiet(i, false);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
         assert!(
             savings >= 50.0,
@@ -4632,7 +4904,7 @@ mod tests {
     #[test]
     fn quiet_unknown_error_line_kept_as_safety_net() {
         let i = "[ERROR] Some unexpected error output we don't classify\n";
-        let o = filter_quiet(i);
+        let o = filter_quiet(i, false);
         assert!(
             o.contains("Some unexpected error output"),
             "unclassified ERROR line preserved; got:\n{}",
@@ -4694,21 +4966,12 @@ mod tests {
 
     // ── daemon gate: plain `mvn` never routes through the lane layer ────────
 
-    /// Cold-preclear finding (upstream PR #3199, third review round), SLF4J
-    /// probe: an SLF4J/Logback `[%thread] [%level] %msg` layout produces
-    /// lines syntactically identical to a real mvnd module line. Critically,
-    /// `is_lane_opener`'s `RUNNING` arm is intentionally permissive (any
-    /// `[INFO] Running …`, no `FILE_COORD` guard like the `[ERROR]` arm
-    /// has) — an app log line that merely happens to start with "Running"
-    /// (`[main] [INFO] Running the widget pipeline`) is exactly as
-    /// opener-shaped as a genuine mvnd module's own `Running` line. Pre-fix,
-    /// this minted a phantom `main` lane on *plain* `mvn` output (`daemon ==
-    /// false`), opened a block that never closed, and detached the
-    /// failure's own context lines so they printed after the build footer,
-    /// reading as belonging to nothing. Post-fix, `daemon == false`
-    /// short-circuits `split_lane` before any bracket parsing happens at
-    /// all, so this is structurally impossible: the context lines stay
-    /// exactly where base would keep them — inside the failing block,
+    /// An SLF4J/Logback `[%thread] [%level] %msg` layout produces lines
+    /// syntactically identical to a real mvnd module line, so plain `mvn` must
+    /// never reach the lane layer at all: `daemon == false` short-circuits
+    /// `split_lane` before any bracket parsing happens, which makes the whole
+    /// phantom-lane class structurally impossible there. A failure's context
+    /// lines stay exactly where base keeps them — inside the failing block,
     /// before the footer.
     #[test]
     fn slf4j_thread_tag_does_not_mint_phantom_lane_in_plain_mvn() {
@@ -5202,6 +5465,8 @@ mod tests {
         );
     }
 }
+
+
 
 
 
