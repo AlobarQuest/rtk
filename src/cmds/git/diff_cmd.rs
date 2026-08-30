@@ -394,8 +394,8 @@ diff --git a/b.rs b/b.rs
 
     #[test]
     fn test_condense_unified_diff_markers_at_column_0() {
-        // Same silent-false-negative class as compact_diff (#3646): indented
-        // markers make anchored greps (`^[+-]`) match nothing.
+        // Indented markers make anchored greps (`^[+-]`) match nothing, so a
+        // "was anything removed?" audit answers no while the content is there.
         //
         // Two files on purpose. A file's changes are flushed at two separate
         // sites: once per `+++` for the preceding file, once after the loop for
@@ -410,13 +410,15 @@ diff --git a/b.rs b/b.rs
                 result
             );
         }
-        // Scoped to change lines: the `  ... +N more` trailer is legitimately
-        // indented, so a blanket "no line starts with a space" would be false
-        // for any diff with more than ten changes.
+        // Match on leading whitespace rather than a single space: the indent
+        // this guards against is two spaces, so `" +"` / `" -"` would never
+        // fire and the assertion would pass on the very code it rejects.
         assert!(
-            !result
-                .lines()
-                .any(|l| l.starts_with(" +") || l.starts_with(" -")),
+            !result.lines().any(|l| {
+                let trimmed = l.trim_start();
+                trimmed.len() != l.len()
+                    && (trimmed.starts_with('+') || trimmed.starts_with('-'))
+            }),
             "change lines must not be indented:\n{}",
             result
         );
