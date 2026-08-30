@@ -335,11 +335,24 @@ enum Commands {
         // FOO as -t's value regardless of what clap does. That is a search.rs
         // defect, tracked separately.
         /// Max line length
-        // No short: `-l` is grep's --files-with-matches. Bound to RTK's
-        // --max-len (a `usize`), `rtk grep -l PATTERN` could not parse at all --
-        // clap aborted with exit 2 and rtk fell back to raw grep, losing all
-        // compaction. Without the short, `-l` flows to extra_args and reaches
-        // grep/rg, which lists matching filenames as the user intended.
+        // No short: `-l` is grep's --files-with-matches. Binding it to --max-len
+        // (a `usize`) split behavior on whether the PATTERN parsed as a number.
+        //
+        // Non-numeric pattern: clap rejected it, run_fallback re-ran raw grep,
+        // and the user got the right answer. Wasteful, not harmful -- and note
+        // `-l` is a has_format_flag passthrough on the fixed path too, so no
+        // compaction was "lost"; there is none to lose for this flag.
+        //
+        // Numeric pattern: clap ACCEPTED it. `rtk grep -l 8080 a.txt b.txt` set
+        // max_len=8080 and left a.txt as the pattern, b.txt as the only path --
+        // no error, no fallback, silently empty output and exit 1 on a file that
+        // does match. With a single file it is worse: the filename becomes the
+        // pattern, no path is left, and rtk falls back to reading stdin -- which
+        // exits 1 on /dev/null and hangs outright on an interactive terminal.
+        // That silent wrong answer, reached through a hook the user never opted
+        // into, is the real reason this short had to go.
+        // Pinned by tests::test_grep_parse_files_with_matches_l (clap layer) and
+        // numeric_pattern_with_files_with_matches_flag (end to end).
         #[arg(long, default_value = "80")]
         max_len: usize,
         /// Max results to show
@@ -3889,7 +3902,8 @@ mod tests {
     #[test]
     fn test_grep_version_routes_to_extra_args() {
         // `--version` is not a subcommand flag (version isn't propagated), so it
-        // lands in extra_args and grep_cmd::run forwards it to rg --version.
+        // lands in extra_args, and search::run's --version/--help check execs it
+        // against the engine unfiltered.
         assert_eq!(
             grep_extra_args(&["rtk", "grep", "--version"]).unwrap(),
             vec!["--version"]

@@ -327,6 +327,54 @@ fn small_grep_not_worse_than_plain() {
     );
 }
 
+// --- #2628: a numeric pattern must not bind to rtk's removed `-l` short ---
+
+#[test]
+fn numeric_pattern_with_files_with_matches_flag() {
+    if !grep_available() {
+        return;
+    }
+    // The pattern MUST parse as a usize for this test to gate anything. With
+    // `-l` bound to `--max-len: usize`, a non-numeric pattern makes clap fail,
+    // and run_fallback then re-runs raw grep and prints the right answer -- so
+    // a word pattern passes with or without the fix. A numeric pattern instead
+    // binds silently: `-l 8080` sets max_len=8080, leaving the first filename
+    // as the pattern and the second as the only path. No error, no fallback,
+    // wrong answer.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("hit.txt"), "listen on port 8080 today\n").expect("write");
+    std::fs::write(dir.path().join("miss.txt"), "nothing numeric here\n").expect("write");
+    let hit = dir.path().join("hit.txt");
+    let miss = dir.path().join("miss.txt");
+
+    let out = rtk()
+        .args([
+            "grep",
+            "-l",
+            "8080",
+            hit.to_str().unwrap(),
+            miss.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rtk grep");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        out.status.success(),
+        "`grep -l <number>` must find the match (#2628); status={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("hit.txt"),
+        "-l must report the file containing 8080:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("miss.txt"),
+        "-l must not report the non-matching file:\n{stdout}"
+    );
+}
+
 // --- #2628: rtk's own long options still bind after the short forms were removed ---
 
 #[test]
