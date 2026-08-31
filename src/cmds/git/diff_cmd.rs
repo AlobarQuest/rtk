@@ -21,7 +21,7 @@ pub fn run(file1: &Path, file2: &Path, verbose: u8) -> Result<i32> {
     let lines2: Vec<&str> = content2.lines().collect();
     let diff = compute_diff(&lines1, &lines2);
     let fallback = format_classic_diff(&diff);
-    let tracking_baseline = format!("{}\n---\n{}", content1, content2);
+    let both_files = format!("{}\n---\n{}", content1, content2);
 
     let (rtk, exit_code) = render_diff(file1, file2, &diff);
 
@@ -30,7 +30,7 @@ pub fn run(file1: &Path, file2: &Path, verbose: u8) -> Result<i32> {
     timer.track(
         &format!("diff {} {}", file1.display(), file2.display()),
         "rtk diff",
-        &tracking_baseline,
+        tracking_baseline(&diff, &fallback, &both_files, shown),
         shown,
     );
     Ok(exit_code)
@@ -224,6 +224,30 @@ fn format_line_range(start: usize, end: usize) -> String {
         start.to_string()
     } else {
         format!("{start},{end}")
+    }
+}
+
+/// Baseline the savings are measured against: what `diff` itself would have
+/// printed, so the recorded ratio compares like with like and can never go
+/// negative -- the guard already caps the shown output at the fallback.
+fn tracking_baseline<'a>(
+    diff: &DiffResult,
+    fallback: &'a str,
+    both_files: &'a str,
+    shown: &'a str,
+) -> &'a str {
+    if !diff.changes.is_empty() {
+        return fallback;
+    }
+
+    // Identical files: `diff` prints nothing, so the dump of both files
+    // stands in as the output that would otherwise have to be read. Two
+    // near-empty files can make that dump cheaper than the verdict line,
+    // which would book a loss against the cheapest possible answer.
+    if tracking::estimate_tokens(both_files) >= tracking::estimate_tokens(shown) {
+        both_files
+    } else {
+        shown
     }
 }
 
@@ -494,6 +518,53 @@ mod tests {
         assert!(shown.contains("< alpha beta"));
         assert!(shown.contains("\n---\n"));
         assert!(shown.contains("> alpha zzzz"));
+    }
+
+    #[test]
+    fn test_tracking_baseline_never_books_a_loss() {
+        // Two unrelated files: the classic diff carries both of them plus the
+        // "< " / "> " markers, so it is bigger than a plain dump. Measuring
+        // against the dump used to record negative savings.
+        let old: Vec<String> = (0..40).map(|i| format!("old line {i}")).collect();
+        let new: Vec<String> = (0..40).map(|i| format!("brand new content {i}")).collect();
+        let r1: Vec<&str> = old.iter().map(|s| s.as_str()).collect();
+        let r2: Vec<&str> = new.iter().map(|s| s.as_str()).collect();
+
+        let diff = compute_diff(&r1, &r2);
+        let fallback = format_classic_diff(&diff);
+        let both_files = format!("{}\n---\n{}", old.join("\n"), new.join("\n"));
+        let (rendered, _) = render_diff(Path::new("a"), Path::new("b"), &diff);
+        let shown = select_file_diff_output(&diff, &fallback, &rendered);
+        let baseline = tracking_baseline(&diff, &fallback, &both_files, shown);
+
+        assert!(
+            tracking::estimate_tokens(baseline) >= tracking::estimate_tokens(shown),
+            "baseline {} < shown {} would record negative savings",
+            tracking::estimate_tokens(baseline),
+            tracking::estimate_tokens(shown)
+        );
+    }
+
+    #[test]
+    fn test_tracking_baseline_identical_files_use_both_files() {
+        let diff = compute_diff(&["a: 1", "b: 2"], &["a: 1", "b: 2"]);
+        let both_files = "a: 1\nb: 2\n\n---\na: 1\nb: 2\n";
+        let shown = "[ok] Files are identical\n";
+
+        assert_eq!(
+            tracking_baseline(&diff, "", both_files, shown),
+            both_files,
+            "identical files should still measure against the dump"
+        );
+    }
+
+    #[test]
+    fn test_tracking_baseline_empty_files_do_not_book_a_loss() {
+        // Both files empty: the dump is shorter than the verdict line.
+        let diff = compute_diff(&[], &[]);
+        let shown = "[ok] Files are identical\n";
+
+        assert_eq!(tracking_baseline(&diff, "", "\n---\n", shown), shown);
     }
 
     #[test]
