@@ -42,6 +42,7 @@ ignore_files = ["*.lock", "*.min.js", "*.min.css"]
 enabled = true              # save raw output on failure
 mode = "failures"           # "failures" (default), "always", "never"
 max_files = 20              # rotation: keep last N files
+max_file_size = 1048576     # 1 MB in bytes
 # directory = "/custom/tee/path"  # optional override
 
 [telemetry]
