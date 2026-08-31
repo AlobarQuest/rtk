@@ -579,6 +579,15 @@ pub const RULES: &[RtkRule] = &[
         ..RtkRule::DEFAULT
     },
     RtkRule {
+        pattern: r"^php\s+run-tests\.php(?:\s|$)",
+        rtk_cmd: "rtk phpt",
+        rewrite_prefixes: &["php run-tests.php"],
+        category: "Tests",
+        savings_pct: 99.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
         pattern: r"^(?:php\s+)?(?:\./)?(?:(?:vendor/)?bin/)?phpunit(?:\s|$)",
         rtk_cmd: "rtk phpunit",
         // rewrite_segment_inner normalizes the php wrapper, `./`, vendor/bin and

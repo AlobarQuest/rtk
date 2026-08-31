@@ -5707,6 +5707,29 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_phpt_run_tests() {
+        assert!(matches!(
+            classify_command("php run-tests.php Zend/tests/"),
+            Classification::Supported {
+                rtk_equivalent: "rtk phpt",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_phpt_run_tests() {
+        assert_eq!(
+            rewrite_command_no_prefixes("php run-tests.php Zend/tests/67468.phpt", &[]),
+            Some("rtk phpt Zend/tests/67468.phpt".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("php run-tests.php", &[]),
+            Some("rtk phpt".into())
+        );
+    }
+
+    #[test]
     fn test_normalize_php_tool_command_custom_bin_dir() {
         use std::path::PathBuf;
         let dirs = vec![PathBuf::from("tools/bin"), PathBuf::from("vendor/bin")];
