@@ -1022,8 +1022,8 @@ fn rewrite_segment_inner(
     {
         // head/tail rewrite to `rtk read`, so honour exclude_commands here too —
         // this branch returns before the checks below and used to ignore the list.
-        let stripped = ENV_PREFIX.replace(cmd_part, "");
-        if is_excluded(stripped.trim(), excluded) {
+        // Any sudo/env prefix has already been peeled by strip_disabled_prefix above.
+        if is_excluded(cmd_part, excluded) {
             return None;
         }
         return rewrite_line_range(cmd_part).map(|r| format!("{}{}", r, redirect_suffix));
@@ -2264,6 +2264,16 @@ mod tests {
         );
         assert_eq!(
             rewrite_command_no_prefixes("tail -20 src/main.rs", &excluded),
+            None
+        );
+        // A sudo/env prefix is peeled by strip_disabled_prefix before this branch,
+        // so the exclusion still applies to the wrapped head/tail.
+        assert_eq!(
+            rewrite_command_no_prefixes("sudo head -20 src/main.rs", &excluded),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("RUST_LOG=debug tail -20 src/main.rs", &excluded),
             None
         );
         // ...and must not affect unrelated commands.
