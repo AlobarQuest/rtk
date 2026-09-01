@@ -992,6 +992,12 @@ fn rewrite_segment_inner(
             if !routable {
                 return None;
             }
+            // The inner command may have been dropped because it is excluded.
+            // Re-testing the wrapped form would route it through the wrapper's
+            // own filter, defeating the exclusion.
+            if is_excluded(ENV_PREFIX.replace(rest, "").trim(), excluded) {
+                return None;
+            }
             break;
         }
     }
@@ -2280,6 +2286,27 @@ mod tests {
         assert_eq!(
             rewrite_command_no_prefixes("git status", &excluded),
             Some("rtk git status".into())
+        );
+    }
+
+    #[test]
+    fn test_routable_wrapper_honours_exclude_commands() {
+        // `uv run` is a routable wrapper: when the inner rewrite is dropped it
+        // falls through and re-tests `uv run <cmd>` as a `uv` invocation. That
+        // fall-through must not resurrect a command the user excluded.
+        let excluded = vec!["head".to_string(), "tail".to_string()];
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run head -20 src/main.rs", &excluded),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run cat src/main.rs", &["cat".to_string()]),
+            None
+        );
+        // A non-excluded inner command still rewrites through the wrapper.
+        assert_eq!(
+            rewrite_command_no_prefixes("uv run head -20 src/main.rs", &["cat".to_string()]),
+            Some("uv run rtk read src/main.rs --max-lines 20".into())
         );
     }
 
