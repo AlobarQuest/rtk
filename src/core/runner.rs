@@ -506,6 +506,164 @@ fn filter_errors(output: &str) -> String {
     result.join("\n")
 }
 
+/// Whether a block's ending vouches for it. `Vouched` means the ending itself
+/// attributes the block to a real failure (bun's `(fail)` marker).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Close {
+    Vouched,
+    Plain,
+}
+
+/// Whether the runner is currently printing its own diagnostics or relaying the
+/// test's stdout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Trusted,
+    Untrusted,
+}
+
+/// Which lines belong to a real failure rather than to the test's own stdout.
+///
+/// Bun and deno answer the same three questions (what opens a diagnostic block,
+/// what proves the runner wrote it, what closes it), so they share one engine
+/// and differ only in this table. As two separate state machines they drifted:
+/// a guard added on one side had to be rediscovered on the other, and deno had
+/// no proof rule at all, reporting passing suites as failed.
+struct BlockPolicy {
+    /// Opens a diagnostic block. Opening also closes any block already open.
+    opens: fn(&str) -> bool,
+    /// Runner-written evidence inside an open block.
+    proves: fn(&str) -> bool,
+    /// Ends the current block.
+    closes: fn(&str) -> Option<Close>,
+    /// Keeps a line inside the block. Stack frames and rules are noise.
+    keeps: fn(&str) -> bool,
+    /// Moves in and out of the region where the runner prints its own
+    /// diagnostics. A block opened outside it needs a vouched close to count.
+    section: fn(&str) -> Option<Section>,
+}
+
+/// Buffers a diagnostic block until something decides whether the runner wrote
+/// it. Kept when it opened inside a trusted section, or when it carries the
+/// runner's own evidence and a vouched ending. Anything else is the test's own
+/// stdout and is dropped.
+#[derive(Default)]
+struct FailureBlocks {
+    pending: Vec<String>,
+    open: bool,
+    evidence: bool,
+    opened_trusted: bool,
+    trusted: bool,
+    kept: Vec<String>,
+}
+
+impl FailureBlocks {
+    fn feed(&mut self, line: &str, trimmed: &str, policy: &BlockPolicy) {
+        if let Some(section) = (policy.section)(trimmed) {
+            self.close(None);
+            self.trusted = section == Section::Trusted;
+        }
+        if let Some(close) = (policy.closes)(trimmed) {
+            self.close(Some(close));
+            return;
+        }
+        if (policy.opens)(trimmed) {
+            self.close(None);
+            self.open = true;
+            self.evidence = false;
+            self.opened_trusted = self.trusted;
+            self.pending.push(line.to_string());
+            return;
+        }
+        if self.open {
+            if (policy.proves)(trimmed) {
+                self.evidence = true;
+            }
+            if (policy.keeps)(trimmed) {
+                self.pending.push(line.to_string());
+            }
+        }
+    }
+
+    fn close(&mut self, close: Option<Close>) {
+        if !self.open {
+            self.pending.clear();
+            return;
+        }
+        if self.opened_trusted || (self.evidence && close == Some(Close::Vouched)) {
+            self.kept.append(&mut self.pending);
+        } else {
+            self.pending.clear();
+        }
+        self.open = false;
+        self.evidence = false;
+    }
+}
+
+/// Bun writes a diagnostic before the marker it belongs to, so a block only
+/// counts once a `(fail)` marker claims it. A test logging its own `error:`,
+/// even with a stack, gets claimed by `(pass)` or by the counts instead.
+/// Module-level failures carry no marker at all, which is what the
+/// unhandled-error banner is for.
+const BUN_POLICY: BlockPolicy = BlockPolicy {
+    opens: |t| t.starts_with("error:"),
+    proves: |t| t.starts_with("at ") || t.starts_with("Expected:") || t.starts_with("Received:"),
+    closes: |t| {
+        if t.starts_with("(fail)") || t.contains('✗') {
+            Some(Close::Vouched)
+        } else if t.starts_with("(pass)") || is_bun_count_line(t) || t.starts_with("Ran ") {
+            Some(Close::Plain)
+        } else {
+            None
+        }
+    },
+    keeps: |t| !t.is_empty() && !t.starts_with("at ") && !t.chars().all(|c| c == '-'),
+    section: |t| {
+        if t.starts_with("# Unhandled error") {
+            Some(Section::Trusted)
+        } else if is_bun_count_line(t) || t.starts_with("Ran ") {
+            Some(Section::Untrusted)
+        } else {
+            None
+        }
+    },
+};
+
+/// Deno groups every diagnostic it writes under an ERRORS section, and fences
+/// the test's own stdout between output rules. That section is the proof: deno
+/// prints no per-failure marker that could vouch for a block, so one opened
+/// anywhere else is the test talking.
+const DENO_POLICY: BlockPolicy = BlockPolicy {
+    opens: |t| t.starts_with("error:") && t != "error: Test failed",
+    proves: |t| t.starts_with("[Diff]"),
+    closes: |t| {
+        // A frame ends a block, and so does the next entry's "name => file:line"
+        // header: consecutive leak failures carry no frames at all.
+        if t.starts_with("at ") || t.contains(" => ") {
+            Some(Close::Plain)
+        } else {
+            None
+        }
+    },
+    keeps: |t| !t.is_empty() && t != "^" && !t.starts_with("throw "),
+    section: |t| {
+        if t == "ERRORS" {
+            Some(Section::Trusted)
+        } else if t == "FAILURES"
+            || t.starts_with("FAILED |")
+            || t.starts_with("ok |")
+            || t.contains("test result:")
+            || t.starts_with("failures:")
+            || t.starts_with("------- output")
+            || t.starts_with("----- output end")
+        {
+            Some(Section::Untrusted)
+        } else {
+            None
+        }
+    },
+};
+
 fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
     // Test runners colorize even when piped (deno does), so anchor on clean text.
     let cleaned = crate::core::utils::strip_ansi(output);
@@ -516,11 +674,7 @@ fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
     let mut failure_lines = Vec::new();
     let mut in_failure = false;
     let mut in_failures_list = false;
-    // Bun only: diagnostic lines buffered until the marker that claims them.
-    let mut pending: Vec<String> = Vec::new();
-    let mut pending_open = false;
-    let mut pending_proven = false;
-    let mut unhandled_section = false;
+    let mut blocks = FailureBlocks::default();
 
     for line in lines.iter() {
         match eco {
@@ -568,59 +722,16 @@ fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
 
             TestEcosystem::Bun => {
                 let trimmed = line.trim_start();
-                // Anchored count lines (" 6 pass", " 4 fail") and the "Ran N tests" footer.
-                // A loose `contains(" fail")` also matches bun's echoed source context when
-                // a test NAME contains "fails", flooding the summary with duplicate snippets.
-                let is_count = is_bun_count_line(trimmed) || trimmed.starts_with("Ran ");
-                if is_count {
+                // Anchored count lines (" 6 pass", " 4 fail") and the "Ran N tests"
+                // footer. A loose `contains(" fail")` also matches bun's echoed
+                // source context when a test NAME contains "fails".
+                if is_bun_count_line(trimmed) || trimmed.starts_with("Ran ") {
                     result.push(line.to_string());
                 }
-
-                // Bun prints a diagnostic BEFORE the marker it belongs to, so the
-                // block is buffered and only kept if something proves bun wrote it:
-                //   error: expect(received).toBe(expected)   <- opens the block
-                //   Expected: 3                              <- proof
-                //   Received: 2
-                //         at <anonymous> (...)               <- proof
-                //   (fail) t2 fails [1.86ms]                 <- closes the block
-                // A test that logs its own "error: ..." to stdout produces none of
-                // that proof, so its block is dropped instead of being swept in.
-                // Module-level failures carry no proof either, but bun announces
-                // them with an unhandled-error banner, which counts on its own.
-                if trimmed.starts_with("# Unhandled error") {
-                    unhandled_section = true;
-                }
-                let opens_block = trimmed.starts_with("error:");
-                let closes_block =
-                    is_count || opens_block || trimmed.starts_with("(fail)") || line.contains('✗');
-
-                if closes_block && pending_open {
-                    if pending_proven {
-                        failure_lines.append(&mut pending);
-                    } else {
-                        pending.clear();
-                    }
-                    pending_open = false;
-                }
-
                 if trimmed.starts_with("(fail)") || line.contains('✗') {
                     failures.push(line.to_string());
-                } else if opens_block {
-                    pending.push(line.to_string());
-                    pending_open = true;
-                    pending_proven = unhandled_section;
-                } else if is_count {
-                    unhandled_section = false;
-                } else if pending_open {
-                    if trimmed.starts_with("at ") {
-                        pending_proven = true;
-                    } else if trimmed.starts_with("Expected:") || trimmed.starts_with("Received:") {
-                        pending_proven = true;
-                        pending.push(line.to_string());
-                    } else if !trimmed.is_empty() && !trimmed.chars().all(|c| c == '-') {
-                        pending.push(line.to_string());
-                    }
                 }
+                blocks.feed(line, trimmed, &BUN_POLICY);
             }
 
             TestEcosystem::Deno => {
@@ -630,50 +741,26 @@ fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
                 // Current deno (2.x): "FAILED | 3 passed | 2 failed (17ms)" footer,
                 // " FAILURES " section listing "name => file:line:col".
                 // Legacy deno mimicked cargo ("test result:", "failures:").
-                // These section boundaries also close any open diagnostic block:
-                // deno's leak and sanitizer failures carry no "at " stack frame,
-                // so without this the capture never ends and swallows the footer.
                 if trimmed.starts_with("FAILED |")
                     || trimmed.starts_with("ok |")
                     || line.contains("test result:")
                 {
                     result.push(line.to_string());
                     in_failures_list = false;
-                    in_failure = false;
                 } else if trimmed == "FAILURES" || line.starts_with("failures:") {
                     in_failures_list = true;
-                    in_failure = false;
                 } else if in_failures_list && !trimmed.is_empty() {
                     failures.push(line.to_string());
                 }
-                // Diagnostics live in the ERRORS section: an "error:" line, then
-                // [Diff] and +/- lines, then a stack that ends the block.
-                // "error: Test failed" is deno's generic footer, not a diagnostic.
-                if trimmed.starts_with("error:") && trimmed != "error: Test failed" {
-                    in_failure = true;
-                    failure_lines.push(line.to_string());
-                } else if in_failure {
-                    if trimmed.starts_with("at ") {
-                        in_failure = false;
-                    } else if !trimmed.is_empty()
-                        && trimmed != "^"
-                        && !trimmed.starts_with("throw ")
-                    {
-                        // "throw new AssertionError(...)" is deno-std's echoed
-                        // internal throw site; the failing test's location is
-                        // already in the FAILURES marker.
-                        failure_lines.push(line.to_string());
-                    }
-                }
+                blocks.feed(line, trimmed, &DENO_POLICY);
             }
 
             TestEcosystem::Unknown => {}
         }
     }
 
-    if pending_proven {
-        failure_lines.append(&mut pending);
-    }
+    blocks.close(None);
+    failure_lines.append(&mut blocks.kept);
 
     let mut output = String::new();
 
@@ -907,6 +994,67 @@ SUMMARY:
         // The footer and section headers must not be swallowed into the block.
         assert_eq!(out.matches("t2 leaks a timer").count(), 1, "{out}");
         assert!(!out.contains("error: Test failed"), "{out}");
+    }
+
+    /// Every test-output scenario is asserted on both runtimes, so a fix that
+    /// lands on one and not the other fails here instead of in a later review.
+    const PAIRED_GREEN_LOG: [(TestEcosystem, &str); 4] = [
+        (
+            TestEcosystem::Bun,
+            include_str!("../../tests/fixtures/bun_test_stdout_error_raw.txt"),
+        ),
+        (
+            TestEcosystem::Deno,
+            include_str!("../../tests/fixtures/deno_test_stdout_error_raw.txt"),
+        ),
+        (
+            TestEcosystem::Bun,
+            include_str!("../../tests/fixtures/bun_test_stdout_stack_raw.txt"),
+        ),
+        (
+            TestEcosystem::Deno,
+            include_str!("../../tests/fixtures/deno_test_stdout_stack_raw.txt"),
+        ),
+    ];
+
+    #[test]
+    fn test_green_run_never_reports_a_failure_on_either_runtime() {
+        // A passing test that logs its own "error:" line, with and without a
+        // stack. Reporting these as failures is worse than a degraded message
+        // on a red run: it is a false positive on a green one.
+        for (eco, raw) in PAIRED_GREEN_LOG {
+            let out = extract_test_summary(raw, eco);
+            assert!(!out.contains("[FAIL]"), "{eco:?}: {out}");
+            assert!(!out.contains("could not reach cache"), "{eco:?}: {out}");
+            assert!(!out.contains("fetchCache"), "{eco:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn test_consecutive_stack_free_failures_do_not_merge() {
+        // Deno leak failures carry no "at " frame, so nothing but the next
+        // entry header closes the block.
+        let raw = include_str!("../../tests/fixtures/deno_test_twoleak_raw.txt");
+        let out = extract_test_summary(raw, TestEcosystem::Deno);
+        assert_eq!(out.matches("t3 leaks =>").count(), 1, "{out}");
+        assert!(out.contains("FAILED | 1 passed | 2 failed"), "{out}");
+        assert!(!out.contains("error: Test failed"), "{out}");
+    }
+
+    #[test]
+    fn test_module_load_error_survives_on_either_runtime() {
+        // Bun reports counts and no failure marker, deno reports neither, so
+        // the two reach the user by different paths. Both must say why.
+        let bun = extract_test_summary(
+            include_str!("../../tests/fixtures/bun_test_load_error_raw.txt"),
+            TestEcosystem::Bun,
+        );
+        assert!(bun.contains("Cannot find module"), "{bun}");
+        let deno = extract_test_summary(
+            include_str!("../../tests/fixtures/deno_test_load_error_raw.txt"),
+            TestEcosystem::Deno,
+        );
+        assert!(deno.contains("Module not found"), "{deno}");
     }
 
     #[test]
