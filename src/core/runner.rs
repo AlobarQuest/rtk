@@ -499,6 +499,11 @@ fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
     let mut failure_lines = Vec::new();
     let mut in_failure = false;
     let mut in_failures_list = false;
+    // Bun only: diagnostic lines buffered until the marker that claims them.
+    let mut pending: Vec<String> = Vec::new();
+    let mut pending_open = false;
+    let mut pending_proven = false;
+    let mut unhandled_section = false;
 
     for line in lines.iter() {
         match eco {
@@ -549,23 +554,55 @@ fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
                 // Anchored count lines (" 6 pass", " 4 fail") and the "Ran N tests" footer.
                 // A loose `contains(" fail")` also matches bun's echoed source context when
                 // a test NAME contains "fails", flooding the summary with duplicate snippets.
-                if is_bun_count_line(trimmed) || trimmed.starts_with("Ran ") {
+                let is_count = is_bun_count_line(trimmed) || trimmed.starts_with("Ran ");
+                if is_count {
                     result.push(line.to_string());
                 }
-                // Bun prints the diagnostic BEFORE the failure marker:
-                //   error: expect(received).toBe(expected)
-                //   Expected: 3
+
+                // Bun prints a diagnostic BEFORE the marker it belongs to, so the
+                // block is buffered and only kept if something proves bun wrote it:
+                //   error: expect(received).toBe(expected)   <- opens the block
+                //   Expected: 3                              <- proof
                 //   Received: 2
-                //         at <anonymous> (...)
-                //   (fail) t2 fails [1.86ms]
+                //         at <anonymous> (...)               <- proof
+                //   (fail) t2 fails [1.86ms]                 <- closes the block
+                // A test that logs its own "error: ..." to stdout produces none of
+                // that proof, so its block is dropped instead of being swept in.
+                // Module-level failures carry no proof either, but bun announces
+                // them with an unhandled-error banner, which counts on its own.
+                if trimmed.starts_with("# Unhandled error") {
+                    unhandled_section = true;
+                }
+                let opens_block = trimmed.starts_with("error:");
+                let closes_block =
+                    is_count || opens_block || trimmed.starts_with("(fail)") || line.contains('✗');
+
+                if closes_block && pending_open {
+                    if pending_proven {
+                        failure_lines.append(&mut pending);
+                    } else {
+                        pending.clear();
+                    }
+                    pending_open = false;
+                }
+
                 if trimmed.starts_with("(fail)") || line.contains('✗') {
                     failures.push(line.to_string());
-                    in_failure = false;
-                } else if trimmed.starts_with("error:") {
-                    in_failure = true;
-                    failure_lines.push(line.to_string());
-                } else if in_failure && !trimmed.is_empty() && !trimmed.starts_with("at ") {
-                    failure_lines.push(line.to_string());
+                } else if opens_block {
+                    pending.push(line.to_string());
+                    pending_open = true;
+                    pending_proven = unhandled_section;
+                } else if is_count {
+                    unhandled_section = false;
+                } else if pending_open {
+                    if trimmed.starts_with("at ") {
+                        pending_proven = true;
+                    } else if trimmed.starts_with("Expected:") || trimmed.starts_with("Received:") {
+                        pending_proven = true;
+                        pending.push(line.to_string());
+                    } else if !trimmed.is_empty() && !trimmed.chars().all(|c| c == '-') {
+                        pending.push(line.to_string());
+                    }
                 }
             }
 
@@ -576,14 +613,19 @@ fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
                 // Current deno (2.x): "FAILED | 3 passed | 2 failed (17ms)" footer,
                 // " FAILURES " section listing "name => file:line:col".
                 // Legacy deno mimicked cargo ("test result:", "failures:").
+                // These section boundaries also close any open diagnostic block:
+                // deno's leak and sanitizer failures carry no "at " stack frame,
+                // so without this the capture never ends and swallows the footer.
                 if trimmed.starts_with("FAILED |")
                     || trimmed.starts_with("ok |")
                     || line.contains("test result:")
                 {
                     result.push(line.to_string());
                     in_failures_list = false;
+                    in_failure = false;
                 } else if trimmed == "FAILURES" || line.starts_with("failures:") {
                     in_failures_list = true;
+                    in_failure = false;
                 } else if in_failures_list && !trimmed.is_empty() {
                     failures.push(line.to_string());
                 }
@@ -612,10 +654,21 @@ fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
         }
     }
 
+    if pending_proven {
+        failure_lines.append(&mut pending);
+    }
+
     let mut output = String::new();
 
-    if !failures.is_empty() {
-        output.push_str("[FAIL] FAILURES:\n");
+    // failure_lines can carry the only diagnostic there is: bun prints no
+    // "(fail)" marker when a test file fails to load, and the count lines it
+    // still prints keep the raw-tail fallback below from firing.
+    if !failures.is_empty() || !failure_lines.is_empty() {
+        if failures.is_empty() {
+            output.push_str("[FAIL] ERRORS:\n");
+        } else {
+            output.push_str("[FAIL] FAILURES:\n");
+        }
         for f in failures.iter().take(MAX_RUNNER_FAILURES) {
             output.push_str(&format!("  {}\n", f.trim()));
         }
@@ -655,13 +708,14 @@ fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
     output
 }
 
-/// True for bun's summary count lines: " 6 pass", " 4 fail", " 2 skip", " 1 todo".
+/// True for bun's summary count lines: " 6 pass", " 4 fail", " 2 skip", " 1 todo",
+/// " 1 error".
 /// Anchored on the exact two-token shape so echoed source lines never match.
 fn is_bun_count_line(trimmed: &str) -> bool {
     let mut parts = trimmed.split_whitespace();
     matches!(
         (parts.next(), parts.next(), parts.next()),
-        (Some(count), Some("pass" | "fail" | "skip" | "todo"), None)
+        (Some(count), Some("pass" | "fail" | "skip" | "todo" | "error"), None)
             if count.chars().all(|c| c.is_ascii_digit())
     )
 }
@@ -783,6 +837,59 @@ SUMMARY:
         assert!(out.contains("1 skip"), "{out}");
         assert!(out.contains("1 todo"), "{out}");
         assert!(!out.contains("at <anonymous>"), "{out}");
+    }
+
+    #[test]
+    fn test_bun_module_load_error_survives_with_no_fail_marker() {
+        // Bun prints no "(fail)" line when a test file cannot load, so the
+        // diagnostic is the only thing that says why rtk is exiting non-zero.
+        let raw = include_str!("../../tests/fixtures/bun_test_load_error_raw.txt");
+        let out = extract_test_summary(raw, TestEcosystem::Bun);
+        assert!(out.contains("[FAIL]"), "{out}");
+        assert!(out.contains("Cannot find module"), "{out}");
+        assert!(out.contains("0 pass"), "{out}");
+        assert!(out.contains("1 fail"), "{out}");
+    }
+
+    #[test]
+    fn test_bun_test_stdout_error_is_not_a_failure() {
+        // A passing test that logs its own "error: ..." must not manufacture a
+        // failure block out of the lines that follow it.
+        let raw = include_str!("../../tests/fixtures/bun_test_stdout_error_raw.txt");
+        let out = extract_test_summary(raw, TestEcosystem::Bun);
+        assert!(!out.contains("[FAIL]"), "{out}");
+        assert!(!out.contains("logged by test"), "{out}");
+        assert!(out.contains("2 pass"), "{out}");
+        assert!(out.contains("0 fail"), "{out}");
+    }
+
+    #[test]
+    fn test_bun_test_stdout_error_between_real_failures() {
+        // The same log line, this time interleaved with two genuine failures:
+        // the real diagnostics survive and the logged one is still dropped.
+        let raw = include_str!("../../tests/fixtures/bun_test_stdout_error_mixed_raw.txt");
+        let out = extract_test_summary(raw, TestEcosystem::Bun);
+        assert!(out.contains("(fail) t2 fails"), "{out}");
+        assert!(out.contains("(fail) t4 fails too"), "{out}");
+        assert!(out.contains("Expected: 3"), "{out}");
+        assert!(out.contains("Received: 2"), "{out}");
+        assert!(out.contains("Expected: 5"), "{out}");
+        assert!(out.contains("Received: 4"), "{out}");
+        assert!(!out.contains("logged by test"), "{out}");
+        assert!(!out.contains("console.log"), "{out}");
+    }
+
+    #[test]
+    fn test_deno_leak_failure_closes_at_section_boundary() {
+        // Leak and sanitizer failures carry no "at " stack frame, so nothing
+        // else would ever close the diagnostic block.
+        let raw = include_str!("../../tests/fixtures/deno_test_leak_raw.txt");
+        let out = extract_test_summary(raw, TestEcosystem::Deno);
+        assert!(out.contains("Leaks detected"), "{out}");
+        assert!(out.contains("FAILED | 1 passed | 1 failed"), "{out}");
+        // The footer and section headers must not be swallowed into the block.
+        assert_eq!(out.matches("t2 leaks a timer").count(), 1, "{out}");
+        assert!(!out.contains("error: Test failed"), "{out}");
     }
 
     #[test]
