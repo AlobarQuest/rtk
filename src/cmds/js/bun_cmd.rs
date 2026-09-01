@@ -196,33 +196,59 @@ pub fn run_pm_ls(args: &[String], verbose: u8) -> Result<i32> {
     )
 }
 
-/// Run `bun build` with error-only filtering. Args are passed as a vector, never via a shell.
+/// True when `bun build` writes its bundle to disk rather than to stdout.
+/// Without one of these flags stdout IS the bundle, so nothing may filter it.
+fn build_writes_to_disk(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        a == "--outdir"
+            || a == "--outfile"
+            || a == "--compile"
+            || a.starts_with("--outdir=")
+            || a.starts_with("--outfile=")
+    })
+}
+
+/// Run `bun build`. Args are passed as a vector, never via a shell.
+///
+/// With no output flag bun writes the bundled JS to stdout, so the command is
+/// a plain passthrough: filtering it would replace a user's bundle with a
+/// status line, and `bun build ./index.ts > bundle.js` would silently write
+/// that line to the file. Only the write-to-disk forms print a summary that is
+/// safe to filter.
 pub fn run_build(args: &[String], verbose: u8) -> Result<i32> {
+    if !build_writes_to_disk(args) {
+        let mut passthrough: Vec<OsString> = vec![OsString::from("build")];
+        passthrough.extend(args.iter().map(OsString::from));
+        return crate::core::runner::run_passthrough("bun", &passthrough, verbose);
+    }
+
     let mut cmd = resolved_command("bun");
     cmd.arg("build").args(args);
-    let display = format!("bun build {}", args.join(" "));
-    crate::core::runner::run_err_cmd(cmd, display.trim_end(), verbose)
+    let display = format!("build {}", args.join(" "));
+    crate::core::runner::run_err_cmd(cmd, "bun", display.trim_end(), "bun_build", verbose)
 }
 
 /// Run `bun test` showing only failures. Args are passed as a vector, never via a shell.
 pub fn run_test(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("bun");
     cmd.arg("test").args(args);
-    let display = format!("bun test {}", args.join(" "));
+    let display = format!("test {}", args.join(" "));
     crate::core::runner::run_test_cmd(
         cmd,
+        "bun",
         display.trim_end(),
+        "bun_test",
         crate::core::runner::TestEcosystem::Bun,
         verbose,
     )
 }
 
-/// Run `bunx <tool>` with error-only filtering. Args are passed as a vector, never via a shell.
-pub fn run_bunx(args: &[String], verbose: u8) -> Result<i32> {
-    let mut cmd = resolved_command("bunx");
-    cmd.args(args);
-    let display = format!("bunx {}", args.join(" "));
-    crate::core::runner::run_err_cmd(cmd, display.trim_end(), verbose)
+/// Run `bunx <tool>`. Args are passed as a vector, never via a shell.
+///
+/// Uses the same light filter as the npx path rather than an errors-only one:
+/// bunx hosts arbitrary tools, and for many of them stdout is the whole point.
+pub fn run_bunx(args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
+    crate::cmds::js::npm_cmd::exec_with("bunx", args, verbose, skip_env)
 }
 
 /// Passthrough for `bun run` and other unfiltered subcommands.
@@ -400,6 +426,30 @@ error: PackageNotFound - "nonexistent-pkg" not found in registry
         let err = "error: No package.json was found for directory \"/home/user\"\nnote: Run \"bun init\" to initialize a project";
         let out = filter_bun_pm_ls(err);
         assert!(out.contains("No package.json"), "{out}");
+    }
+
+    #[test]
+    fn test_bun_build_without_output_flag_is_passthrough() {
+        // With no output flag the bundle IS stdout, so it must not be filtered:
+        // `bun build ./index.ts > bundle.js` would otherwise write a status line.
+        assert!(!build_writes_to_disk(&["./index.ts".to_string()]));
+        assert!(!build_writes_to_disk(&[]));
+    }
+
+    #[test]
+    fn test_bun_build_with_output_flag_is_filtered() {
+        for flag in [
+            "--outdir",
+            "--outfile",
+            "--compile",
+            "--outdir=dist",
+            "--outfile=out.js",
+        ] {
+            assert!(
+                build_writes_to_disk(&["./index.ts".to_string(), flag.to_string()]),
+                "{flag}"
+            );
+        }
     }
 
     #[test]

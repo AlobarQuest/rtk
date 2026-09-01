@@ -1445,14 +1445,14 @@ enum DenoCommands {
 
 /// Route `bunx <tool>` and `bun x <tool>` to the matching tool filter,
 /// falling back to the generic bunx runner for unrecognized tools.
-fn run_bunx_tool(args: &[String], verbose: u8) -> Result<i32> {
+fn run_bunx_tool(args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
     if args.is_empty() {
         anyhow::bail!("bunx requires a command argument");
     }
     match args[0].as_str() {
         "tsc" | "typescript" => tsc_cmd::run(&args[1..], verbose),
-        "eslint" => lint_cmd::run(&args[1..], verbose),
-        _ => bun_cmd::run_bunx(args, verbose),
+        "eslint" => lint_cmd::run(args, verbose),
+        _ => bun_cmd::run_bunx(args, verbose, skip_env),
     }
 }
 
@@ -2457,11 +2457,11 @@ fn run_cli() -> Result<i32> {
                     bun_cmd::run_passthrough(&os_args, cli.verbose)?
                 }
             },
-            BunCommands::X { args } => run_bunx_tool(&args, cli.verbose)?,
+            BunCommands::X { args } => run_bunx_tool(&args, cli.verbose, cli.skip_env)?,
             BunCommands::Other(args) => bun_cmd::run_passthrough(&args, cli.verbose)?,
         },
 
-        Commands::Bunx { args } => run_bunx_tool(&args, cli.verbose)?,
+        Commands::Bunx { args } => run_bunx_tool(&args, cli.verbose, cli.skip_env)?,
 
         Commands::Deno { command } => match command {
             DenoCommands::Test { args } => deno_cmd::run_test(&args, cli.verbose)?,
@@ -2543,7 +2543,7 @@ fn run_cli() -> Result<i32> {
             // Intelligent routing: delegate to specialized filters
             match args[0].as_str() {
                 "tsc" | "typescript" => tsc_cmd::run(&args[1..], cli.verbose)?,
-                "eslint" => lint_cmd::run(&args[1..], cli.verbose)?,
+                "eslint" => lint_cmd::run(&args, cli.verbose)?,
                 "prisma" => {
                     // Route to prisma_cmd based on subcommand
                     if args.len() > 1 {

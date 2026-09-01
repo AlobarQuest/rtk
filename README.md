@@ -232,11 +232,11 @@ rtk prisma generate             # Schema generation (no ASCII art)
 ```bash
 rtk bun install                  # Strip progress bars (~80% reduction)
 rtk bun test                     # Failures only (-90%)
-rtk bun build                    # Errors only
+rtk bun build                    # Errors only when writing to disk, else passthrough
 rtk bunx tsc                     # Smart routing to tsc filter
 rtk deno test                    # Failures only (-90%)
 rtk deno lint                    # Strip download lines + tee recovery
-rtk deno check                   # Type check errors only
+rtk deno check                   # Strip download lines + tee recovery
 ```
 
 ### AWS

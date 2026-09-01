@@ -52,18 +52,20 @@ pub fn run_check(args: &[String], verbose: u8) -> Result<i32> {
 pub fn run_compile(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("deno");
     cmd.arg("compile").args(args);
-    let display = format!("deno compile {}", args.join(" "));
-    crate::core::runner::run_err_cmd(cmd, display.trim_end(), verbose)
+    let display = format!("compile {}", args.join(" "));
+    crate::core::runner::run_err_cmd(cmd, "deno", display.trim_end(), "deno_compile", verbose)
 }
 
 /// Run `deno test` showing only failures. Args are passed as a vector, never via a shell.
 pub fn run_test(args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = resolved_command("deno");
     cmd.arg("test").args(args);
-    let display = format!("deno test {}", args.join(" "));
+    let display = format!("test {}", args.join(" "));
     crate::core::runner::run_test_cmd(
         cmd,
+        "deno",
         display.trim_end(),
+        "deno_test",
         crate::core::runner::TestEcosystem::Deno,
         verbose,
     )

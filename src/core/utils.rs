@@ -387,6 +387,10 @@ pub fn detect_package_manager() -> &'static str {
         "pnpm"
     } else if std::path::Path::new("yarn.lock").exists() {
         "yarn"
+    } else if std::path::Path::new("bun.lockb").exists()
+        || std::path::Path::new("bun.lock").exists()
+    {
+        "bun"
     } else {
         "npm"
     }
@@ -408,6 +412,11 @@ pub fn package_manager_exec(tool: &str) -> Command {
             "yarn" => {
                 let mut c = resolved_command("yarn");
                 c.arg("exec").arg("--").arg(tool);
+                c
+            }
+            "bun" => {
+                let mut c = resolved_command("bunx");
+                c.arg(tool);
                 c
             }
             _ => {
@@ -1571,5 +1580,16 @@ mod tests {
         // 0o7777 permission range this function masks to — those must not affect
         // the comparison either way.
         assert!(mode_already_correct(0o100600, 0o600));
+    }
+
+    #[test]
+    fn test_detect_package_manager_recognizes_bun() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(dir.path()).expect("chdir");
+        std::fs::write("bun.lockb", "").expect("write lockfile");
+        let detected = detect_package_manager();
+        std::env::set_current_dir(prev).expect("restore cwd");
+        assert_eq!(detected, "bun");
     }
 }

@@ -103,6 +103,15 @@ pub fn exec(args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
     run_filtered("npx", args, verbose, skip_env)
 }
 
+/// Run an arbitrary package runner (`npx`, `bunx`) under the npm output filter.
+///
+/// This is the light line filter, not the errors-only one: these runners host
+/// tools whose entire value is their stdout, so dropping non-error lines would
+/// return nothing.
+pub fn exec_with(runner: &str, args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
+    run_filtered(runner, args, verbose, skip_env)
+}
+
 /// Shared command-execution path for `run` (npm) and `exec` (npx).
 ///
 /// Builds the resolved command, appends args, applies `SKIP_ENV_VALIDATION`,

@@ -388,16 +388,26 @@ impl StreamFilter for ErrorStreamFilter {
 
 /// Run a prebuilt command (no shell) and filter output to show only errors/warnings.
 /// `display` is used only for logging, tee keys, and tracking, never executed.
-pub fn run_err_cmd(cmd: Command, display: &str, verbose: u8) -> Result<i32> {
+///
+/// `tool` is the command the user actually ran. It keys tracking and the tee
+/// slug, so passing a real name keeps `rtk gain --history` showing invocations
+/// that exist and stops recovery files colliding across ecosystems.
+pub fn run_err_cmd(
+    cmd: Command,
+    tool: &str,
+    display: &str,
+    tee_label: &str,
+    verbose: u8,
+) -> Result<i32> {
     if verbose > 0 {
-        eprintln!("Running: {}", display);
+        eprintln!("Running: {} {}", tool, display);
     }
     run_streamed(
         cmd,
-        "err",
+        tool,
         display,
         Box::new(ErrorStreamFilter::new()),
-        RunOptions::with_tee("err"),
+        RunOptions::with_tee(tee_label),
     )
 }
 
@@ -443,16 +453,23 @@ impl TestEcosystem {
 
 /// Run a prebuilt test command (no shell), showing only failures.
 /// `display` is used only for logging and tracking, never executed.
-pub fn run_test_cmd(cmd: Command, display: &str, eco: TestEcosystem, verbose: u8) -> Result<i32> {
+pub fn run_test_cmd(
+    cmd: Command,
+    tool: &str,
+    display: &str,
+    tee_label: &str,
+    eco: TestEcosystem,
+    verbose: u8,
+) -> Result<i32> {
     if verbose > 0 {
-        eprintln!("Running tests: {}", display);
+        eprintln!("Running tests: {} {}", tool, display);
     }
     run_filtered(
         cmd,
-        "test",
+        tool,
         display,
         move |raw| extract_test_summary(raw, eco),
-        RunOptions::with_tee("test"),
+        RunOptions::with_tee(tee_label),
     )
 }
 
