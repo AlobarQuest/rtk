@@ -673,13 +673,18 @@ pub const RULES: &[RtkRule] = &[
     },
     // Bun/Deno
     RtkRule {
-        pattern: r"^bun\s+(install|add|remove|test|build|run|pm|x)\b",
+        pattern: r"^bun\s+(install|add|remove|test|build|run|pm\s+ls|pm|x)\b",
         rtk_cmd: "rtk bun",
         rewrite_prefixes: &["bun"],
         category: "PackageManager",
         savings_pct: 75.0,
-        subcmd_savings: &[("test", 90.0), ("install", 80.0)],
-        subcmd_status: &[("run", RtkStatus::Passthrough)],
+        subcmd_savings: &[("test", 90.0), ("install", 80.0), ("pm ls", 70.0)],
+        // "pm ls" is filtered; every other "bun pm" subcommand is passthrough,
+        // which is why the pattern captures the two-word form separately.
+        subcmd_status: &[
+            ("run", RtkStatus::Passthrough),
+            ("pm", RtkStatus::Passthrough),
+        ],
         ..RtkRule::DEFAULT
     },
     RtkRule {
@@ -691,7 +696,7 @@ pub const RULES: &[RtkRule] = &[
         ..RtkRule::DEFAULT
     },
     RtkRule {
-        pattern: r"^deno\s+(test|lint|check|run|task|compile|install)",
+        pattern: r"^deno\s+(test|lint|check|run|task|compile|install)\b",
         rtk_cmd: "rtk deno",
         rewrite_prefixes: &["deno"],
         category: "Build",
@@ -700,6 +705,7 @@ pub const RULES: &[RtkRule] = &[
         subcmd_status: &[
             ("run", RtkStatus::Passthrough),
             ("task", RtkStatus::Passthrough),
+            ("install", RtkStatus::Passthrough),
         ],
         ..RtkRule::DEFAULT
     },

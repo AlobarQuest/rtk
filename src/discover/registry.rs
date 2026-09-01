@@ -169,7 +169,14 @@ pub fn classify_command(cmd: &str) -> Classification {
         // Extract subcommand for savings override and status detection
         let (savings, status) = if let Some(caps) = COMPILED[idx].captures(cmd_clean) {
             if let Some(sub) = caps.get(1) {
-                let subcmd = sub.as_str();
+                // Collapse internal whitespace so a two-word capture ("pm  ls")
+                // still matches its single-spaced key in the tables below.
+                let subcmd_owned = sub
+                    .as_str()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let subcmd = subcmd_owned.as_str();
                 // Check if this subcommand has a special status
                 let status = rule
                     .subcmd_status
@@ -3416,6 +3423,48 @@ mod tests {
             rewrite_command_no_prefixes("bun x tsc --noEmit", &[]),
             Some("rtk bun x tsc --noEmit".into())
         );
+    }
+
+    /// Status and savings a rule assigns to a command, for the passthrough
+    /// accounting tests below.
+    fn status_and_savings(cmd: &str) -> (RtkStatus, f64) {
+        match classify_command(cmd) {
+            Classification::Supported {
+                status,
+                estimated_savings_pct,
+                ..
+            } => (status, estimated_savings_pct),
+            other => panic!("expected Supported for {cmd}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_deno_pattern_does_not_match_subcommand_prefixes() {
+        // Without a trailing \b, "deno taskfoo" matches the "task" alternative.
+        assert_eq!(rewrite_command_no_prefixes("deno taskfoo", &[]), None);
+        assert_eq!(rewrite_command_no_prefixes("deno testify", &[]), None);
+        assert_eq!(
+            rewrite_command_no_prefixes("deno task build", &[]),
+            Some("rtk deno task build".into())
+        );
+    }
+
+    #[test]
+    fn test_passthrough_subcommands_claim_no_savings() {
+        // deno install and bun pm <non-ls> run unfiltered, so discover must not
+        // credit them with the rule's headline savings.
+        let (status, _) = status_and_savings("deno install npm:cowsay");
+        assert_eq!(status, RtkStatus::Passthrough);
+        let (status, _) = status_and_savings("bun pm cache rm");
+        assert_eq!(status, RtkStatus::Passthrough);
+
+        // The filtered forms are still credited.
+        let (status, savings) = status_and_savings("bun pm ls");
+        assert_eq!(status, RtkStatus::Existing);
+        assert_eq!(savings, 70.0);
+        let (status, savings) = status_and_savings("deno test");
+        assert_eq!(status, RtkStatus::Existing);
+        assert_eq!(savings, 90.0);
     }
 
     #[test]
