@@ -5,6 +5,100 @@ All notable changes to rtk (Rust Token Killer) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.47.0](https://github.com/rtk-ai/rtk/compare/v0.46.0...v0.47.0) (2026-09-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **grep:** `rtk grep --file-type` and its `-t` short are removed. The option never reached the engine, so it was a silent no-op; `-t` now flows through, which means `rtk rg -t rust` filters by type while `rtk grep -t rust` returns grep's own `invalid option -- 't'`. `-l` and `-m` under `rtk grep` are likewise the native grep flags now rather than rtk's --max-len and --max.
+
+### Features
+
+* **ctest:** add compact output filter ([c75522e](https://github.com/rtk-ai/rtk/commit/c75522e200d6133bca79ef2ba777c29ae9b1df6d))
+* **ctest:** add compact output filter ([ab48a68](https://github.com/rtk-ai/rtk/commit/ab48a6836ea18bdfd0dc1e76e7f060d2ca10f141))
+* **ls:** cap listing with tee tail hint and standard dotfile semantics ([aa40853](https://github.com/rtk-ai/rtk/commit/aa408534859949ebac1dcc82ec4d25b575a539fa))
+* **mvn:** add rtk mvnd support for Maven Daemon ([774465e](https://github.com/rtk-ai/rtk/commit/774465e379a4b723b1239ec0ea1b04c413ed0f10))
+* **phpt:** add PHP .phpt filter for php-src run-tests.php (-99%) ([e8541d1](https://github.com/rtk-ai/rtk/commit/e8541d1e1180f7ef4c736322cedc8e834f2f8f77))
+
+
+### Bug Fixes
+
+* address review feedback on classic diff fallback ([d1a0d9c](https://github.com/rtk-ai/rtk/commit/d1a0d9c2c1bba186fb111f82f8f0e6cec921d71a))
+* **benchmark:** assert the find --max cap, count its baseline once ([9b16854](https://github.com/rtk-ai/rtk/commit/9b1685497524daae34ab56304d23068d788c17a8))
+* **benchmark:** compare find --max against full find, not head -N ([475f9dd](https://github.com/rtk-ai/rtk/commit/475f9ddfc20dbce4dab206329a36d8303cd9aa09))
+* **bench:** stop benchmarking a grep command that errors ([901838d](https://github.com/rtk-ai/rtk/commit/901838ddae373deb7d3c8460d7f97feab2f7577d))
+* **bom:** degrade gracefully on unparseable Gemini settings, strip BOM on claude/gemini hook stdin and rtk json fallback ([b6f354c](https://github.com/rtk-ai/rtk/commit/b6f354ca870d7bab30ad439efbf62926f6d9e5af))
+* **ctest:** address review round 2 ([4147e99](https://github.com/rtk-ai/rtk/commit/4147e99aa3ee4487e5327cdc0ade33363b1672cf))
+* **ctest:** address review round 3 ([87702bf](https://github.com/rtk-ai/rtk/commit/87702bf339e77125213865bac185a017f4cc830b))
+* **ctest:** take the run total from the first result line and keep unparsed failures ([acbde6e](https://github.com/rtk-ai/rtk/commit/acbde6e4431e0f9ab23be2c7ccf04b2f0eda65db))
+* **ctest:** validate framing lines and tee the failed section once ([6cf56a9](https://github.com/rtk-ai/rtk/commit/6cf56a9c830e786964966a66c991c3923224e14d))
+* **ctest:** validate result lines by run total and bypass dashboard modes ([ffe1d45](https://github.com/rtk-ai/rtk/commit/ffe1d453c276799673ac99331ccee8b7cb033efa))
+* **ctest:** validate the summary, keep reasons and trailers intact, size the caps ([143dc8c](https://github.com/rtk-ai/rtk/commit/143dc8cf239a80bea3a6f68196fef62bfa5de40c))
+* **diff:** keep +/- markers at column 0 in condense_unified_diff ([cf6d99d](https://github.com/rtk-ai/rtk/commit/cf6d99df7619a359e849b9669c4f1972f2c8567a))
+* **diff:** keep +/- markers at column 0 in condense_unified_diff ([ca85483](https://github.com/rtk-ai/rtk/commit/ca85483cbcd552548711105bbd429fb4bfc5e70c))
+* **diff:** measure savings against the classic diff, not a dump of both files ([8495176](https://github.com/rtk-ai/rtk/commit/8495176c941f8e02df128320055547839ed0ab2a))
+* **diff:** remove misleading overflow indicator from condense_unified_diff ([947467e](https://github.com/rtk-ai/rtk/commit/947467ebe285db55d0bf9206db36c773f3ff443f))
+* emit classic hunk headers in the diff fallback ([1246ce3](https://github.com/rtk-ai/rtk/commit/1246ce335f4d45e2ed1b011d3df85a604707e322))
+* **filters:** address PR review findings on spring-boot/liquibase/ssh ([cab2283](https://github.com/rtk-ai/rtk/commit/cab228398e7716a62c26aed8fb523f76e06d806b))
+* **filters:** correct spring-boot description and drop plan artifact ([3853c71](https://github.com/rtk-ai/rtk/commit/3853c7170c94d2502953706a3f81c0e614b26b84))
+* **filters:** tighten overly broad spring-boot/liquibase/ssh matching ([0de9610](https://github.com/rtk-ai/rtk/commit/0de9610d443ed1a642101e5c2acf8c6bef03c3d7))
+* **git-diff:** count one truncated line as singular ([75dda6c](https://github.com/rtk-ai/rtk/commit/75dda6c0975c7faebbd95aad5b178b4d222abb23))
+* **git-diff:** decode quoted paths, and read the header kind before splitting ([7409cb5](https://github.com/rtk-ai/rtk/commit/7409cb56337e620fee5754746ccf02efd55cb93e))
+* **git-diff:** emit hunk lines at column 0 so `^-` anchors again ([b166396](https://github.com/rtk-ai/rtk/commit/b16639606f2541a585e83e4cf6cde3836a1f6f29))
+* **git-diff:** emit hunk lines at column 0 so `^-` anchors again ([4e811fb](https://github.com/rtk-ai/rtk/commit/4e811fbb4e847b5aeb1331b90beb0a9fe812a8c9))
+* **git-diff:** end hunks at their declared length, keep context adjacent ([844d6fa](https://github.com/rtk-ai/rtk/commit/844d6fa3d1410ec995dee4bdc59ec4d8007cbed4))
+* **git-diff:** pass word diffs through, and stop guessing at path pairs ([e59276e](https://github.com/rtk-ai/rtk/commit/e59276e5c15976b5afebecc4905f8ac85d0a583e))
+* **git-diff:** reset hunk state on combined diffs, exempt leading context ([5d4b549](https://github.com/rtk-ai/rtk/commit/5d4b5492cfff16dfa9da01ee35704c654d7f44e8))
+* **git-diff:** slice markers as bytes, and bound a combined hunk by every parent ([eac9b99](https://github.com/rtk-ai/rtk/commit/eac9b996d7406a5d11a2c56bcb1d4d49ace2c04e))
+* **git-diff:** stop dropping hunk content that starts with `++` or `--` ([60ec79f](https://github.com/rtk-ai/rtk/commit/60ec79fc4d9752c0268bd96494ba6ca6049777ce))
+* **grep:** free -m for GNU --max-count instead of rtk --max ([d9a5893](https://github.com/rtk-ai/rtk/commit/d9a589389d1bd472328fc9d0f98b22cb3e6328f6))
+* **grep:** repair the smoke assertion this PR invalidated ([187228d](https://github.com/rtk-ai/rtk/commit/187228dc508ebdf7346cc1882b797cd01984553b))
+* **grep:** stop -l and -t shadowing native grep flags ([16228b7](https://github.com/rtk-ai/rtk/commit/16228b74b083f218766e909a8f8c80f3b0e1c171))
+* **grep:** stop -l/-t shadowing native grep flags ([4ea0555](https://github.com/rtk-ai/rtk/commit/4ea0555776509a85f66230cd64cd2005bb3ee764))
+* **hooks,json:** hermetic gemini BOM test, restore serde diagnostics, honest init summary, zero-copy fallback ([ed8b0eb](https://github.com/rtk-ai/rtk/commit/ed8b0eb50e5471345c7eb241b5be2c4120a647de))
+* **hooks:** honor CLAUDE_CONFIG_DIR when loading permission rules ([196780d](https://github.com/rtk-ai/rtk/commit/196780d77cc4172d2c8e262e73eece1e3f553536))
+* **hooks:** honor CLAUDE_CONFIG_DIR when loading permission rules ([f4404cb](https://github.com/rtk-ai/rtk/commit/f4404cbc970c2214b2b9e6fd233f4ca06f89b8ea))
+* **hooks:** honour exclude_commands for head and tail ([7dc503d](https://github.com/rtk-ai/rtk/commit/7dc503d7513af4a4acb78606f734b6d14b07edb8))
+* **hooks:** keep exclude_commands honoured under routable wrappers ([2eed6de](https://github.com/rtk-ai/rtk/commit/2eed6de33644c6907039c704a8d03415122a5a3c))
+* **hooks:** match exclude_commands against the peeled command form ([e533c40](https://github.com/rtk-ai/rtk/commit/e533c40901ec7fc85dd0da69be979113348e234d))
+* **hooks:** match exclude_commands against the peeled command form ([9ba5239](https://github.com/rtk-ai/rtk/commit/9ba523960b2e49d04e172ba3ebbc12c87a1f08c1))
+* **hooks:** strip the BOM on Mistral Vibe hook stdin too ([ac3389a](https://github.com/rtk-ai/rtk/commit/ac3389a5978e2e150e9d126bd8fad589814e7136))
+* **init,utils:** propagate Gemini settings parse errors, add from_json_str wrapper ([dd867b2](https://github.com/rtk-ai/rtk/commit/dd867b24e6ce5dd5cab2dafca8da05f65db78bdb))
+* **json,deps:** tolerate UTF-8 BOM at the remaining JSON parse sites ([7e7be16](https://github.com/rtk-ai/rtk/commit/7e7be1676b8558ca8e39d9918afe80c820485c99))
+* **json,deps:** tolerate UTF-8 BOM at the three remaining JSON parse sites ([a39a872](https://github.com/rtk-ai/rtk/commit/a39a8729ca651563d764c75496aa2ee82b1f0dd3))
+* **ls:** avoid underflow in verbose reduction stat ([2f75c7a](https://github.com/rtk-ai/rtk/commit/2f75c7a7b0a0aefb82bb16a63b1a51cb7da58125))
+* **ls:** record dot noise dirs under -A and track real args ([a7e7329](https://github.com/rtk-ai/rtk/commit/a7e732946dc3b8c6a03e755026d7425023673083))
+* **mvn:** close review findings -- lane routing, summary budgets, mvnd.cmd rewrite ([150845c](https://github.com/rtk-ai/rtk/commit/150845cb66c603ac1ff599dfa5391a19a151cf9e))
+* **mvn:** gate lane routing on daemon mode, repair summary cap, phase-marker generations ([ce26d60](https://github.com/rtk-ai/rtk/commit/ce26d60000dd3bc0af496823d898f52554448413))
+* **mvn:** gate the Building keeper on arrival, phase-key the failures budget, tag-aware quiet mode ([37663ac](https://github.com/rtk-ai/rtk/commit/37663ac11f89d838d8e25e5b340e0e848737ea45))
+* **mvn:** require Surefire's own emission shape to mint a Running lane ([323897b](https://github.com/rtk-ai/rtk/commit/323897b2f463783c19ace1c732d09907fae26fbd))
+* **mvn:** second review round -- root-lane disarm, per-lane summary tails, opener narrowing, drop insta ([9e7e01d](https://github.com/rtk-ai/rtk/commit/9e7e01d7dd04f53506d4bcfd02b9f8c461d54dd0))
+* **phpt:** use LazyLock and RtkRule::DEFAULT so develop builds ([c84288e](https://github.com/rtk-ai/rtk/commit/c84288edfcd767be7aea2e4eba282deaab365acf))
+* **phpt:** use LazyLock and RtkRule::DEFAULT so develop builds ([a419e69](https://github.com/rtk-ai/rtk/commit/a419e691c9b23ab9f32c6fcb10e4ceace678f06e))
+* render a real diff instead of dumping both files for modified lines ([e4b9705](https://github.com/rtk-ai/rtk/commit/e4b9705d506fd5771df5ad16ac2957a1e349e2d9))
+* render a real diff instead of dumping both files for modified lines ([f2780d4](https://github.com/rtk-ai/rtk/commit/f2780d4cea35402e7bf40edb5a624a279f66bb33))
+* **review:** compare fat pointers in render_json, cover droid BOM strip, name files in deps read errors ([9d78af2](https://github.com/rtk-ai/rtk/commit/9d78af249dddf3cbda8a2e781441f3909d13b857))
+* **test:** make the -t smoke assertion actually gate something ([b3ae7be](https://github.com/rtk-ai/rtk/commit/b3ae7be09ed351bc2fbcd983a19afa45da3cb2ac))
+* **tsc:** count global diagnostics and keep the failure head ([6232c37](https://github.com/rtk-ai/rtk/commit/6232c377e8e36acd9ca609df1642dbb1230f16ea))
+* **tsc:** handle pretty diagnostics ([a93d63b](https://github.com/rtk-ai/rtk/commit/a93d63b9b99fbbdded5ce22cb83b9bc032b5b2a5))
+* **tsc:** handle pretty diagnostics ([9d1c60a](https://github.com/rtk-ai/rtk/commit/9d1c60ab4e6d103eee7363486d9ddad548c011d1)), closes [#1772](https://github.com/rtk-ai/rtk/issues/1772) [#3220](https://github.com/rtk-ai/rtk/issues/3220)
+* **tsc:** strip escapes before the blank filter and bound the failure dump ([1906cb2](https://github.com/rtk-ai/rtk/commit/1906cb2d6ee0fbdc019aa96118c988adba10ded9))
+
+
+### Performance Improvements
+
+* **hook:** avoid Pi package barrel import ([322db4d](https://github.com/rtk-ai/rtk/commit/322db4da98219b15608d5b71eddf6338c48d693c))
+
+
+### Miscellaneous Chores
+
+* release 0.47.0 ([fde8b79](https://github.com/rtk-ai/rtk/commit/fde8b79a272713bdbe7314180f8ab4bde99ca957))
+
+
+### Code Refactoring
+
+* **grep:** trim comments and align the siblings of the flag change ([eb3f814](https://github.com/rtk-ai/rtk/commit/eb3f8148726f3725f1de5b3cb546991d2b562df9))
+
 ## [0.46.0](https://github.com/rtk-ai/rtk/compare/v0.45.0...v0.46.0) (2026-08-26)
 
 
