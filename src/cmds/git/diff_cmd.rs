@@ -27,7 +27,7 @@ pub fn run(file1: &Path, file2: &Path, verbose: u8) -> Result<i32> {
     let fallback = format_classic_diff(&diff);
     let both_files = format!("{}\n---\n{}", content1, content2);
 
-    let (rtk, exit_code) = render_diff(file1, file2, &diff, &content1, &content2);
+    let (rtk, exit_code) = render_diff(file1, file2, &diff, content1 == content2);
 
     let shown = select_file_diff_output(&diff, &fallback, &rtk);
     print!("{}", shown);
@@ -44,15 +44,9 @@ fn render_file_header(file1: &Path, file2: &Path) -> String {
     format!("{} → {}\n", file1.display(), file2.display())
 }
 
-fn render_diff(
-    file1: &Path,
-    file2: &Path,
-    diff: &DiffResult,
-    content1: &str,
-    content2: &str,
-) -> (String, i32) {
+fn render_diff(file1: &Path, file2: &Path, diff: &DiffResult, bytes_equal: bool) -> (String, i32) {
     if diff.changes.is_empty() {
-        if content1 == content2 {
+        if bytes_equal {
             return (IDENTICAL_FILES_MESSAGE.to_string(), 0);
         }
         // `str::lines()` strips `\r` and drops a trailing newline, so these
@@ -401,8 +395,7 @@ mod tests {
             Path::new(file1),
             Path::new(file2),
             &diff,
-            content1,
-            content2,
+            content1 == content2,
         )
     }
 
@@ -587,13 +580,8 @@ mod tests {
     fn test_never_worse_fallback_is_a_classic_diff() {
         let diff = compute_diff(&["alpha beta"], &["alpha zzzz"]);
         let fallback = format_classic_diff(&diff);
-        let (rendered, code) = render_diff(
-            Path::new("before"),
-            Path::new("after"),
-            &diff,
-            "alpha beta",
-            "alpha zzzz",
-        );
+        let (rendered, code) =
+            render_diff(Path::new("before"), Path::new("after"), &diff, false);
         let shown = select_file_diff_output(&diff, &fallback, &rendered);
 
         assert_eq!(code, 1);
@@ -622,8 +610,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             &diff,
-            &old_content,
-            &new_content,
+            old_content == new_content,
         );
         let shown = select_file_diff_output(&diff, &fallback, &rendered);
         let baseline = tracking_baseline(&diff, &fallback, &both_files, shown);
