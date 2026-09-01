@@ -1,16 +1,21 @@
 //! Filters bun output — install logs, package lists, and pm commands.
 
-use crate::core::tracking;
-use crate::core::utils::{exit_code_from_output, join_or_ok, resolved_command, strip_ansi, truncate};
-use anyhow::{Context, Result};
+use crate::core::utils::{join_or_ok, resolved_command, strip_ansi, truncate};
+use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
 
 /// JSON structure for `bun pm ls --json` output.
+///
+/// `version` is required on purpose. Serde ignores unknown keys, so an
+/// optional-only struct also accepts a grouped shape like
+/// `{"dependencies": {"express": {...}}}` and reports the group names as
+/// packages. Requiring it makes that shape fail to parse and fall through to
+/// the tree parser instead.
 #[derive(Debug, Deserialize)]
 struct BunPmPackage {
-    version: Option<String>,
+    version: String,
 }
 
 /// Build the argv for `bun <subcmd> <args>`. Specs pass through verbatim:
@@ -62,7 +67,10 @@ pub fn filter_bun_pkg(output: &str) -> String {
             continue;
         }
 
-        result.push(trimmed);
+        // Push the original line, not `trimmed`: bun indents the frames and
+        // hints under each error, and flattening them loses which hint belongs
+        // to which package on a multi-error install.
+        result.push(line);
     }
 
     join_or_ok(&result)
@@ -78,13 +86,7 @@ pub fn filter_bun_pm_ls_json(raw: &str) -> Option<String> {
 
     let mut entries: Vec<String> = packages
         .iter()
-        .map(|(name, pkg)| {
-            if let Some(ver) = &pkg.version {
-                format!("{}@{}", name, ver)
-            } else {
-                name.clone()
-            }
-        })
+        .map(|(name, pkg)| format!("{}@{}", name, pkg.version))
         .collect();
 
     entries.sort();
@@ -127,15 +129,15 @@ fn filter_bun_pm_ls_tree(raw: &str) -> Option<String> {
 }
 
 /// Pick the pm ls parser by what bun actually printed, not by the flags we
-/// passed: JSON if stdout is JSON, tree if it is a tree, raw text otherwise.
-fn filter_bun_pm_ls(stdout: &str, combined: &str) -> String {
-    if let Some(json_result) = filter_bun_pm_ls_json(stdout) {
+/// passed: JSON if the output is JSON, tree if it is a tree, raw text otherwise.
+fn filter_bun_pm_ls(raw: &str) -> String {
+    if let Some(json_result) = filter_bun_pm_ls_json(raw) {
         return json_result;
     }
-    if let Some(tree_result) = filter_bun_pm_ls_tree(stdout) {
+    if let Some(tree_result) = filter_bun_pm_ls_tree(raw) {
         return tree_result;
     }
-    filter_bun_pm_ls_text(combined)
+    filter_bun_pm_ls_text(raw)
 }
 
 /// Text fallback for `bun pm ls`.
@@ -146,9 +148,12 @@ pub fn filter_bun_pm_ls_text(raw: &str) -> String {
 }
 
 /// Run `bun install`, `bun add`, or `bun remove` with filtered output.
+///
+/// Goes through the shared core runner so stdout and stderr stay interleaved
+/// in the order bun wrote them (bun puts progress on stderr), and so tracking
+/// records the output that was actually shown rather than the pre-guard filter
+/// result.
 pub fn run_pkg(subcmd: &str, args: &[String], verbose: u8) -> Result<i32> {
-    let timer = tracking::TimedExecution::start();
-
     let mut cmd = resolved_command("bun");
     cmd.args(pkg_argv(subcmd, args));
 
@@ -156,38 +161,18 @@ pub fn run_pkg(subcmd: &str, args: &[String], verbose: u8) -> Result<i32> {
         eprintln!("Running: bun {} {}", subcmd, args.join(" "));
     }
 
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to run bun {}. Is bun installed?", subcmd))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
-
-    // Filter the combined stream so warnings on stderr survive a passing run.
-    let filtered = filter_bun_pkg(&combined);
-    let exit_code = exit_code_from_output(&output, "bun");
-    crate::core::runner::print_with_hint(
-        &filtered,
-        &combined,
-        &combined,
-        &format!("bun_{}", subcmd),
-        exit_code,
-    );
-
-    timer.track(
-        &format!("bun {} {}", subcmd, args.join(" ")),
-        &format!("rtk bun {} {}", subcmd, args.join(" ")),
-        &combined,
-        &filtered,
-    );
-
-    Ok(exit_code)
+    let display = format!("{} {}", subcmd, args.join(" "));
+    let tee_label = format!("bun_{}", subcmd);
+    crate::core::runner::run_filtered(
+        cmd,
+        "bun",
+        display.trim_end(),
+        filter_bun_pkg,
+        crate::core::runner::RunOptions::with_tee(&tee_label),
+    )
 }
 
 pub fn run_pm_ls(args: &[String], verbose: u8) -> Result<i32> {
-    let timer = tracking::TimedExecution::start();
-
     let mut cmd = resolved_command("bun");
     cmd.arg("pm").arg("ls");
     if !args.iter().any(|a| a == "--json") {
@@ -201,29 +186,14 @@ pub fn run_pm_ls(args: &[String], verbose: u8) -> Result<i32> {
         eprintln!("Running: bun pm ls --json {}", args.join(" "));
     }
 
-    let output = cmd
-        .output()
-        .context("Failed to run bun pm ls. Is bun installed?")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
-
-    // Structured output lives on stdout; the text fallback reads the combined
-    // stream so errors survive.
-    let filtered = filter_bun_pm_ls(&stdout, &combined);
-
-    let exit_code = exit_code_from_output(&output, "bun");
-    crate::core::runner::print_with_hint(&filtered, &combined, &combined, "bun_pm_ls", exit_code);
-
-    timer.track(
-        &format!("bun pm ls {}", args.join(" ")),
-        &format!("rtk bun pm ls {}", args.join(" ")),
-        &combined,
-        &filtered,
-    );
-
-    Ok(exit_code)
+    let display = format!("pm ls {}", args.join(" "));
+    crate::core::runner::run_filtered(
+        cmd,
+        "bun",
+        display.trim_end(),
+        filter_bun_pm_ls,
+        crate::core::runner::RunOptions::with_tee("bun_pm_ls"),
+    )
 }
 
 /// Run `bun build` with error-only filtering. Args are passed as a vector, never via a shell.
@@ -420,16 +390,38 @@ error: PackageNotFound - "nonexistent-pkg" not found in registry
         // passed: tree text must never hit the JSON parser's 500-char
         // truncation fallback.
         let raw = include_str!("../../../tests/fixtures/bun_pm_ls_raw.txt");
-        let out = filter_bun_pm_ls(raw, raw);
+        let out = filter_bun_pm_ls(raw);
         assert!(out.starts_with("6 deps"), "{out}");
 
         let json = r#"{"express": {"version": "4.18.2"}}"#;
-        let out = filter_bun_pm_ls(json, json);
+        let out = filter_bun_pm_ls(json);
         assert!(out.starts_with("1 deps"), "{out}");
 
         let err = "error: No package.json was found for directory \"/home/user\"\nnote: Run \"bun init\" to initialize a project";
-        let out = filter_bun_pm_ls("", err);
+        let out = filter_bun_pm_ls(err);
         assert!(out.contains("No package.json"), "{out}");
+    }
+
+    #[test]
+    fn test_filter_bun_pm_ls_json_rejects_grouped_shape() {
+        // Group names are not packages. Without a required `version`, serde
+        // accepts this and reports "dependencies"/"devDependencies" as deps.
+        let grouped = r#"{"dependencies": {"express": {"version": "4.18.2"}}, "devDependencies": {"vitest": {"version": "1.0.0"}}}"#;
+        assert!(filter_bun_pm_ls_json(grouped).is_none());
+        // It falls through to the raw text fallback rather than reporting the
+        // two group names as a confident dependency list.
+        let out = filter_bun_pm_ls(grouped);
+        assert!(!out.starts_with("2 deps"), "{out}");
+    }
+
+    #[test]
+    fn test_filter_bun_pkg_keeps_indentation() {
+        let raw = "bun install v1.3.6
+error: failed to resolve left-pad
+    hint: check the registry
+";
+        let out = filter_bun_pkg(raw);
+        assert!(out.contains("    hint: check the registry"), "{out}");
     }
 
     #[test]
