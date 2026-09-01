@@ -96,6 +96,22 @@ Patterns match against the full command after stripping env prefixes (`sudo`, `V
 
 Subcommand patterns work too: `"git push"` excludes `git push origin main` but not `git status`.
 
+An entry names a tool RTK has a filter for, and that tool is covered however it is invoked.
+Before matching, RTK peels the wrapper, interpreter or path off the command and matches what is
+left, so `"playwright"` excludes `playwright test`, `npx playwright test` and
+`pnpm exec playwright test` alike; `"pytest"` also covers `python3 -m pytest tests/`, and
+`"phpunit"` covers `vendor/bin/phpunit` and `php vendor/bin/phpunit`.
+
+A tool RTK has no filter of its own for is matched as typed, because RTK only sees the wrapper:
+with `["my-tool"]`, `npx my-tool` still rewrites to `rtk npx my-tool`. Exclude `"npx"` to stop
+that.
+
+The arguments are kept when peeling, so an anchored pattern still narrows the way you wrote it:
+`"^ls$"` excludes a bare `ls` without swallowing `ls -la`. Matching stays exact — `"go"` never
+excludes `golangci-lint`, subcommand patterns stay literal (`"git push"` does not widen to all of
+`git`), and an entry never leaks to a different tool that happens to share an RTK filter: `"read"`
+does not exclude `cat`, and `"eslint"` does not exclude `biome`.
+
 Patterns starting with `^` are treated as regex:
 
 ```toml

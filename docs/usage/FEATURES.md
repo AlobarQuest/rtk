@@ -1232,6 +1232,12 @@ Pour empecher certaines commandes d'etre reecrites, ajoutez-les dans `config.tom
 exclude_commands = ["curl", "playwright"]
 ```
 
+Le motif est ancre en debut de commande : `"curl"` exclut `curl https://...` mais pas `curl-config`.
+Avant la comparaison, RTK retire le wrapper, l'interpreteur ou le chemin, donc `"playwright"` couvre
+`playwright test` comme `npx playwright test` ou `pnpm exec playwright test`, et `"pytest"` couvre
+aussi `python3 -m pytest tests/`. Les arguments sont conserves : `"^ls$"` exclut `ls` seul sans
+englober `ls -la`.
+
 ---
 
 ## Configuration
