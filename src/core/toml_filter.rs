@@ -2032,6 +2032,21 @@ match_command = "^make\\b"
         );
     }
 
+    /// Verify that every built-in filter's match_command starts with `^`.
+    /// Prevents substring misfires where an unanchored match matches a subcommand or path in the middle of a command line.
+    #[test]
+    fn test_builtin_all_filters_match_command_anchored() {
+        let filters = make_filters(BUILTIN_TOML);
+        for filter in &filters {
+            assert!(
+                filter.match_regex.as_str().starts_with('^'),
+                "Filter '{}' has match_command '{}' which does not start with '^'",
+                filter.name,
+                filter.match_regex.as_str()
+            );
+        }
+    }
+
     /// Verify that every built-in filter has at least one inline test.
     /// Prevents shipping filters with zero test coverage.
     #[test]

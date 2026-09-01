@@ -6012,4 +6012,20 @@ mod tests {
             "pest"
         );
     }
+
+    #[test]
+    fn test_rewrite_liquibase_wrapper_and_paths() {
+        assert_eq!(
+            rewrite_command_no_prefixes("timeout 5 /usr/bin/liquibase update", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("nohup /opt/tools/liquibase update", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("liquibase update", &[]),
+            Some("rtk liquibase update".into())
+        );
+    }
 }
