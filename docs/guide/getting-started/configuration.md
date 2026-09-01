@@ -96,11 +96,19 @@ Patterns match against the full command after stripping env prefixes (`sudo`, `V
 
 Subcommand patterns work too: `"git push"` excludes `git push origin main` but not `git status`.
 
-An entry names a tool RTK has a filter for, and that tool is covered however it is invoked.
-Before matching, RTK peels the wrapper, interpreter or path off the command and matches what is
-left, so `"playwright"` excludes `playwright test`, `npx playwright test` and
-`pnpm exec playwright test` alike; `"pytest"` also covers `python3 -m pytest tests/`, and
-`"phpunit"` covers `vendor/bin/phpunit` and `php vendor/bin/phpunit`.
+An entry names a tool RTK has a filter for, and covers the wrapper, interpreter and path spellings
+of it. Before matching, RTK peels those off the command and matches what is left, so
+`"playwright"` excludes `playwright test`, `npx playwright test` and `pnpm exec playwright test`
+alike; `"pytest"` also covers `python3 -m pytest tests/`, and `"phpunit"` covers
+`vendor/bin/phpunit` and `php vendor/bin/phpunit`.
+
+Three spellings are not peeled yet, and still rewrite despite a matching entry:
+
+| Entry | Command | Why |
+|---|---|---|
+| `"head"`, `"tail"` | `head -20 f`, `tail -n 5 f` | The line-range form takes a fast path that returns before the exclusion is consulted ([#2823](https://github.com/rtk-ai/rtk/issues/2823)). Without a line range, `head f` is excluded normally. |
+| `"gradlew"`, `"mvn"` | `gradlew.bat build`, `mvnw.cmd test` | Path stripping splits on `/`, so a `.bat`/`.cmd` spelling never reduces to the tool name. `./gradlew` and `gradlew` are both excluded ([#3617](https://github.com/rtk-ai/rtk/pull/3617)). |
+| `"golangci-lint"` | `golangci run ./...` | `golangci run` is one of the rule's own aliases and is kept whole, so it does not match the `golangci-lint` entry. Exclude `"golangci"` as well to cover it. |
 
 A tool RTK has no filter of its own for is matched as typed, because RTK only sees the wrapper:
 with `["my-tool"]`, `npx my-tool` still rewrites to `rtk npx my-tool`. Exclude `"npx"` to stop
