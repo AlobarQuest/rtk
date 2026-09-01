@@ -142,7 +142,11 @@ fn filter_bun_pm_ls(raw: &str) -> String {
 
 /// Text fallback for `bun pm ls`.
 pub fn filter_bun_pm_ls_text(raw: &str) -> String {
-    let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    // Strip first, like the JSON and tree paths: this is the path error output
+    // takes, bun colorizes it, and the 500-char budget would otherwise be spent
+    // on escape sequences and could cut one in half.
+    let cleaned = strip_ansi(raw);
+    let lines: Vec<&str> = cleaned.lines().filter(|l| !l.trim().is_empty()).collect();
 
     truncate(&join_or_ok(&lines), 500)
 }
@@ -450,6 +454,14 @@ error: PackageNotFound - "nonexistent-pkg" not found in registry
                 "{flag}"
             );
         }
+    }
+
+    #[test]
+    fn test_filter_bun_pm_ls_text_strips_ansi() {
+        let raw = "\x1b[31merror: No package.json was found\x1b[0m\n\x1b[2mnote: Run bun init\x1b[0m";
+        let out = filter_bun_pm_ls_text(raw);
+        assert!(!out.contains('\x1b'), "{out:?}");
+        assert!(out.contains("No package.json"), "{out}");
     }
 
     #[test]

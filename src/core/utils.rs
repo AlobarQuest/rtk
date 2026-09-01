@@ -383,13 +383,17 @@ pub fn count_tokens(text: &str) -> usize {
 /// ```
 #[allow(dead_code)]
 pub fn detect_package_manager() -> &'static str {
-    if std::path::Path::new("pnpm-lock.yaml").exists() {
+    detect_package_manager_in(std::path::Path::new("."))
+}
+
+/// Lockfile detection against an explicit directory, so callers (and tests) do
+/// not have to move the process's current directory to ask the question.
+pub fn detect_package_manager_in(dir: &std::path::Path) -> &'static str {
+    if dir.join("pnpm-lock.yaml").exists() {
         "pnpm"
-    } else if std::path::Path::new("yarn.lock").exists() {
+    } else if dir.join("yarn.lock").exists() {
         "yarn"
-    } else if std::path::Path::new("bun.lockb").exists()
-        || std::path::Path::new("bun.lock").exists()
-    {
+    } else if dir.join("bun.lockb").exists() || dir.join("bun.lock").exists() {
         "bun"
     } else {
         "npm"
@@ -399,10 +403,23 @@ pub fn detect_package_manager() -> &'static str {
 /// Build a Command using the detected package manager's exec mechanism.
 /// Returns a Command ready to have tool-specific args appended.
 pub fn package_manager_exec(tool: &str) -> Command {
+    tool_exec(None, tool)
+}
+
+/// Build a Command that runs `tool`, preferring the package runner the user
+/// actually named over lockfile detection.
+///
+/// RTK forwards what was typed rather than substituting an engine for it: a
+/// user who types `bunx tsc` must not get `pnpm` because a lockfile is present.
+/// Detection applies only when nothing was named, as with a bare `rtk tsc`.
+pub fn tool_exec(runner: Option<&str>, tool: &str) -> Command {
     if tool_exists(tool) {
         resolved_command(tool)
     } else {
-        let pm = detect_package_manager();
+        let pm: &str = match runner {
+            Some(named) => named,
+            None => detect_package_manager(),
+        };
         match pm {
             "pnpm" => {
                 let mut c = resolved_command("pnpm");
@@ -414,7 +431,7 @@ pub fn package_manager_exec(tool: &str) -> Command {
                 c.arg("exec").arg("--").arg(tool);
                 c
             }
-            "bun" => {
+            "bun" | "bunx" => {
                 let mut c = resolved_command("bunx");
                 c.arg(tool);
                 c
@@ -1584,12 +1601,10 @@ mod tests {
 
     #[test]
     fn test_detect_package_manager_recognizes_bun() {
+        // Asks about an explicit directory: chdir is process-global and would
+        // race the other tests in this binary that assert on the real cwd.
         let dir = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(dir.path()).expect("chdir");
-        std::fs::write("bun.lockb", "").expect("write lockfile");
-        let detected = detect_package_manager();
-        std::env::set_current_dir(prev).expect("restore cwd");
-        assert_eq!(detected, "bun");
+        std::fs::write(dir.path().join("bun.lockb"), "").expect("write lockfile");
+        assert_eq!(detect_package_manager_in(dir.path()), "bun");
     }
 }

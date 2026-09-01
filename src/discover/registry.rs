@@ -3459,6 +3459,9 @@ mod tests {
         assert_eq!(status, RtkStatus::Passthrough);
 
         // The filtered forms are still credited.
+        let (status, _) = status_and_savings("bun build ./index.ts");
+        assert_eq!(status, RtkStatus::Passthrough);
+
         let (status, savings) = status_and_savings("bun pm ls");
         assert_eq!(status, RtkStatus::Existing);
         assert_eq!(savings, 70.0);

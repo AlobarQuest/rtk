@@ -3,9 +3,7 @@
 use crate::core::runner;
 use crate::core::stream::{BlockHandler, BlockStreamFilter};
 use crate::core::truncate::{reduced, CAP_WARNINGS};
-use crate::core::utils::{
-    detect_package_manager, package_manager_exec, strip_ansi, tool_exists, truncate,
-};
+use crate::core::utils::{detect_package_manager, strip_ansi, tool_exec, tool_exists, truncate};
 use anyhow::Result;
 use regex::Regex;
 use std::borrow::Cow;
@@ -78,24 +76,28 @@ fn clean_line(line: &str) -> Cow<'_, str> {
     }
 }
 
-pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+/// `runner` is the package runner the user named (`bunx tsc`, `npx tsc`), or
+/// None for a bare `rtk tsc` where nothing was specified and detection applies.
+pub fn run(runner: Option<&str>, args: &[String], verbose: u8) -> Result<i32> {
     let tsc_exists = tool_exists("tsc");
 
-    // Fall back through the project's own package manager rather than always
-    // npx: a bun-only project has no npx to fall back to.
-    let mut cmd = package_manager_exec("tsc");
+    let mut cmd = tool_exec(runner, "tsc");
 
     for arg in args {
         cmd.arg(arg);
     }
 
     if verbose > 0 {
-        let tool = if tsc_exists {
+        let via = if tsc_exists {
             "tsc".to_string()
         } else {
-            format!("{} tsc", detect_package_manager())
+            let via: &str = match runner {
+                Some(named) => named,
+                None => detect_package_manager(),
+            };
+            format!("{} tsc", via)
         };
-        eprintln!("Running: {} {}", tool, args.join(" "));
+        eprintln!("Running: {} {}", via, args.join(" "));
     }
 
     runner::run_streamed(

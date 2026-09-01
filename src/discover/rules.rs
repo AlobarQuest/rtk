@@ -679,11 +679,15 @@ pub const RULES: &[RtkRule] = &[
         category: "PackageManager",
         savings_pct: 75.0,
         subcmd_savings: &[("test", 90.0), ("install", 80.0), ("pm ls", 70.0)],
-        // "pm ls" is filtered; every other "bun pm" subcommand is passthrough,
-        // which is why the pattern captures the two-word form separately.
+        // Audited against what each subcommand actually does. "pm ls" is
+        // filtered and every other "bun pm" is passthrough, which is why the
+        // pattern captures the two-word form separately. "build" writes its
+        // bundle to stdout unless an output flag is present, so its common form
+        // runs unfiltered and it cannot claim the headline number.
         subcmd_status: &[
             ("run", RtkStatus::Passthrough),
             ("pm", RtkStatus::Passthrough),
+            ("build", RtkStatus::Passthrough),
         ],
         ..RtkRule::DEFAULT
     },
@@ -702,6 +706,8 @@ pub const RULES: &[RtkRule] = &[
         category: "Build",
         savings_pct: 75.0,
         subcmd_savings: &[("test", 90.0), ("lint", 80.0)],
+        // Audited alongside the bun rule above: test, lint, check and compile
+        // are filtered, the rest run unchanged.
         subcmd_status: &[
             ("run", RtkStatus::Passthrough),
             ("task", RtkStatus::Passthrough),
