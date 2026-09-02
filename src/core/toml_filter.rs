@@ -2032,19 +2032,64 @@ match_command = "^make\\b"
         );
     }
 
-    /// Verify that every built-in filter's match_command starts with `^`.
-    /// Prevents substring misfires where an unanchored match matches a subcommand or path in the middle of a command line.
+    /// Verify that every built-in filter is anchored across every top-level branch.
     #[test]
     fn test_builtin_all_filters_match_command_anchored() {
+        fn has_top_level_alternation(pattern: &str) -> bool {
+            let mut depth = 0;
+            let mut escaped = false;
+            let mut in_class = false;
+
+            for character in pattern.chars() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match character {
+                    '\\' => escaped = true,
+                    '[' if !in_class => in_class = true,
+                    ']' if in_class => in_class = false,
+                    '(' if !in_class => depth += 1,
+                    ')' if !in_class => depth -= 1,
+                    '|' if !in_class && depth == 0 => return true,
+                    _ => {}
+                }
+            }
+
+            false
+        }
+
         let filters = make_filters(BUILTIN_TOML);
         for filter in &filters {
+            let pattern = filter.match_regex.as_str();
             assert!(
-                filter.match_regex.as_str().starts_with('^'),
-                "Filter '{}' has match_command '{}' which does not start with '^'",
+                pattern.starts_with('^') && !has_top_level_alternation(pattern),
+                "Filter '{}' has match_command '{}' with an unanchored top-level branch",
                 filter.name,
-                filter.match_regex.as_str()
+                pattern
             );
         }
+
+        assert!(has_top_level_alternation(r"^liquibase\b|/liquibase\b"));
+        assert!(!has_top_level_alternation(r"^(liquibase\b|/liquibase\b)"));
+    }
+
+    #[test]
+    fn test_builtin_liquibase_filter_does_not_match_wrapped_or_path_commands() {
+        let filters = make_filters(BUILTIN_TOML);
+        let liquibase = filters
+            .iter()
+            .find(|filter| filter.name == "liquibase")
+            .expect("built-in liquibase filter should exist");
+
+        assert!(liquibase.match_regex.is_match("liquibase update"));
+        assert!(!liquibase
+            .match_regex
+            .is_match("timeout 5 /usr/bin/liquibase update"));
+        assert!(!liquibase
+            .match_regex
+            .is_match("nohup /opt/tools/liquibase update"));
+        assert!(!liquibase.match_regex.is_match("/usr/bin/liquibase update"));
     }
 
     /// Verify that every built-in filter has at least one inline test.

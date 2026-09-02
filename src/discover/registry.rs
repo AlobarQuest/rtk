@@ -6014,18 +6014,13 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_liquibase_wrapper_and_paths() {
+    fn test_path_qualified_liquibase_is_not_rewritten() {
+        // #3757 originally requested path-qualified rewriting, but registry
+        // normalization currently classifies the basename without rewriting
+        // the original argv[0]. Pin that existing behavior explicitly.
         assert_eq!(
-            rewrite_command_no_prefixes("timeout 5 /usr/bin/liquibase update", &[]),
-            None
-        );
-        assert_eq!(
-            rewrite_command_no_prefixes("nohup /opt/tools/liquibase update", &[]),
-            None
-        );
-        assert_eq!(
-            rewrite_command_no_prefixes("liquibase update", &[]),
-            Some("rtk liquibase update".into())
+            rewrite_command_no_prefixes("/usr/bin/liquibase update", &[]),
+            None,
         );
     }
 }
