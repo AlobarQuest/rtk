@@ -6,21 +6,33 @@ const TELEMETRY_DISABLED_VALUE: &str = "1";
 
 /// Label for the `device hash` row when no salt file exists.
 ///
-/// `(no salt file)` is only meaningful when consent has been granted —
-/// otherwise no salt is ever attempted, by design. Issue #1656.
-///
-/// Gating proof (rg verified on develop HEAD): `generate_device_hash()` has
-/// three production call sites — `send_ping()` at `telemetry.rs:71` (gated by
-/// `consent_given == Some(true)` at `telemetry.rs:38-41`), `run_status()` and
-/// `run_forget()` (both only call it after `salt_path.exists()`). So the salt
-/// is only ever written through `send_ping()`'s consent-gated path.
-fn salt_missing_label(consent_given: Option<bool>) -> &'static str {
+/// A missing salt is only ever a real failure once every gate that stops the
+/// salt from being written has been cleared. The arms below mirror the gate
+/// order in `telemetry::maybe_ping`, so the label names the gate that actually
+/// fired instead of blaming the filesystem. Issue #1656.
+fn salt_missing_label(
+    endpoint_configured: bool,
+    env_override: bool,
+    enabled: bool,
+    consent_given: Option<bool>,
+) -> &'static str {
+    if !endpoint_configured {
+        return "(not applicable; this build has no telemetry endpoint)";
+    }
+    if env_override {
+        return "(blocked by RTK_TELEMETRY_DISABLED)";
+    }
     match consent_given {
-        Some(true) => "(no salt file)",
         // `Some(false)` (explicit opt-out) and `None` (never prompted) collapse
         // because the user-facing remediation — running `rtk telemetry enable`
         // — is identical in both states.
         Some(false) | None => "(telemetry not enabled; run `rtk telemetry enable` to opt in)",
+        Some(true) if !enabled => "(telemetry disabled in config.toml)",
+        // Every gate is clear, so the salt is simply not there yet. This is true
+        // both when no ping has landed (the 23 h interval, or a run that touched
+        // the marker before the detached thread wrote the salt) and when a write
+        // genuinely failed — as far as the available state lets us go.
+        Some(true) => "(no salt file yet; written on the first ping)",
     }
 }
 
@@ -28,7 +40,13 @@ fn salt_missing_label(consent_given: Option<bool>) -> &'static str {
 ///
 /// Extracted so the routing (which message string for which state) is covered
 /// by unit tests rather than only the leaf label helper.
-fn device_hash_line(consent_given: Option<bool>, hash: Option<&str>) -> String {
+fn device_hash_line(
+    endpoint_configured: bool,
+    env_override: bool,
+    enabled: bool,
+    consent_given: Option<bool>,
+    hash: Option<&str>,
+) -> String {
     match hash {
         // The device hash is a SHA-256 hex digest — exactly 64 chars by
         // construction. Gate on `== 64` (not `>= 64`) so a malformed hash of any
@@ -38,7 +56,10 @@ fn device_hash_line(consent_given: Option<bool>, hash: Option<&str>) -> String {
         Some(h) if h.len() == 64 => {
             format!("  device hash:   {}...{}", &h[..8], &h[56..])
         }
-        _ => format!("  device hash:   {}", salt_missing_label(consent_given)),
+        _ => format!(
+            "  device hash:   {}",
+            salt_missing_label(endpoint_configured, env_override, enabled, consent_given)
+        ),
     }
 }
 
@@ -105,7 +126,13 @@ fn run_status() -> Result<()> {
     };
     println!(
         "{}",
-        device_hash_line(config.telemetry.consent_given, hash.as_deref())
+        device_hash_line(
+            option_env!("RTK_TELEMETRY_URL").is_some(),
+            env_override,
+            config.telemetry.enabled,
+            config.telemetry.consent_given,
+            hash.as_deref(),
+        )
     );
 
     println!();
@@ -283,21 +310,52 @@ mod tests {
         // therefore never writes a salt — that is by design, not a failure.
         // Surfacing it as `(no salt file)` reads as an error to users.
         let not_enabled = "(telemetry not enabled; run `rtk telemetry enable` to opt in)";
-        assert_eq!(salt_missing_label(None), not_enabled);
-        assert_eq!(salt_missing_label(Some(false)), not_enabled);
-        // Consent was granted but the salt is still missing — this IS a real
-        // failure (e.g. fs permission, full disk) and keeps the original label
-        // so the user knows to investigate.
-        assert_eq!(salt_missing_label(Some(true)), "(no salt file)");
+        assert_eq!(salt_missing_label(true, false, true, None), not_enabled);
+        assert_eq!(
+            salt_missing_label(true, false, true, Some(false)),
+            not_enabled
+        );
+        // Every gate is clear and the salt is still missing, so the label says
+        // what is actually known rather than accusing the filesystem.
+        assert_eq!(
+            salt_missing_label(true, false, true, Some(true)),
+            "(no salt file yet; written on the first ping)"
+        );
+    }
+
+    #[test]
+    fn salt_missing_label_names_the_gate_that_actually_fired() {
+        // Consent is one of five gates on salt creation, and three of the others
+        // produce "consent granted, no salt" legitimately. The arms are ordered
+        // as `telemetry::maybe_ping` applies its gates, so the first unmet gate
+        // wins even when a later one is unmet too.
+        assert_eq!(
+            salt_missing_label(false, true, false, Some(false)),
+            "(not applicable; this build has no telemetry endpoint)"
+        );
+        assert_eq!(
+            salt_missing_label(true, true, false, Some(false)),
+            "(blocked by RTK_TELEMETRY_DISABLED)"
+        );
+        assert_eq!(
+            salt_missing_label(true, false, false, Some(true)),
+            "(telemetry disabled in config.toml)"
+        );
     }
 
     #[test]
     fn device_hash_line_renders_truncated_hash_when_salt_exists() {
-        // The salt-exists path is consent-agnostic: once the hash is in hand
-        // it's safe to show regardless of how the salt got there.
+        // The salt-exists path is gate-agnostic: once the hash is in hand it's
+        // safe to show regardless of how the salt got there.
         let expected = "  device hash:   01234567...89abcdef";
-        assert_eq!(device_hash_line(Some(true), Some(SAMPLE_HASH)), expected);
-        assert_eq!(device_hash_line(None, Some(SAMPLE_HASH)), expected);
+        assert_eq!(
+            device_hash_line(true, false, true, Some(true), Some(SAMPLE_HASH)),
+            expected
+        );
+        assert_eq!(
+            device_hash_line(false, true, false, None, Some(SAMPLE_HASH)),
+            expected
+        );
     }
 
     #[test]
@@ -305,16 +363,28 @@ mod tests {
         // Locks the routing: removing or inlining `salt_missing_label` without
         // copying its literals will fail these asserts.
         assert_eq!(
-            device_hash_line(Some(true), None),
-            "  device hash:   (no salt file)"
+            device_hash_line(true, false, true, Some(true), None),
+            "  device hash:   (no salt file yet; written on the first ping)"
         );
         assert_eq!(
-            device_hash_line(None, None),
+            device_hash_line(true, false, true, None, None),
             "  device hash:   (telemetry not enabled; run `rtk telemetry enable` to opt in)"
         );
         assert_eq!(
-            device_hash_line(Some(false), None),
+            device_hash_line(true, false, true, Some(false), None),
             "  device hash:   (telemetry not enabled; run `rtk telemetry enable` to opt in)"
+        );
+        assert_eq!(
+            device_hash_line(false, false, true, Some(true), None),
+            "  device hash:   (not applicable; this build has no telemetry endpoint)"
+        );
+        assert_eq!(
+            device_hash_line(true, true, true, Some(true), None),
+            "  device hash:   (blocked by RTK_TELEMETRY_DISABLED)"
+        );
+        assert_eq!(
+            device_hash_line(true, false, false, Some(true), None),
+            "  device hash:   (telemetry disabled in config.toml)"
         );
     }
 
@@ -327,12 +397,12 @@ mod tests {
         let short = "0123456789abcdef"; // 16 chars
         let long = SAMPLE_HASH.repeat(2); // 128 chars
         assert_eq!(
-            device_hash_line(Some(true), Some(short)),
-            "  device hash:   (no salt file)"
+            device_hash_line(true, false, true, Some(true), Some(short)),
+            "  device hash:   (no salt file yet; written on the first ping)"
         );
         assert_eq!(
-            device_hash_line(Some(true), Some(&long)),
-            "  device hash:   (no salt file)"
+            device_hash_line(true, false, true, Some(true), Some(&long)),
+            "  device hash:   (no salt file yet; written on the first ping)"
         );
     }
 }
