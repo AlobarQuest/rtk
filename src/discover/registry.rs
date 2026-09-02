@@ -6013,6 +6013,25 @@ mod tests {
         );
     }
 
+    /// `jj` is covered only by a TOML filter, never by the native RULES table,
+    /// so the bare case pins the TOML branch of the rewrite path and keeps the
+    /// wrapper assertions below from passing vacuously when TOML is disabled.
+    #[test]
+    fn test_toml_filter_rewrites_bare_command_but_not_wrapped_invocations() {
+        assert_eq!(
+            rewrite_command_no_prefixes("jj log", &[]),
+            Some("rtk jj log".into()),
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("timeout 5 /usr/bin/jj log", &[]),
+            None,
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("nohup /opt/tools/jj log", &[]),
+            None,
+        );
+    }
+
     #[test]
     fn test_path_qualified_liquibase_is_not_rewritten() {
         // #3757 originally requested path-qualified rewriting, but registry
