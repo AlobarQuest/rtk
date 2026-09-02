@@ -531,6 +531,24 @@ pub fn tool_exists(name: &str) -> bool {
     which::which(name).is_ok()
 }
 
+/// Check if a compile-time environment variable was set to a non-empty value.
+///
+/// `option_env!` yields `Some("")` when the build environment exports the
+/// variable with an empty value, which a CI `env:` block fed by an unset
+/// repository variable does. `.is_some()` alone then reports a feature as
+/// configured when it is not, so pair every `option_env!` gate with this.
+///
+/// # Examples
+/// ```
+/// use rtk::utils::env_is_some;
+/// assert!(env_is_some(Some("https://example.com")));
+/// assert!(!env_is_some(Some("")));
+/// assert!(!env_is_some(None));
+/// ```
+pub fn env_is_some(value: Option<&str>) -> bool {
+    value.is_some_and(|v| !v.is_empty())
+}
+
 /// Extract short name from AWS ARN.
 /// Example: `arn:aws:ecs:region:acct:service/cluster/name` -> `name`
 /// For simple ARNs like `arn:aws:iam::123:user/alice`, returns `alice`.
@@ -731,6 +749,15 @@ mod tests {
         }
         let b: Borrowed = from_json_str("\u{feff}{\"name\": \"rtk\"}").unwrap();
         assert_eq!(b.name, "rtk");
+    }
+
+    #[test]
+    fn env_is_some_rejects_unset_and_empty() {
+        assert!(env_is_some(Some("https://telemetry.example")));
+        // An unset CI repository variable still exports the env var, so the
+        // empty string reaches `option_env!` as `Some("")`.
+        assert!(!env_is_some(Some("")));
+        assert!(!env_is_some(None));
     }
 
     #[test]
