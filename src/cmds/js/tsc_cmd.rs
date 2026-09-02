@@ -3,7 +3,9 @@
 use crate::core::runner;
 use crate::core::stream::{BlockHandler, BlockStreamFilter};
 use crate::core::truncate::{reduced, CAP_WARNINGS};
-use crate::core::utils::{detect_package_manager, strip_ansi, tool_exec, tool_exists, truncate};
+use crate::core::utils::{
+    detect_package_manager, strip_ansi, tool_exec, tool_exists, truncate, MissingTool,
+};
 use anyhow::Result;
 use regex::Regex;
 use std::borrow::Cow;
@@ -81,7 +83,9 @@ fn clean_line(line: &str) -> Cow<'_, str> {
 pub fn run(runner: Option<&str>, args: &[String], verbose: u8) -> Result<i32> {
     let tsc_exists = tool_exists("tsc");
 
-    let mut cmd = tool_exec(runner, "tsc");
+    // Fetch, not Fail: `npx tsc` fetched before this routing existed, and
+    // rtk filters output rather than changing what a command does.
+    let mut cmd = tool_exec(runner, "tsc", MissingTool::Fetch);
 
     for arg in args {
         cmd.arg(arg);

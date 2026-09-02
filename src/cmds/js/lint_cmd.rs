@@ -4,7 +4,7 @@ use crate::core::config;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
 use crate::core::truncate::{CAP_ERRORS, CAP_WARNINGS};
-use crate::core::utils::{resolved_command, tool_exec, truncate};
+use crate::core::utils::{resolved_command, tool_exec, truncate, MissingTool};
 use crate::mypy_cmd;
 use crate::ruff_cmd;
 use anyhow::{Context, Result};
@@ -102,7 +102,7 @@ pub fn run(runner: Option<&str>, args: &[String], verbose: u8) -> Result<i32> {
     let mut cmd = if is_python_linter(linter) {
         resolved_command(linter)
     } else {
-        tool_exec(runner, linter)
+        tool_exec(runner, linter, MissingTool::Fail)
     };
 
     // Add format flags based on linter

@@ -403,7 +403,16 @@ pub fn detect_package_manager_in(dir: &std::path::Path) -> &'static str {
 /// Build a Command using the detected package manager's exec mechanism.
 /// Returns a Command ready to have tool-specific args appended.
 pub fn package_manager_exec(tool: &str) -> Command {
-    tool_exec(None, tool)
+    tool_exec(None, tool, MissingTool::Fail)
+}
+
+/// What the npm arm does when `tool` is not installed. `npx` fetches on demand
+/// by default, which is right for a tool the user named themselves and
+/// surprising for one rtk picked on their behalf.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MissingTool {
+    Fetch,
+    Fail,
 }
 
 /// Build a Command that runs `tool`, preferring the package runner the user
@@ -412,7 +421,7 @@ pub fn package_manager_exec(tool: &str) -> Command {
 /// RTK forwards what was typed rather than substituting an engine for it: a
 /// user who types `bunx tsc` must not get `pnpm` because a lockfile is present.
 /// Detection applies only when nothing was named, as with a bare `rtk tsc`.
-pub fn tool_exec(runner: Option<&str>, tool: &str) -> Command {
+pub fn tool_exec(runner: Option<&str>, tool: &str, missing: MissingTool) -> Command {
     if tool_exists(tool) {
         resolved_command(tool)
     } else {
@@ -438,7 +447,10 @@ pub fn tool_exec(runner: Option<&str>, tool: &str) -> Command {
             }
             _ => {
                 let mut c = resolved_command("npx");
-                c.arg("--no-install").arg("--").arg(tool);
+                if missing == MissingTool::Fail {
+                    c.arg("--no-install");
+                }
+                c.arg("--").arg(tool);
                 c
             }
         }
@@ -1606,5 +1618,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("bun.lockb"), "").expect("write lockfile");
         assert_eq!(detect_package_manager_in(dir.path()), "bun");
+    }
+
+    #[test]
+    fn test_missing_tool_policy_controls_npx_no_install() {
+        // Semantics are per caller: a tool the user named may be fetched, one
+        // rtk chose may not. Changing either would change what runs, not what
+        // is printed, which is not rtk's job.
+        let args: Vec<String> =
+            tool_exec(Some("npm"), "definitely-not-installed", MissingTool::Fetch)
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+        assert!(!args.contains(&"--no-install".to_string()), "{args:?}");
+
+        let args: Vec<String> =
+            tool_exec(Some("npm"), "definitely-not-installed", MissingTool::Fail)
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+        assert!(args.contains(&"--no-install".to_string()), "{args:?}");
     }
 }
