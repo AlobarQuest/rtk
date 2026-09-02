@@ -48,19 +48,25 @@ fn device_hash_line(
     hash: Option<&str>,
 ) -> String {
     match hash {
-        // The device hash is a SHA-256 hex digest — exactly 64 chars by
-        // construction. Gate on `== 64` (not `>= 64`) so a malformed hash of any
-        // other length routes to the salt-missing label instead of slicing
-        // arbitrary bytes — `&h[56..]` on a longer string would print an
-        // over-long tail.
-        Some(h) if h.len() == 64 => {
+        Some(h) if is_device_hash(h) => {
             format!("  device hash:   {}...{}", &h[..8], &h[56..])
         }
-        _ => format!(
+        // The caller only supplies a hash once the salt file exists, so a hash
+        // that fails the shape check is a malformed salt, not a missing one.
+        Some(_) => "  device hash:   (malformed device hash)".to_string(),
+        None => format!(
             "  device hash:   {}",
             salt_missing_label(endpoint_configured, env_override, enabled, consent_given)
         ),
     }
+}
+
+/// A device hash is a SHA-256 digest rendered as lowercase hex: 64 ASCII
+/// characters. Checking the alphabet as well as the length is what keeps
+/// `&h[..8]` and `&h[56..]` on char boundaries — `len()` counts bytes, so a
+/// 64-byte string of multi-byte characters would otherwise panic when sliced.
+fn is_device_hash(h: &str) -> bool {
+    h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Subcommand)]
@@ -127,7 +133,7 @@ fn run_status() -> Result<()> {
     println!(
         "{}",
         device_hash_line(
-            option_env!("RTK_TELEMETRY_URL").is_some(),
+            super::telemetry::endpoint_url().is_some(),
             env_override,
             config.telemetry.enabled,
             config.telemetry.consent_given,
@@ -241,8 +247,7 @@ fn run_forget() -> Result<()> {
 }
 
 fn send_erasure_request(device_hash: &str) -> Result<()> {
-    let url = option_env!("RTK_TELEMETRY_URL");
-    let url = match url {
+    let url = match super::telemetry::endpoint_url() {
         Some(u) => format!("{}/erasure", u),
         None => anyhow::bail!("no telemetry endpoint configured"),
     };
@@ -389,20 +394,38 @@ mod tests {
     }
 
     #[test]
-    fn device_hash_line_treats_non_64_char_hash_as_missing() {
-        // The device hash is a 64-char SHA-256 hex digest by construction, so the
-        // truncating render is gated on `len() == 64`. A hash of any other length
-        // is malformed (a truncated read, a future format change) and routes to
-        // the salt-missing label rather than slicing arbitrary bytes.
+    fn device_hash_line_reports_a_malformed_hash_as_malformed() {
+        // A hash only reaches here once the salt file exists, so "missing" would
+        // be a claim the caller already knows to be false — the wrong length or
+        // alphabet means the salt is malformed, not absent.
+        let malformed = "  device hash:   (malformed device hash)";
         let short = "0123456789abcdef"; // 16 chars
         let long = SAMPLE_HASH.repeat(2); // 128 chars
         assert_eq!(
             device_hash_line(true, false, true, Some(true), Some(short)),
-            "  device hash:   (no salt file yet; written on the first ping)"
+            malformed
         );
         assert_eq!(
             device_hash_line(true, false, true, Some(true), Some(&long)),
-            "  device hash:   (no salt file yet; written on the first ping)"
+            malformed
+        );
+    }
+
+    #[test]
+    fn device_hash_line_rejects_a_64_byte_non_hex_hash_without_panicking() {
+        // `len()` counts bytes: 21 three-byte characters plus one ASCII byte is
+        // 64 bytes long, and slicing it at byte 8 would panic on a char boundary.
+        let multibyte = format!("{}x", "日".repeat(21));
+        assert_eq!(multibyte.len(), 64);
+        assert_eq!(
+            device_hash_line(true, false, true, Some(true), Some(&multibyte)),
+            "  device hash:   (malformed device hash)"
+        );
+        // Right length and alphabet size, wrong alphabet.
+        let non_hex = "z".repeat(64);
+        assert_eq!(
+            device_hash_line(true, false, true, Some(true), Some(&non_hex)),
+            "  device hash:   (malformed device hash)"
         );
     }
 }
