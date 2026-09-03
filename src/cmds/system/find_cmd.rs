@@ -423,6 +423,7 @@ pub fn run(
         max_depth,
         want_dirs,
         case_insensitive,
+        true,
     );
 
     let raw_output = {
@@ -443,12 +444,15 @@ pub fn run(
     Ok(0)
 }
 
+const DISCLOSURE_ENTRY_CAP: usize = 20_000;
+
 fn native_walk(
     path: &str,
     pattern: &str,
     max_depth: Option<usize>,
     want_dirs: bool,
     case_insensitive: bool,
+    git_global: bool,
 ) -> (Vec<String>, Vec<String>) {
     // When the pattern targets dotfiles (e.g. -name ".claude.json"), we must walk hidden
     // entries; otherwise skip them to keep results tidy (#1101).
@@ -458,7 +462,7 @@ fn native_walk(
     builder
         .hidden(!search_hidden) // skip hidden files/dirs unless pattern targets dotfiles
         .git_ignore(true) // respect .gitignore
-        .git_global(true)
+        .git_global(git_global)
         .git_exclude(true);
     if let Some(depth) = max_depth {
         builder.max_depth(Some(depth));
@@ -467,25 +471,43 @@ fn native_walk(
     let mut files = Vec::new();
     let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
     let mut visited_dirs: Vec<(std::path::PathBuf, usize)> = Vec::new();
+    let mut disclose = true;
     for entry in builder.build().flatten() {
-        visited.insert(entry.path().to_path_buf());
-        if entry.file_type().is_some_and(|t| t.is_dir()) {
-            visited_dirs.push((entry.path().to_path_buf(), entry.depth()));
+        if disclose {
+            if visited.len() >= DISCLOSURE_ENTRY_CAP {
+                disclose = false;
+                visited.clear();
+                visited_dirs.clear();
+            } else {
+                visited.insert(entry.path().to_path_buf());
+                let is_dir = if entry.depth() == 0 {
+                    std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir())
+                } else {
+                    entry.file_type().is_some_and(|t| t.is_dir())
+                };
+                if is_dir {
+                    visited_dirs.push((entry.path().to_path_buf(), entry.depth()));
+                }
+            }
         }
         if let Some(display) = entry_display(&entry, path, pattern, want_dirs, case_insensitive) {
             files.push(display);
         }
     }
 
-    let filtered = disclose_filtered(
-        path,
-        pattern,
-        max_depth,
-        want_dirs,
-        case_insensitive,
-        &visited_dirs,
-        &visited,
-    );
+    let filtered = if disclose {
+        disclose_filtered(
+            path,
+            pattern,
+            max_depth,
+            want_dirs,
+            case_insensitive,
+            &visited_dirs,
+            &visited,
+        )
+    } else {
+        Vec::new()
+    };
     (files, filtered)
 }
 
@@ -531,6 +553,7 @@ fn relative_display(entry_path: &Path, root: &str) -> String {
 }
 
 const FILTERED_CAP: usize = 1000;
+const UNREPORTED_DIR: &str = ".git";
 
 fn disclose_filtered(
     root: &str,
@@ -558,7 +581,7 @@ fn disclose_filtered(
             let is_dir = child.file_type().is_ok_and(|t| t.is_dir());
             let display = relative_display(&child_path, root);
             if is_dir {
-                if name == ".git" {
+                if name == UNREPORTED_DIR {
                     continue;
                 }
                 out.push(format!("{}/", display));
@@ -584,10 +607,7 @@ fn filtered_hint(filtered: &[String]) -> Option<String> {
     } else {
         filtered.len().to_string()
     };
-    let note = format!(
-        "... ({} filtered: hidden or gitignored; dirs listed with / were not searched)",
-        count
-    );
+    let note = format!("... ({} filtered)", count);
     let mut sorted = filtered.to_vec();
     sorted.sort();
     let listing = format!("{}\n", sorted.join("\n"));
@@ -1288,7 +1308,6 @@ mod tests {
         // verify it runs without error. The smoke tests verify content.
     }
 
-
     #[test]
     fn missing_path_with_separator_is_a_find_path_not_a_pattern() {
         let p = parse_find_args(&args(&["/definitely/missing/xyz", "-maxdepth", "1"])).unwrap();
@@ -1308,16 +1327,30 @@ mod tests {
 
     #[test]
     fn native_run_reports_missing_path_as_exit_1() {
-        let code = run("*", "/definitely/missing/xyz", 10, false, None, "f", false, 0).unwrap();
+        let code = run(
+            "*",
+            "/definitely/missing/xyz",
+            10,
+            false,
+            None,
+            "f",
+            false,
+            0,
+        )
+        .unwrap();
         assert_eq!(code, 1);
     }
 
     #[test]
     fn native_run_returns_zero_on_success() {
         let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("RTK_TEE_DIR", tmp.path());
         std::fs::write(tmp.path().join("a.txt"), "x").unwrap();
         let root = tmp.path().to_string_lossy().into_owned();
-        assert_eq!(run("*.txt", &root, 10, false, None, "f", false, 0).unwrap(), 0);
+        assert_eq!(
+            run("*.txt", &root, 10, false, None, "f", false, 0).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1331,7 +1364,6 @@ mod tests {
         let code = run_from_args(&args(&argv), 0).unwrap();
         assert_eq!(code, expected);
     }
-
 
     #[test]
     fn hidden_and_ignored_matches_are_collected_for_disclosure() {
@@ -1355,23 +1387,29 @@ mod tests {
         std::fs::write(root.join("build").join("out.txt"), "w").unwrap();
         let root_s = root.to_string_lossy().into_owned();
 
-        let (files, filtered) = native_walk(&root_s, "*.txt", None, false, false);
+        let (files, filtered) = native_walk(&root_s, "*.txt", None, false, false, false);
         assert_eq!(files, vec!["visible.txt".to_string()]);
         assert_eq!(
             filtered,
-            vec![".hidden/".to_string(), "build/".to_string(), "secret.txt".to_string()]
+            vec![
+                ".hidden/".to_string(),
+                "build/".to_string(),
+                "secret.txt".to_string()
+            ]
         );
 
-        let (_, filtered) = native_walk(&root_s, "*.txt", Some(0), false, false);
+        let (_, filtered) = native_walk(&root_s, "*.txt", Some(0), false, false, false);
         assert!(filtered.is_empty(), "{filtered:?}");
 
-        let (files, filtered) = native_walk(&root_s, ".gitignore", None, false, false);
+        let (files, filtered) = native_walk(&root_s, ".gitignore", None, false, false, false);
         assert_eq!(files, vec![".gitignore".to_string()]);
         assert_eq!(filtered, vec!["build/".to_string()]);
     }
 
     #[test]
     fn disclosure_survives_the_output_guard() {
+        let tee = tempfile::tempdir().unwrap();
+        std::env::set_var("RTK_TEE_DIR", tee.path());
         let timer = tracking::TimedExecution::start();
         let shown = render(
             vec!["visible.txt".to_string()],
@@ -1393,6 +1431,21 @@ mod tests {
             &timer,
         );
         assert!(shown.contains("(1 filtered"), "{shown}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_root_still_discloses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("sub").join(".hidden")).unwrap();
+        std::fs::write(root.join("sub").join("a.txt"), "a").unwrap();
+        std::fs::write(root.join("sub").join(".hidden").join("h.txt"), "h").unwrap();
+        std::os::unix::fs::symlink(root.join("sub"), root.join("link")).unwrap();
+        let link = root.join("link").to_string_lossy().into_owned();
+        let (files, filtered) = native_walk(&link, "*.txt", None, false, false, false);
+        assert_eq!(files, vec!["a.txt".to_string()]);
+        assert_eq!(filtered, vec![".hidden/".to_string()]);
     }
 
     #[test]
