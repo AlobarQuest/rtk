@@ -1,9 +1,0 @@
-bun test v1.3.6 (d530ed99)
-
-stdoutlog.test.ts:
-error: could not connect to db (logged by test)
-
- 2 pass
- 0 fail
- 2 expect() calls
-Ran 2 tests across 1 file. [15.00ms]

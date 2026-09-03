@@ -3,9 +3,7 @@
 use crate::core::runner;
 use crate::core::stream::{BlockHandler, BlockStreamFilter};
 use crate::core::truncate::{reduced, CAP_WARNINGS};
-use crate::core::utils::{
-    detect_package_manager, strip_ansi, tool_exec, tool_exists, truncate, MissingTool,
-};
+use crate::core::utils::{MissingTool, exec_runner, strip_ansi, tool_exec, tool_exists, truncate};
 use anyhow::Result;
 use regex::Regex;
 use std::borrow::Cow;
@@ -95,11 +93,7 @@ pub fn run(runner: Option<&str>, args: &[String], verbose: u8) -> Result<i32> {
         let via = if tsc_exists {
             "tsc".to_string()
         } else {
-            let via: &str = match runner {
-                Some(named) => named,
-                None => detect_package_manager(),
-            };
-            format!("{} tsc", via)
+            format!("{} tsc", exec_runner(runner, MissingTool::Fetch))
         };
         eprintln!("Running: {} {}", via, args.join(" "));
     }

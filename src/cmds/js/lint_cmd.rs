@@ -72,6 +72,12 @@ fn strip_pm_prefix(args: &[String]) -> usize {
     skip
 }
 
+/// The package runner named at the front of the args, if any. `bunx eslint`
+/// and `pnpm exec eslint` both name one; a bare `exec` does not.
+fn named_runner(args: &[String], skip: usize) -> Option<&str> {
+    args[..skip].iter().map(String::as_str).find(|a| *a != "exec")
+}
+
 /// Detect the linter name from args (after stripping PM prefixes).
 /// Returns the linter name and whether it was explicitly specified.
 fn detect_linter(args: &[String]) -> (&str, bool) {
@@ -94,6 +100,9 @@ pub fn run(runner: Option<&str>, args: &[String], verbose: u8) -> Result<i32> {
 
     let skip = strip_pm_prefix(args);
     let effective_args = &args[skip..];
+    // A runner stripped from the args was still named by the user, so it wins
+    // over lockfile detection just as an explicitly threaded one does.
+    let runner = runner.or_else(|| named_runner(args, skip));
 
     let (linter, explicit) = detect_linter(effective_args);
 
@@ -205,8 +214,12 @@ pub fn run(runner: Option<&str>, args: &[String], verbose: u8) -> Result<i32> {
     let shown = crate::core::runner::emit_guarded(&filtered, hint.as_deref(), &raw);
 
     timer.track(
-        &format!("{} {}", linter, args.join(" ")),
-        &format!("rtk lint {} {}", linter, args.join(" ")),
+        &format!("{} {}", linter, effective_args[start_idx..].join(" ")),
+        &format!(
+            "rtk lint {} {}",
+            linter,
+            effective_args[start_idx..].join(" ")
+        ),
         &raw,
         &shown,
     );
@@ -707,4 +720,20 @@ mod tests {
         assert!(!is_python_linter("biome"));
         assert!(!is_python_linter("unknown"));
     }
+
+    #[test]
+    fn test_named_runner_recovers_the_stripped_prefix() {
+        let args: Vec<String> = ["bunx", "eslint", "."].iter().map(|s| s.to_string()).collect();
+        let skip = strip_pm_prefix(&args);
+        assert_eq!(named_runner(&args, skip), Some("bunx"));
+
+        let args: Vec<String> = ["pnpm", "exec", "eslint"].iter().map(|s| s.to_string()).collect();
+        let skip = strip_pm_prefix(&args);
+        assert_eq!(named_runner(&args, skip), Some("pnpm"));
+
+        let args: Vec<String> = ["eslint", "src"].iter().map(|s| s.to_string()).collect();
+        let skip = strip_pm_prefix(&args);
+        assert_eq!(named_runner(&args, skip), None);
+    }
 }
+

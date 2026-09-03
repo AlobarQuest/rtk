@@ -373,13 +373,13 @@ pub fn count_tokens(text: &str) -> usize {
 }
 
 /// Detect the package manager used in the current directory.
-/// Returns "pnpm", "yarn", or "npm" based on lockfile presence.
+/// Returns "pnpm", "yarn", "bun", or "npm" based on lockfile presence.
 ///
 /// # Examples
 /// ```no_run
 /// use rtk::utils::detect_package_manager;
 /// let pm = detect_package_manager();
-/// // Returns "pnpm" if pnpm-lock.yaml exists, "yarn" if yarn.lock, else "npm"
+/// // "pnpm" for pnpm-lock.yaml, "yarn" for yarn.lock, "bun" for bun.lock(b), else "npm"
 /// ```
 #[allow(dead_code)]
 pub fn detect_package_manager() -> &'static str {
@@ -415,21 +415,42 @@ pub enum MissingTool {
     Fail,
 }
 
+/// The runner used to resolve a tool that is not on PATH. A runner the user
+/// named wins outright. Otherwise lockfile detection picks one, except that a
+/// detected bun resolves through npx: bunx always fetches a missing tool into
+/// its cache and cannot be told not to, so `MissingTool` could not be honoured
+/// and the presence of a lockfile alone would decide what gets downloaded.
+pub fn exec_runner(runner: Option<&str>, missing: MissingTool) -> &str {
+    match runner {
+        Some(named) => named,
+        // Nothing was named and rtk may fetch: npx is the only runner that can,
+        // and lockfile detection would hand `pnpm exec` a tool the project
+        // does not have.
+        None if missing == MissingTool::Fetch => "npx",
+        None => match detect_package_manager() {
+            // bunx always fetches; npm's runner is npx.
+            "bun" | "npm" => "npx",
+            other => other,
+        },
+    }
+}
+
 /// Build a Command that runs `tool`, preferring the package runner the user
 /// actually named over lockfile detection.
 ///
 /// RTK forwards what was typed rather than substituting an engine for it: a
 /// user who types `bunx tsc` must not get `pnpm` because a lockfile is present.
 /// Detection applies only when nothing was named, as with a bare `rtk tsc`.
+///
+/// A tool already on PATH is run directly only when no runner was named.
 pub fn tool_exec(runner: Option<&str>, tool: &str, missing: MissingTool) -> Command {
-    if tool_exists(tool) {
+    // Only when nothing was named: `bunx tsc` must resolve the project's tsc,
+    // not a global one that happens to be on PATH. Both bunx and npx prefer
+    // node_modules/.bin before fetching, so naming one is a real choice.
+    if runner.is_none() && tool_exists(tool) {
         resolved_command(tool)
     } else {
-        let pm: &str = match runner {
-            Some(named) => named,
-            None => detect_package_manager(),
-        };
-        match pm {
+        match exec_runner(runner, missing) {
             "pnpm" => {
                 let mut c = resolved_command("pnpm");
                 c.arg("exec").arg("--").arg(tool);
@@ -979,7 +1000,7 @@ mod tests {
         // In the test environment (rtk repo), there's no JS lockfile
         // so it should default to "npm"
         let pm = detect_package_manager();
-        assert!(["pnpm", "yarn", "npm"].contains(&pm));
+        assert!(["pnpm", "yarn", "bun", "npm"].contains(&pm));
     }
 
     #[test]
@@ -1638,5 +1659,22 @@ mod tests {
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect();
         assert!(args.contains(&"--no-install".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn test_exec_runner_prefers_the_named_runner_and_never_detects_bunx() {
+        // A named runner is used as given, whatever the fetch policy.
+        for missing in [MissingTool::Fetch, MissingTool::Fail] {
+            assert_eq!(exec_runner(Some("bunx"), missing), "bunx");
+            assert_eq!(exec_runner(Some("pnpm"), missing), "pnpm");
+        }
+
+        // Detection never resolves through bunx: it always fetches a missing
+        // tool, so MissingTool::Fail could not be honoured.
+        assert_ne!(exec_runner(None, MissingTool::Fail), "bun");
+        assert_ne!(exec_runner(None, MissingTool::Fail), "bunx");
+
+        // Nothing named and rtk may fetch: npx is the only runner that can.
+        assert_eq!(exec_runner(None, MissingTool::Fetch), "npx");
     }
 }

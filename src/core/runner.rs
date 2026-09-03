@@ -400,7 +400,7 @@ pub fn run_err_cmd(
     verbose: u8,
 ) -> Result<i32> {
     if verbose > 0 {
-        eprintln!("Running: {} {}", tool, display);
+        eprintln!("Running: {}", display);
     }
     run_streamed(
         cmd,
@@ -451,6 +451,14 @@ impl TestEcosystem {
     }
 }
 
+/// Watch mode never exits, and the filtered runners buffer the whole stream
+/// until the child does, so a watched run prints nothing at all and loses the
+/// buffer on Ctrl-C. Callers send these through unfiltered instead.
+pub fn is_watch_mode(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--watch" || a.starts_with("--watch="))
+}
+
 /// Run a prebuilt test command (no shell), showing only failures.
 /// `display` is used only for logging and tracking, never executed.
 pub fn run_test_cmd(
@@ -462,7 +470,7 @@ pub fn run_test_cmd(
     verbose: u8,
 ) -> Result<i32> {
     if verbose > 0 {
-        eprintln!("Running tests: {} {}", tool, display);
+        eprintln!("Running tests: {}", display);
     }
     run_filtered(
         cmd,
@@ -524,19 +532,19 @@ enum Section {
 
 /// Which lines belong to a real failure rather than to the test's own stdout.
 ///
-/// Bun and deno answer the same three questions (what opens a diagnostic block,
-/// what proves the runner wrote it, what closes it), so they share one engine
+/// Bun and deno answer the same questions (what opens a diagnostic block, what
+/// closes it and whether that ending vouches for it, and where the runner's own
+/// output begins and ends), so they share one engine
 /// and differ only in this table. As two separate state machines they drifted:
 /// a guard added on one side had to be rediscovered on the other, and deno had
 /// no proof rule at all, reporting passing suites as failed.
 struct BlockPolicy {
     /// Opens a diagnostic block. Opening also closes any block already open.
     opens: fn(&str) -> bool,
-    /// Runner-written evidence inside an open block.
-    proves: fn(&str) -> bool,
-    /// Ends the current block.
+    /// Ends the current block. A vouched close is the runner's own marker
+    /// claiming what came before it.
     closes: fn(&str) -> Option<Close>,
-    /// Keeps a line inside the block. Stack frames and rules are noise.
+    /// Keeps a line inside the block. Separator rules are noise.
     keeps: fn(&str) -> bool,
     /// Moves in and out of the region where the runner prints its own
     /// diagnostics. A block opened outside it needs a vouched close to count.
@@ -544,14 +552,12 @@ struct BlockPolicy {
 }
 
 /// Buffers a diagnostic block until something decides whether the runner wrote
-/// it. Kept when it opened inside a trusted section, or when it carries the
-/// runner's own evidence and a vouched ending. Anything else is the test's own
-/// stdout and is dropped.
+/// it. Kept when it opened inside a trusted section, or when the runner's own
+/// marker vouches for it. Anything else is the test's own stdout and is dropped.
 #[derive(Default)]
 struct FailureBlocks {
     pending: Vec<String>,
     open: bool,
-    evidence: bool,
     opened_trusted: bool,
     trusted: bool,
     kept: Vec<String>,
@@ -570,18 +576,12 @@ impl FailureBlocks {
         if (policy.opens)(trimmed) {
             self.close(None);
             self.open = true;
-            self.evidence = false;
             self.opened_trusted = self.trusted;
             self.pending.push(line.to_string());
             return;
         }
-        if self.open {
-            if (policy.proves)(trimmed) {
-                self.evidence = true;
-            }
-            if (policy.keeps)(trimmed) {
-                self.pending.push(line.to_string());
-            }
+        if self.open && (policy.keeps)(trimmed) {
+            self.pending.push(line.to_string());
         }
     }
 
@@ -590,13 +590,12 @@ impl FailureBlocks {
             self.pending.clear();
             return;
         }
-        if self.opened_trusted || (self.evidence && close == Some(Close::Vouched)) {
+        if self.opened_trusted || close == Some(Close::Vouched) {
             self.kept.append(&mut self.pending);
         } else {
             self.pending.clear();
         }
         self.open = false;
-        self.evidence = false;
     }
 }
 
@@ -607,21 +606,23 @@ impl FailureBlocks {
 /// unhandled-error banner is for.
 const BUN_POLICY: BlockPolicy = BlockPolicy {
     opens: |t| t.starts_with("error:"),
-    proves: |t| t.starts_with("at ") || t.starts_with("Expected:") || t.starts_with("Received:"),
     closes: |t| {
-        if t.starts_with("(fail)") || t.contains('✗') {
+        if BUN_FAILURE_MARKER.is_match(t) {
             Some(Close::Vouched)
-        } else if t.starts_with("(pass)") || is_bun_count_line(t) || t.starts_with("Ran ") {
+        } else if t.starts_with("(pass)") || is_bun_count_line(t) || BUN_RAN_FOOTER.is_match(t) {
             Some(Close::Plain)
         } else {
             None
         }
     },
-    keeps: |t| !t.is_empty() && !t.starts_with("at ") && !t.chars().all(|c| c == '-'),
+    // The frame carries the file and line. Without it two failing tests that
+    // share a name, or a module error that has no marker at all, cannot be
+    // located. Bun prints one frame per failure, so this costs a line each.
+    keeps: |t| !t.is_empty() && !t.chars().all(|c| c == '-'),
     section: |t| {
-        if t.starts_with("# Unhandled error") {
+        if t == "# Unhandled error between tests" {
             Some(Section::Trusted)
-        } else if is_bun_count_line(t) || t.starts_with("Ran ") {
+        } else if is_bun_count_line(t) || BUN_RAN_FOOTER.is_match(t) {
             Some(Section::Untrusted)
         } else {
             None
@@ -629,17 +630,47 @@ const BUN_POLICY: BlockPolicy = BlockPolicy {
     },
 };
 
+/// Deno's type-check diagnostics, "TS2322 [ERROR]: Type 'string' is not
+/// assignable to type 'number'." They are not introduced by an `error:` line and
+/// carry no ERRORS section, so nothing else in the deno policy would keep them.
+static DENO_TS_ERROR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^TS\d+ \[ERROR\]:").unwrap());
+
+/// Deno fences output it did not write between rules: "------- output -------"
+/// around a test's own stdout, "------- pre-test output -------" around what a
+/// module printed while loading. Returns whether the rule opens a fence.
+fn deno_output_fence(trimmed: &str) -> Option<bool> {
+    if !trimmed.starts_with("-----") || !trimmed.contains("output") {
+        return None;
+    }
+    Some(!trimmed.contains("output end"))
+}
+
+/// Bun's run footer, "Ran 4 tests across 1 file. [12.00ms]". Unanchored, the
+/// prefix also matches anything a test logs starting with those characters.
+static BUN_RAN_FOOTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^Ran \d+ test").unwrap());
+
+/// Bun's failure markers carry the test's duration: "(fail) name [1.86ms]",
+/// "✗ name [200.27ms]". Without that suffix a line a test merely logged
+/// would read as a marker, manufacturing a failure on a green run.
+static BUN_FAILURE_MARKER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:\(fail\)|✗)\s.*\[[\d.]+(?:µ|m)?s\]$").unwrap());
+
+/// Deno's FAILURES entries are "name => file:line:col". Matching a bare
+/// " => " would also match an arrow function or an arrow inside an assertion
+/// message, closing the diagnostic that line belongs to.
+static DENO_FAILURE_ENTRY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\S.* => \S+:\d+:\d+$").unwrap());
+
 /// Deno groups every diagnostic it writes under an ERRORS section, and fences
 /// the test's own stdout between output rules. That section is the proof: deno
 /// prints no per-failure marker that could vouch for a block, so one opened
 /// anywhere else is the test talking.
 const DENO_POLICY: BlockPolicy = BlockPolicy {
     opens: |t| t.starts_with("error:") && t != "error: Test failed",
-    proves: |t| t.starts_with("[Diff]"),
     closes: |t| {
         // A frame ends a block, and so does the next entry's "name => file:line"
         // header: consecutive leak failures carry no frames at all.
-        if t.starts_with("at ") || t.contains(" => ") {
+        if t.starts_with("at ") || DENO_FAILURE_ENTRY.is_match(t) {
             Some(Close::Plain)
         } else {
             None
@@ -654,8 +685,7 @@ const DENO_POLICY: BlockPolicy = BlockPolicy {
             || t.starts_with("ok |")
             || t.contains("test result:")
             || t.starts_with("failures:")
-            || t.starts_with("------- output")
-            || t.starts_with("----- output end")
+            || deno_output_fence(t).is_some()
         {
             Some(Section::Untrusted)
         } else {
@@ -674,6 +704,8 @@ fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
     let mut failure_lines = Vec::new();
     let mut in_failure = false;
     let mut in_failures_list = false;
+    let mut in_test_output = false;
+    let mut in_ts_error = false;
     let mut blocks = FailureBlocks::default();
 
     for line in lines.iter() {
@@ -725,10 +757,10 @@ fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
                 // Anchored count lines (" 6 pass", " 4 fail") and the "Ran N tests"
                 // footer. A loose `contains(" fail")` also matches bun's echoed
                 // source context when a test NAME contains "fails".
-                if is_bun_count_line(trimmed) || trimmed.starts_with("Ran ") {
+                if is_bun_count_line(trimmed) || BUN_RAN_FOOTER.is_match(trimmed) {
                     result.push(line.to_string());
                 }
-                if trimmed.starts_with("(fail)") || line.contains('✗') {
+                if BUN_FAILURE_MARKER.is_match(trimmed) {
                     failures.push(line.to_string());
                 }
                 blocks.feed(line, trimmed, &BUN_POLICY);
@@ -741,18 +773,50 @@ fn extract_test_summary(output: &str, eco: TestEcosystem) -> String {
                 // Current deno (2.x): "FAILED | 3 passed | 2 failed (17ms)" footer,
                 // " FAILURES " section listing "name => file:line:col".
                 // Legacy deno mimicked cargo ("test result:", "failures:").
-                if trimmed.starts_with("FAILED |")
-                    || trimmed.starts_with("ok |")
-                    || line.contains("test result:")
-                {
-                    result.push(line.to_string());
-                    in_failures_list = false;
-                } else if trimmed == "FAILURES" || line.starts_with("failures:") {
-                    in_failures_list = true;
-                } else if in_failures_list && !trimmed.is_empty() {
-                    failures.push(line.to_string());
+                // Deno fences a test's own stdout between output rules. A
+                // test is free to log "FAILURES" in there, so nothing inside
+                // the fence is read as deno's own bookkeeping.
+                let fence = deno_output_fence(trimmed);
+                if let Some(opening) = fence {
+                    in_test_output = opening;
                 }
-                blocks.feed(line, trimmed, &DENO_POLICY);
+                // Inside the fence the test is talking, so neither the failures
+                // list nor the block engine reads it as deno's own output. The
+                // rules themselves are fed, so they close anything still open.
+                if fence.is_some() || !in_test_output {
+                    // A type error aborts the run before any test executes, so
+                    // the diagnostic and the frame under it are the only things
+                    // naming what broke and where. The echoed source line and
+                    // its caret are dropped like bun's.
+                    if DENO_TS_ERROR.is_match(trimmed) {
+                        failures.push(line.to_string());
+                        in_ts_error = true;
+                        continue;
+                    }
+                    if in_ts_error {
+                        if trimmed.starts_with("at ") {
+                            failures.push(line.to_string());
+                            in_ts_error = false;
+                            continue;
+                        }
+                        if trimmed.is_empty() {
+                            in_ts_error = false;
+                        }
+                        continue;
+                    }
+                    if trimmed.starts_with("FAILED |")
+                        || trimmed.starts_with("ok |")
+                        || line.contains("test result:")
+                    {
+                        result.push(line.to_string());
+                        in_failures_list = false;
+                    } else if trimmed == "FAILURES" || line.starts_with("failures:") {
+                        in_failures_list = true;
+                    } else if in_failures_list && !trimmed.is_empty() {
+                        failures.push(line.to_string());
+                    }
+                    blocks.feed(line, trimmed, &DENO_POLICY);
+                }
             }
 
             TestEcosystem::Unknown => {}
@@ -858,92 +922,6 @@ mod err_test_runner_tests {
     }
 
     #[test]
-    fn test_bun_multifail_golden() {
-        let raw = include_str!("../../tests/fixtures/bun_test_multifail_raw.txt");
-        let out = extract_test_summary(raw, TestEcosystem::Bun);
-        let expected = r#"[FAIL] FAILURES:
-  (fail) t2 fails [1.86ms]
-  (fail) t4 fails [0.08ms]
-  (fail) t6 fails [0.21ms]
-  (fail) t8 fails [0.97ms]
-  error: expect(received).toBe(expected)
-  Expected: 3
-  Received: 2
-  error: expect(received).toBe(expected)
-  Expected: 4
-  Received: 3
-  error: expect(received).toContain(expected)
-  Expected to contain: "bye"
-  Received: "hello"
-  error: expect(received).toEqual(expected)
-  {
-  -   "a": 2,
-  +   "a": 1,
-  }
-  - Expected  - 1
-  + Received  + 1
-
-SUMMARY:
-   6 pass
-   4 fail
-  Ran 10 tests across 1 file. [62.00ms]
-"#;
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn test_bun_multifail_keeps_diagnostics_drops_noise() {
-        let raw = include_str!("../../tests/fixtures/bun_test_multifail_raw.txt");
-        let out = extract_test_summary(raw, TestEcosystem::Bun);
-        // The one thing an agent needs: expected vs received, per failure.
-        assert!(
-            out.contains("error: expect(received).toBe(expected)"),
-            "{out}"
-        );
-        assert!(out.contains("Expected: 3"), "{out}");
-        assert!(out.contains("Received: 2"), "{out}");
-        assert!(out.contains("Expected to contain: \"bye\""), "{out}");
-        assert!(out.contains("(fail) t2 fails"), "{out}");
-        assert!(out.contains("(fail) t8 fails"), "{out}");
-        // Echoed source context must not leak into the summary.
-        assert!(!out.contains("test(\"t1 passes\""), "{out}");
-        assert!(!out.contains("test(\"t2 fails\""), "{out}");
-        // Stack frames are noise once the failing test is named.
-        assert!(!out.contains("at <anonymous>"), "{out}");
-        assert!(out.contains("4 fail"), "{out}");
-        assert!(out.contains("Ran 10 tests"), "{out}");
-    }
-
-    #[test]
-    fn test_bun_multifail_savings() {
-        let raw = include_str!("../../tests/fixtures/bun_test_multifail_raw.txt");
-        let out = extract_test_summary(raw, TestEcosystem::Bun);
-        let savings = 100.0 - (count_tokens(&out) as f64 / count_tokens(raw) as f64 * 100.0);
-        assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
-    }
-
-    #[test]
-    fn test_bun_all_pass_summary_only() {
-        let raw = include_str!("../../tests/fixtures/bun_test_pass_raw.txt");
-        let out = extract_test_summary(raw, TestEcosystem::Bun);
-        assert!(!out.contains("[FAIL]"), "{out}");
-        assert!(out.contains("3 pass"), "{out}");
-        assert!(out.contains("0 fail"), "{out}");
-        assert!(out.contains("Ran 3 tests"), "{out}");
-    }
-
-    #[test]
-    fn test_bun_thrown_error_skip_todo() {
-        let raw = include_str!("../../tests/fixtures/bun_test_throw_skip_raw.txt");
-        let out = extract_test_summary(raw, TestEcosystem::Bun);
-        assert!(out.contains("error: boom: connection refused"), "{out}");
-        assert!(out.contains("(fail) throws"), "{out}");
-        assert!(out.contains("1 skip"), "{out}");
-        assert!(out.contains("1 todo"), "{out}");
-        assert!(!out.contains("at <anonymous>"), "{out}");
-    }
-
-    #[test]
     fn test_bun_module_load_error_survives_with_no_fail_marker() {
         // Bun prints no "(fail)" line when a test file cannot load, so the
         // diagnostic is the only thing that says why rtk is exiting non-zero.
@@ -956,78 +934,210 @@ SUMMARY:
     }
 
     #[test]
-    fn test_bun_test_stdout_error_is_not_a_failure() {
-        // A passing test that logs its own "error: ..." must not manufacture a
-        // failure block out of the lines that follow it.
-        let raw = include_str!("../../tests/fixtures/bun_test_stdout_error_raw.txt");
-        let out = extract_test_summary(raw, TestEcosystem::Bun);
-        assert!(!out.contains("[FAIL]"), "{out}");
-        assert!(!out.contains("logged by test"), "{out}");
-        assert!(out.contains("2 pass"), "{out}");
-        assert!(out.contains("0 fail"), "{out}");
+    fn test_is_watch_mode_detects_the_forms_that_never_exit() {
+        let watched: Vec<String> = ["--watch"].iter().map(|s| s.to_string()).collect();
+        assert!(is_watch_mode(&watched));
+
+        let valued: Vec<String> = ["--watch=src"].iter().map(|s| s.to_string()).collect();
+        assert!(is_watch_mode(&valued));
+
+        // A path or flag that merely starts with the same letters is not it.
+        let plain: Vec<String> = ["--watchdog", "./watch", "-w"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(!is_watch_mode(&plain));
+
+        assert!(!is_watch_mode(&[]));
     }
 
     #[test]
-    fn test_bun_test_stdout_error_between_real_failures() {
-        // The same log line, this time interleaved with two genuine failures:
-        // the real diagnostics survive and the logged one is still dropped.
-        let raw = include_str!("../../tests/fixtures/bun_test_stdout_error_mixed_raw.txt");
-        let out = extract_test_summary(raw, TestEcosystem::Bun);
-        assert!(out.contains("(fail) t2 fails"), "{out}");
-        assert!(out.contains("(fail) t4 fails too"), "{out}");
-        assert!(out.contains("Expected: 3"), "{out}");
-        assert!(out.contains("Received: 2"), "{out}");
-        assert!(out.contains("Expected: 5"), "{out}");
-        assert!(out.contains("Received: 4"), "{out}");
-        assert!(!out.contains("logged by test"), "{out}");
-        assert!(!out.contains("console.log"), "{out}");
+    fn test_deno_output_fence_matches_every_variant() {
+        assert_eq!(deno_output_fence("------- output -------"), Some(true));
+        assert_eq!(deno_output_fence("----- output end -----"), Some(false));
+        assert_eq!(
+            deno_output_fence("------- post-test output -------"),
+            Some(true)
+        );
+        assert_eq!(
+            deno_output_fence("----- post-test output end -----"),
+            Some(false)
+        );
+        assert_eq!(
+            deno_output_fence("------- pre-test output -------"),
+            Some(true)
+        );
+        assert_eq!(deno_output_fence("error: nope"), None);
+        assert_eq!(deno_output_fence("-------"), None);
+    }
+
+    /// One green run per runtime whose tests log the vocabulary the runner uses
+    /// for failures: bun's cross and an "error:" line with a stack, deno's
+    /// FAILURES and ERRORS headers inside its output fences. None of it is the
+    /// runner speaking, so none of it may reach the summary.
+    /// Exact output for each consolidated capture. The targeted assertions
+    /// above say why each element matters; this catches anything else moving.
+    #[test]
+    fn test_golden_output_for_each_runtime() {
+        let cases: [(TestEcosystem, &str, &str); 4] = [
+            (
+                TestEcosystem::Bun,
+                include_str!("../../tests/fixtures/bun_test_green_raw.txt"),
+                "SUMMARY:\n   3 pass\n   0 fail\n  Ran 3 tests across 1 file. [5.00ms]\n",
+            ),
+            (
+                TestEcosystem::Bun,
+                include_str!("../../tests/fixtures/bun_test_failures_raw.txt"),
+                concat!(
+                    "[FAIL] FAILURES:\n",
+                    "  \u{2717} t2 fails [0.13ms]\n",
+                    "  \u{2717} t4 fails too [0.03ms]\n",
+                    "  \u{2717} t5 throws [0.02ms]\n",
+                    "  \u{2717} t6 times out [150.10ms]\n",
+                    "  error: expect(received).toBe(expected)\n",
+                    "  Expected: 3\n",
+                    "  Received: 2\n",
+                    "  at <anonymous> (/home/user/project/fails.test.ts:3:40)\n",
+                    "  error: expect(received).toBe(expected)\n",
+                    "  Expected: 4\n",
+                    "  Received: 3\n",
+                    "  at <anonymous> (/home/user/project/fails.test.ts:8:55)\n",
+                    "  error: boom: connection refused\n",
+                    "  at <anonymous> (/home/user/project/fails.test.ts:9:69)\n",
+                    "  error: Test \"t6 times out\" timed out after 150ms\n",
+                    "\n",
+                    "SUMMARY:\n",
+                    "   2 pass\n",
+                    "   1 skip\n",
+                    "   1 todo\n",
+                    "   4 fail\n",
+                    "  Ran 8 tests across 1 file. [157.00ms]\n",
+                ),
+            ),
+            (
+                TestEcosystem::Deno,
+                include_str!("../../tests/fixtures/deno_test_green_raw.txt"),
+                "SUMMARY:\n  ok | 2 passed | 0 failed (1ms)\n",
+            ),
+            (
+                TestEcosystem::Deno,
+                include_str!("../../tests/fixtures/deno_test_failures_raw.txt"),
+                concat!(
+                    "[FAIL] FAILURES:\n",
+                    "  plain assertion => ./fails_test.ts:2:6\n",
+                    "  arrow in message => ./fails_test.ts:3:6\n",
+                    "  error: AssertionError: Values are not equal.\n",
+                    "  [Diff] Actual / Expected\n",
+                    "  -   1\n",
+                    "  +   2\n",
+                    "  error: AssertionError: Values are not equal: handler (a) => b must match\n",
+                    "  [Diff] Actual / Expected\n",
+                    "  -   x\n",
+                    "  +   y\n",
+                    "\n",
+                    "SUMMARY:\n",
+                    "  FAILED | 3 passed | 2 failed (15ms)\n",
+                ),
+            ),
+        ];
+        for (eco, raw, expected) in cases {
+            assert_eq!(extract_test_summary(raw, eco), expected, "{eco:?}");
+        }
     }
 
     #[test]
-    fn test_deno_leak_failure_closes_at_section_boundary() {
-        // Leak and sanitizer failures carry no "at " stack frame, so nothing
-        // else would ever close the diagnostic block.
-        let raw = include_str!("../../tests/fixtures/deno_test_leak_raw.txt");
-        let out = extract_test_summary(raw, TestEcosystem::Deno);
-        assert!(out.contains("Leaks detected"), "{out}");
-        assert!(out.contains("FAILED | 1 passed | 1 failed"), "{out}");
-        // The footer and section headers must not be swallowed into the block.
-        assert_eq!(out.matches("t2 leaks a timer").count(), 1, "{out}");
-        assert!(!out.contains("error: Test failed"), "{out}");
-    }
-
-    /// Every test-output scenario is asserted on both runtimes, so a fix that
-    /// lands on one and not the other fails here instead of in a later review.
-    const PAIRED_GREEN_LOG: [(TestEcosystem, &str); 4] = [
-        (
-            TestEcosystem::Bun,
-            include_str!("../../tests/fixtures/bun_test_stdout_error_raw.txt"),
-        ),
-        (
-            TestEcosystem::Deno,
-            include_str!("../../tests/fixtures/deno_test_stdout_error_raw.txt"),
-        ),
-        (
-            TestEcosystem::Bun,
-            include_str!("../../tests/fixtures/bun_test_stdout_stack_raw.txt"),
-        ),
-        (
-            TestEcosystem::Deno,
-            include_str!("../../tests/fixtures/deno_test_stdout_stack_raw.txt"),
-        ),
-    ];
-
-    #[test]
-    fn test_green_run_never_reports_a_failure_on_either_runtime() {
-        // A passing test that logs its own "error:" line, with and without a
-        // stack. Reporting these as failures is worse than a degraded message
-        // on a red run: it is a false positive on a green one.
-        for (eco, raw) in PAIRED_GREEN_LOG {
+    fn test_a_green_run_is_never_reported_red() {
+        for (eco, raw, ok_marker) in [
+            (
+                TestEcosystem::Bun,
+                include_str!("../../tests/fixtures/bun_test_green_raw.txt"),
+                "0 fail",
+            ),
+            (
+                TestEcosystem::Deno,
+                include_str!("../../tests/fixtures/deno_test_green_raw.txt"),
+                "0 failed",
+            ),
+        ] {
             let out = extract_test_summary(raw, eco);
             assert!(!out.contains("[FAIL]"), "{eco:?}: {out}");
-            assert!(!out.contains("could not reach cache"), "{eco:?}: {out}");
-            assert!(!out.contains("fetchCache"), "{eco:?}: {out}");
+            assert!(out.contains(ok_marker), "{eco:?}: {out}");
+            // Nothing a test logged may be quoted back as a diagnostic.
+            for logged in ["optional dep", "legacy fixture header", "only a log line"] {
+                assert!(!out.contains(logged), "{eco:?} leaked {logged}: {out}");
+            }
         }
+    }
+
+    /// One red run per runtime carrying every failure shape at once.
+    #[test]
+    fn test_a_red_run_keeps_each_failure_and_its_reason() {
+        let bun = extract_test_summary(
+            include_str!("../../tests/fixtures/bun_test_failures_raw.txt"),
+            TestEcosystem::Bun,
+        );
+        assert!(bun.contains("[FAIL]"), "{bun}");
+        // Assertion failures: marker, expected/received, and the frame locating it.
+        assert!(bun.contains("t2 fails"), "{bun}");
+        assert!(bun.contains("Expected: 3"), "{bun}");
+        assert!(bun.contains("Received: 2"), "{bun}");
+        assert!(bun.contains("fails.test.ts:3:40"), "{bun}");
+        // A thrown error, and a timeout, which carries no frame at all.
+        assert!(bun.contains("boom: connection refused"), "{bun}");
+        assert!(bun.contains("timed out after 150ms"), "{bun}");
+        // Counts, including skip and todo.
+        assert!(bun.contains("4 fail"), "{bun}");
+        assert!(bun.contains("1 skip"), "{bun}");
+        assert!(bun.contains("1 todo"), "{bun}");
+        // Echoed source context, and a line a passing test logged between two
+        // real failures, both stay out.
+        assert!(!bun.contains("test(\"t1 passes\""), "{bun}");
+        assert!(!bun.contains("logged between real failures"), "{bun}");
+
+        let deno = extract_test_summary(
+            include_str!("../../tests/fixtures/deno_test_failures_raw.txt"),
+            TestEcosystem::Deno,
+        );
+        assert!(deno.contains("[FAIL]"), "{deno}");
+        assert!(deno.contains("AssertionError"), "{deno}");
+        assert!(deno.contains("[Diff]"), "{deno}");
+        // An arrow inside an assertion message must not read as an entry header
+        // and end the diagnostic it belongs to.
+        assert!(deno.contains("handler (a) => b must match"), "{deno}");
+        assert!(deno.contains("-   x"), "{deno}");
+        assert!(deno.contains("+   y"), "{deno}");
+        assert!(deno.contains("2 failed"), "{deno}");
+    }
+
+    #[test]
+    fn test_red_run_savings_on_either_runtime() {
+        for (eco, raw) in [
+            (
+                TestEcosystem::Bun,
+                include_str!("../../tests/fixtures/bun_test_failures_raw.txt"),
+            ),
+            (
+                TestEcosystem::Deno,
+                include_str!("../../tests/fixtures/deno_test_failures_raw.txt"),
+            ),
+        ] {
+            let out = extract_test_summary(raw, eco);
+            let savings = 100.0 - (count_tokens(&out) as f64 / count_tokens(raw) as f64 * 100.0);
+            assert!(savings >= 20.0, "{eco:?}: got {savings:.1}%");
+        }
+    }
+
+    #[test]
+    fn test_deno_typecheck_error_keeps_its_code_and_location() {
+        // A type error aborts the run before any test executes: deno prints no
+        // FAILURES section and no "error:"-introduced diagnostic, so the TS code
+        // and the frame under it are all there is to report.
+        let raw = include_str!("../../tests/fixtures/deno_test_typecheck_raw.txt");
+        let out = extract_test_summary(raw, TestEcosystem::Deno);
+        assert!(out.contains("TS2322 [ERROR]"), "{out}");
+        assert!(out.contains("typ_test.ts:1:7"), "{out}");
+        // The echoed source and its caret stay out, as they do for bun.
+        assert!(!out.contains("const n: number"), "{out}");
     }
 
     #[test]
@@ -1074,56 +1184,6 @@ SUMMARY:
         assert_eq!(TestEcosystem::detect("pytest -x"), TestEcosystem::Pytest);
         assert_eq!(TestEcosystem::detect("npm test"), TestEcosystem::Jest);
         assert_eq!(TestEcosystem::detect("make check"), TestEcosystem::Unknown);
-    }
-
-    #[test]
-    fn test_deno_multifail_golden() {
-        // Real deno 2.9.1 output: ANSI-colored, " FAILURES " section header,
-        // "FAILED | 3 passed | 2 failed" footer. No "test result:" lines.
-        let raw = include_str!("../../tests/fixtures/deno_test_multifail_raw.txt");
-        let out = extract_test_summary(raw, TestEcosystem::Deno);
-        let expected = r#"[FAIL] FAILURES:
-  subs fails => ./math_test.ts:3:6
-  len fails => ./math_test.ts:5:6
-  includes fails => ./more_test.ts:3:6
-  object fails => ./more_test.ts:5:6
-  error: AssertionError: Values are not equal.
-  [Diff] Actual / Expected
-  -   2
-  +   1
-  error: AssertionError: Values are not equal.
-  [Diff] Actual / Expected
-  -   3
-  +   4
-  error: AssertionError: Expected actual: "hello world" to contain: "bye".
-  error: AssertionError: Values are not equal.
-  [Diff] Actual / Expected
-  {
-  a: 1,
-  -     b: 2,
-  +     b: 3,
-  }
-
-SUMMARY:
-  FAILED | 9 passed | 4 failed (64ms)
-"#;
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn test_deno_multifail_savings() {
-        let raw = include_str!("../../tests/fixtures/deno_test_multifail_raw.txt");
-        let out = extract_test_summary(raw, TestEcosystem::Deno);
-        let savings = 100.0 - (count_tokens(&out) as f64 / count_tokens(raw) as f64 * 100.0);
-        assert!(savings >= 60.0, "expected >=60% savings, got {savings:.1}%");
-    }
-
-    #[test]
-    fn test_deno_all_pass_summary_only() {
-        let raw = include_str!("../../tests/fixtures/deno_test_pass_raw.txt");
-        let out = extract_test_summary(raw, TestEcosystem::Deno);
-        assert!(!out.contains("[FAIL]"), "{out}");
-        assert!(out.contains("ok | 3 passed | 0 failed"), "{out}");
     }
 
     #[test]

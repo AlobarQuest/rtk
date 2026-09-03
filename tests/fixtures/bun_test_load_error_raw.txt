@@ -4,7 +4,7 @@ loadfail.test.ts:
 
 # Unhandled error between tests
 -------------------------------
-error: Cannot find module './does-not-exist' from '/private/tmp/claude-501/-Users-geofflittle-code-rtk/8bcaaec8-9ac3-4c8e-add8-d5402ea4ad6e/scratchpad/probe/loadfail.test.ts'
+error: Cannot find module './does-not-exist' from '/home/user/project/loadfail.test.ts'
 -------------------------------
 
 

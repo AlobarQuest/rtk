@@ -230,7 +230,7 @@ rtk prisma generate             # Schema generation (no ASCII art)
 
 ### Runtimes
 ```bash
-rtk bun install                  # Strip progress bars (~80% reduction)
+rtk bun install                  # Strip progress and version lines
 rtk bun test                     # Failures only (-90%)
 rtk bun build                    # Errors only when writing to disk, else passthrough
 rtk bunx tsc                     # Smart routing to tsc filter
