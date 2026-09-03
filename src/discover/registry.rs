@@ -185,13 +185,20 @@ pub fn classify_command(cmd: &str) -> Classification {
                     .map(|(_, st)| *st)
                     .unwrap_or(super::report::RtkStatus::Existing);
 
-                // Check if this subcommand has custom savings
-                let savings = rule
-                    .subcmd_savings
-                    .iter()
-                    .find(|(s, _)| *s == subcmd)
-                    .map(|(_, pct)| *pct)
-                    .unwrap_or(rule.savings_pct);
+                // A passthrough subcommand runs unfiltered, so it cannot save
+                // anything. Deriving that from the status keeps the two from
+                // drifting: a rule that marks a subcommand passthrough without
+                // also zeroing its entry in `subcmd_savings` would otherwise
+                // inherit the rule's headline percentage.
+                let savings = if status == super::report::RtkStatus::Passthrough {
+                    0.0
+                } else {
+                    rule.subcmd_savings
+                        .iter()
+                        .find(|(s, _)| *s == subcmd)
+                        .map(|(_, pct)| *pct)
+                        .unwrap_or(rule.savings_pct)
+                };
 
                 (savings, status)
             } else {
@@ -2194,12 +2201,14 @@ mod tests {
 
     #[test]
     fn test_classify_cargo_fmt_passthrough() {
+        // Passthrough: `cargo fmt` runs unfiltered, so it saves nothing even
+        // though the rule's other subcommands do.
         assert_eq!(
             classify_command("cargo fmt"),
             Classification::Supported {
                 rtk_equivalent: "rtk cargo",
                 category: "Cargo",
-                estimated_savings_pct: 80.0,
+                estimated_savings_pct: 0.0,
                 status: RtkStatus::Passthrough,
             }
         );
@@ -3451,17 +3460,26 @@ mod tests {
 
     #[test]
     fn test_passthrough_subcommands_claim_no_savings() {
-        // deno install and bun pm <non-ls> run unfiltered, so discover must not
-        // credit them with the rule's headline savings.
-        let (status, _) = status_and_savings("deno install npm:cowsay");
-        assert_eq!(status, RtkStatus::Passthrough);
-        let (status, _) = status_and_savings("bun pm cache rm");
-        assert_eq!(status, RtkStatus::Passthrough);
+        // These run unfiltered, so discover must not credit them with the
+        // rule's headline savings. Asserting the percentage matters as much as
+        // the status: the two are separate fields and only the percentage
+        // reaches the projection.
+        for cmd in [
+            "deno install npm:cowsay",
+            "deno run main.ts",
+            "deno task build",
+            "bun pm cache rm",
+            "bun run dev",
+            "bun build ./index.ts",
+            "deno compile m.ts",
+            "cargo fmt",
+        ] {
+            let (status, savings) = status_and_savings(cmd);
+            assert_eq!(status, RtkStatus::Passthrough, "{cmd}");
+            assert_eq!(savings, 0.0, "{cmd}");
+        }
 
         // The filtered forms are still credited.
-        let (status, _) = status_and_savings("bun build ./index.ts");
-        assert_eq!(status, RtkStatus::Passthrough);
-
         let (status, savings) = status_and_savings("bun pm ls");
         assert_eq!(status, RtkStatus::Existing);
         assert_eq!(savings, 70.0);
