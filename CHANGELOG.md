@@ -5,6 +5,51 @@ All notable changes to rtk (Rust Token Killer) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.0](https://github.com/rtk-ai/rtk/compare/v0.47.0...v0.48.0) (2026-09-04)
+
+
+### Features
+
+* add Bun and Deno runtime support ([856c345](https://github.com/rtk-ai/rtk/commit/856c34599a50086e00f145aa2690fdd309a3d136))
+* **bun,deno:** add Bun and Deno runtime support ([36788f6](https://github.com/rtk-ai/rtk/commit/36788f6bd4932037caac5cbb1d15d6e2fb9f33da))
+* **bun:** route bun x to bunx tool filters ([a9ef10f](https://github.com/rtk-ai/rtk/commit/a9ef10fcb1faa82563f54b7ea431e422236d9e66))
+* **runner:** bun and deno test summaries ([f4ac0cc](https://github.com/rtk-ai/rtk/commit/f4ac0cc8a388248ebf079fd0f4cc6c4b26cdf874))
+
+
+### Bug Fixes
+
+* **benchmark:** skip find's disclosure note and tee pointer when counting names ([c7fc40a](https://github.com/rtk-ai/rtk/commit/c7fc40ab84a50ca11d31cf7270c997f0e59434f2))
+* **benchmark:** skip find's disclosure note and tee pointer when counting names ([d952a6b](https://github.com/rtk-ai/rtk/commit/d952a6b5de06fe87a06815024839c128a40392fb))
+* **bun,deno:** address review feedback ([55d2390](https://github.com/rtk-ai/rtk/commit/55d239036be584352328b30ee584bfa9a4e53ae9))
+* **bun,deno:** fix routing bugs, align with project conventions ([2c52649](https://github.com/rtk-ai/rtk/commit/2c52649bfd8b6dc695e8dc4d4f76b8d2983d1d28))
+* **bun,deno:** run via arg vectors, not shell ([2416b8c](https://github.com/rtk-ai/rtk/commit/2416b8c5b7ab4fde3affa6e757a870cc54e2f9a3))
+* **bun:** add tee recovery to run_pkg/run_pm_ls ([3b6d1e4](https://github.com/rtk-ai/rtk/commit/3b6d1e4180dddb30bf9381b5c609aeeea13b3a79))
+* **bun:** filter combined stdout and stderr ([b850696](https://github.com/rtk-ai/rtk/commit/b850696e3d4885bab9d89f14ffddd8576fb8062d))
+* **bun:** parse real pm ls tree output ([4fb2c3a](https://github.com/rtk-ai/rtk/commit/4fb2c3abe1499c8bdae1cefc7ea5c11b67d47913))
+* **bun:** route pkg and pm ls through the core runner ([0a7e992](https://github.com/rtk-ai/rtk/commit/0a7e9920955ae14d50077e7fac188c3bc3fedc0e))
+* **bun:** stop rejecting valid package specs ([8f056b2](https://github.com/rtk-ai/rtk/commit/8f056b27f8f7c956ae7c47b225d7186bdafe6ba6))
+* **deno:** route lint/check through core runner ([d23e158](https://github.com/rtk-ai/rtk/commit/d23e1587e79f90c5d0b404e85e672f785d4b7da3))
+* **diff:** don't report byte-different files as identical ([4f3c9fe](https://github.com/rtk-ai/rtk/commit/4f3c9feddd0ef147ad8008cc1bd8f8c054bda051))
+* **discover:** derive savings from passthrough status ([e78427b](https://github.com/rtk-ai/rtk/commit/e78427b82f80a7665f72f446c0a02499ebe5f230))
+* **discover:** log real hook decisions instead of guessing coverage retroactively ([f57af35](https://github.com/rtk-ai/rtk/commit/f57af3581b86624790bce23cf3e5e31db2c5b53a))
+* **discover:** stop crediting passthrough subcommands ([a3cca44](https://github.com/rtk-ai/rtk/commit/a3cca44a0f0e6b2cc9881b6dc23d4e1094551489))
+* **filters:** reject unanchored TOML match_command at load ([3522477](https://github.com/rtk-ai/rtk/commit/35224779ea9e30744c16d447a3edef7b26e17851))
+* **find:** bound disclosure bookkeeping, disclose through a symlinked root, align the note with ls ([68dc719](https://github.com/rtk-ai/rtk/commit/68dc719ddc084644bab9651853ac6e1d3fcdd95e))
+* **find:** report a missing path like find does, and disclose hidden/gitignored matches ([9cf048a](https://github.com/rtk-ai/rtk/commit/9cf048ae8819f0685ebf7b2f7914f48ab243e47e))
+* **find:** report a missing path like find does, and disclose hidden/gitignored matches ([765b270](https://github.com/rtk-ai/rtk/commit/765b2709047a0058e4eedf8baa87ac9d6469336b)), closes [#3851](https://github.com/rtk-ai/rtk/issues/3851)
+* **js:** correct bun and deno filtering, routing, and accounting ([9bee7a0](https://github.com/rtk-ai/rtk/commit/9bee7a0d8f843949c0dae4420f3c2342c5f0a99b))
+* **js:** correct bun and deno runtime behavior ([1173de0](https://github.com/rtk-ai/rtk/commit/1173de0686adb26792598525a6941722c498dd22))
+* **js:** keep each caller's behavior for a missing tool ([6ff2571](https://github.com/rtk-ai/rtk/commit/6ff25718207350661bf78fe21d4bddb966b6d69a))
+* **js:** run tools through the runner the user named ([c7c1d96](https://github.com/rtk-ai/rtk/commit/c7c1d9663ce4cec3f89965809ee000e04d6e6f90))
+* **rebase:** clean up flat-layout stale files and fix i32 return types ([afcad86](https://github.com/rtk-ai/rtk/commit/afcad8691255840324b9572fc903189d0158e16f))
+* **runner:** anchor bun test summary extraction ([9e2e4b6](https://github.com/rtk-ai/rtk/commit/9e2e4b6793402c7feca32e79a99e839f1b5d66c3))
+* **runner:** keep real diagnostics, drop test stdout ([50bee30](https://github.com/rtk-ai/rtk/commit/50bee3097731cf1be40cc045e4183fdceff35eca))
+* **runner:** parse current deno test output format ([65cd2f7](https://github.com/rtk-ai/rtk/commit/65cd2f785165a9a4eff0ae4534d53bd2e3132790))
+* **telemetry:** distinguish "consent not given" from missing salt in status ([#1656](https://github.com/rtk-ai/rtk/issues/1656)) ([5189bde](https://github.com/rtk-ai/rtk/commit/5189bdec6ce1c403ec1d69d20378a1375f8cbad5))
+* **telemetry:** distinguish "consent not given" from missing salt in status ([#1656](https://github.com/rtk-ai/rtk/issues/1656)) ([ef363a4](https://github.com/rtk-ai/rtk/commit/ef363a4da74f9f512247ed1ce675bad8c46e212c))
+* **telemetry:** label the missing salt by the gate that actually fired ([3a0ed92](https://github.com/rtk-ai/rtk/commit/3a0ed926fd53ded92bcd22a50bf3eac73438a368))
+* **telemetry:** treat an empty RTK_TELEMETRY_URL as no endpoint ([bb85017](https://github.com/rtk-ai/rtk/commit/bb85017131a137815a400897ddc52a623852b00c))
+
 ## [0.47.0](https://github.com/rtk-ai/rtk/compare/v0.46.0...v0.47.0) (2026-09-01)
 
 
