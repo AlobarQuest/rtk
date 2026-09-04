@@ -213,6 +213,8 @@ count_find_names() {
     /^[0-9]+F [0-9]+D:$/ { next }   # "356F 63D:" summary header
     /^\+[0-9]+ more$/    { next }   # "+256 more" truncation marker
     /^ext: /             { next }   # extension histogram footer
+    /^\.\.\. \(/          { next }   # "... (8 filtered)" disclosure note
+    /^\[see remaining: / { next }   # tee pointer for the disclosed entries
     NF == 0              { next }
     { n += NF - ($1 ~ /\/$/ ? 1 : 0) }   # grouped lines lead with "dir/"
     END { print n + 0 }
@@ -226,6 +228,8 @@ count_find_total() {
     /^[0-9]+F [0-9]+D:$/ { total = $1 + 0; next }
     /^\+[0-9]+ more$/    { more = substr($1, 2) + 0; next }
     /^ext: /             { next }
+    /^\.\.\. \(/          { next }
+    /^\[see remaining: / { next }
     NF == 0              { next }
     { shown += NF - ($1 ~ /\/$/ ? 1 : 0) }
     END { print (total ? total : shown + more) + 0 }
