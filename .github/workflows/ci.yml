@@ -1,0 +1,58 @@
+# The fork's own gate. Upstream runs a far larger matrix on its own repository; this one answers a
+# narrower question that upstream's CI structurally cannot: does the MERGED tree -- upstream's
+# release plus this fork's hardening patches -- build and pass?
+#
+# WHY THIS EXISTS. Until 2026-09-05 this repository had exactly one workflow, the upstream sync
+# itself, and no required status checks. So a sync pull request reported `mergeable_state: CLEAN`
+# only because NOTHING COULD FAIL -- `clean` means "no required check is failing" while branch
+# protection requires one, and with none it degrades to "no merge conflict". The v0.48.0 sync was
+# +38,129/-5,851 across 264 files, and the only thing standing between it and this machine was an
+# advisory AI review written into a pull-request body.
+#
+# macOS on purpose, and it is the one judgement here. The artifact is installed on an arm64 Mac and
+# 0.48.0 alone added platform code (Windows console code pages, Bun/Deno process routing), so a
+# Linux-only gate can pass while a macOS failure ships. This repository is public, so the runner
+# minutes are free; the cost is queue time, which a landing lane can afford and a person waiting
+# cannot. Add ubuntu alongside if cross-platform breakage ever actually bites.
+#
+# NOT fmt, and NOT clippy. Both belong to upstream's own gate and would red this lane on style in
+# code nobody here wrote -- a permanently-red control is one nobody reads. This checks that it
+# builds and that its tests pass, which is what a landing decision here rests on.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # THE JOB NAME IS THE BRANCH-PROTECTION CONTEXT. Protection keys on the JOB, never the workflow:
+  # naming the workflow blocks every pull request forever, silently, because no such context ever
+  # reports. Renaming this is a paired operation -- move the protected context in the same change.
+  build-and-test:
+    name: build and test
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-version` in Cargo.toml is 1.91; stable is ahead of that and is what a contributor
+      # and the release build both use.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--locked` on both: a build that silently re-resolves is not testing the tree that would
+      # land. It fails loudly if Cargo.lock is stale, which is itself worth knowing on a sync.
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Test
+        run: cargo test --locked
