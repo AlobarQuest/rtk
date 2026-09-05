@@ -17,10 +17,32 @@ jobs:
       pull-requests: write
 
     steps:
+      # A DEDICATED IDENTITY FOR THIS LANE, and the reason is a landing permission rather than
+      # hygiene. Until 2026-09-05 this workflow acted as `GITHUB_TOKEN`, so its pull request's
+      # author read `github-actions[bot]` -- the identity of ANY workflow in this repository. The
+      # estate's inert landing lane permits authors BY NAME, so declaring that one would have
+      # granted "may land unattended" to every workflow-authored pull request here rather than to
+      # the sync. Devon chose the narrower option on 2026-09-05.
+      #
+      # The App's installation is what bounds this now, and it is installed on this repository
+      # alone. Deliberately NOT the `Alobar SDS Dispatch` App, which could already reach here: its
+      # wide grant was left in place on 2026-09-02 BECAUSE every one of its call sites is bounded
+      # by the orchestrator's own allowlists, and a fork's sync authoring pull requests would be a
+      # call site outside them -- removing the ground that ruling stands on.
+      #
+      # ALL THREE uses move together. A checkout as one identity and a pull request as another
+      # would push a branch nobody could attribute to the actor that opened it.
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Configure git
         run: |
@@ -32,7 +54,7 @@ jobs:
       - name: Check for new stable release
         id: check
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           TAG=$(gh api repos/rtk-ai/rtk/releases/latest --jq .tag_name) || { echo "No stable upstream release found — nothing to do."; echo "has_changes=false" >> $GITHUB_OUTPUT; exit 0; }
           CURRENT="v$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
@@ -87,7 +109,7 @@ jobs:
       - name: Open or update PR
         if: steps.check.outputs.has_changes == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           TAG="${{ steps.check.outputs.tag }}"
           COMMITS=$(git log origin/main.."$TAG" --oneline -- . ':!.github' | head -50)
