@@ -132,9 +132,11 @@ payload = {
     "messages": [{"role": "user", "content": prompt}]
 }
 
+failed = None
 api_key = os.environ.get('ANTHROPIC_API_KEY')
 if not api_key:
     review = "Warning: ANTHROPIC_API_KEY not set — AI review skipped. Review the diff manually before merging."
+    failed = "the ANTHROPIC_API_KEY secret is not set"
 else:
     req = urllib.request.Request(
         'https://api.anthropic.com/v1/messages',
@@ -151,6 +153,7 @@ else:
             review = result['content'][0]['text']
     except Exception as e:
         review = "Warning: Error generating AI review: {}\n\nReview the diff manually before merging.".format(e)
+        failed = "the Anthropic API rejected or refused the call: {}".format(e)
 
 # prepend scan hits so they're visible even if the AI summary is brief
 output = review
@@ -165,3 +168,21 @@ if scan_findings:
 with open('/tmp/ai_review.md', 'w') as f:
     f.write(output)
 print(output)
+
+# EXIT NON-ZERO WHEN THE REVIEW DID NOT HAPPEN, and write the warning first so the pull request
+# still carries it. Until 2026-09-05 every failure here was caught, turned into a line of prose in
+# a body nobody reads, and the step exited 0 -- so the run stayed green while the security review
+# this lane exists for was not running at all.
+#
+# Measured that day: rtk's `ANTHROPIC_API_KEY` (set 2026-06-11) answers HTTP 401, while
+# claude-octopus's (set 2026-06-27) produces a real review from this same script. One repository's
+# copy of a credential had gone stale, and nothing said so for as long as it takes a person to
+# read a pull-request body. That is the estate's recurring shape: a per-repo secret copy left
+# behind, dead with no signal until something fails at auth.
+#
+# The warning stays in the body ON PURPOSE. Failing silently and failing invisibly are different
+# problems, and this fixes only the second: the caller opens the pull request either way, so the
+# state is visible, and then fails the run so it is also LOUD.
+if failed is not None:
+    print("::error::AI security review did not run -- {}".format(failed))
+    raise SystemExit(2)

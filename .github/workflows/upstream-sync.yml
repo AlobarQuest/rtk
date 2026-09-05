@@ -72,8 +72,12 @@ jobs:
           set -e
           cat /tmp/cargo_audit.txt
 
+      # `continue-on-error` so the pull request is still opened and still carries the warning --
+      # the state must stay VISIBLE. The run is failed at the end instead, by the gate below.
       - name: Generate AI security review
+        id: review
         if: steps.check.outputs.has_changes == 'true'
+        continue-on-error: true
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           BASE_REF: origin/main
@@ -116,3 +120,17 @@ jobs:
               --title "⬆️ Upstream sync — ${TAG}" \
               --body-file /tmp/pr_body.md
           fi
+
+      # THE GATE. Without it this workflow reported `success` for six consecutive days while its
+      # security review was answering HTTP 401 -- the failure was written into the pull-request
+      # body and nowhere else, so the only reader was whoever happened to scroll that far.
+      #
+      # Deliberately AFTER the pull request step: a sync whose review did not run should still be
+      # visible, and should not be mergeable-looking. Visible and red, not hidden and green.
+      - name: Fail the run if the security review did not happen
+        if: steps.check.outputs.has_changes == 'true' && steps.review.outcome == 'failure'
+        run: |
+          echo "::error::the AI security review did not run; the pull request body says why."
+          echo "This run opened or updated the pull request so the state is visible, and fails"
+          echo "here so it is not silently green. Read the body, fix the cause, re-run."
+          exit 1
