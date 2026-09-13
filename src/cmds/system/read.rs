@@ -26,20 +26,21 @@ pub fn run(
     // Read file content
     let bytes =
         fs::read(file).with_context(|| format!("Failed to read file: {}", file.display()))?;
-    if level == FilterLevel::None && !line_numbers {
-        if let Some(window) = byte_line_window(&bytes, head_lines, tail_lines) {
-            io::stdout()
-                .lock()
-                .write_all(window)
-                .context("Failed to write line window")?;
-            timer.track(
-                &format!("cat {}", file.display()),
-                "rtk read",
-                &String::from_utf8_lossy(&bytes),
-                &String::from_utf8_lossy(window),
-            );
-            return Ok(());
-        }
+    if level == FilterLevel::None
+        && !line_numbers
+        && let Some(window) = byte_line_window(&bytes, head_lines, tail_lines)
+    {
+        io::stdout()
+            .lock()
+            .write_all(window)
+            .context("Failed to write line window")?;
+        timer.track(
+            &format!("cat {}", file.display()),
+            "rtk read",
+            &String::from_utf8_lossy(&bytes),
+            &String::from_utf8_lossy(window),
+        );
+        return Ok(());
     }
     let content = String::from_utf8(bytes)
         .with_context(|| format!("Failed to decode file: {}", file.display()))?;
@@ -119,20 +120,21 @@ pub fn run_stdin(
         .lock()
         .read_to_end(&mut bytes)
         .context("Failed to read from stdin")?;
-    if level == FilterLevel::None && !line_numbers {
-        if let Some(window) = byte_line_window(&bytes, head_lines, tail_lines) {
-            io::stdout()
-                .lock()
-                .write_all(window)
-                .context("Failed to write line window")?;
-            timer.track(
-                "cat - (stdin)",
-                "rtk read -",
-                &String::from_utf8_lossy(&bytes),
-                &String::from_utf8_lossy(window),
-            );
-            return Ok(());
-        }
+    if level == FilterLevel::None
+        && !line_numbers
+        && let Some(window) = byte_line_window(&bytes, head_lines, tail_lines)
+    {
+        io::stdout()
+            .lock()
+            .write_all(window)
+            .context("Failed to write line window")?;
+        timer.track(
+            "cat - (stdin)",
+            "rtk read -",
+            &String::from_utf8_lossy(&bytes),
+            &String::from_utf8_lossy(window),
+        );
+        return Ok(());
     }
     let content = String::from_utf8(bytes).context("Failed to decode stdin")?;
 
