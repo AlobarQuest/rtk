@@ -24,22 +24,23 @@ pub fn run(
     }
 
     // Read file content
-    let bytes = fs::read(file)
-        .with_context(|| format!("Failed to read file: {}", file.display()))?;
-    if level == FilterLevel::None && !line_numbers {
-        if let Some(window) = byte_line_window(&bytes, head_lines, tail_lines) {
-            io::stdout()
-                .lock()
-                .write_all(window)
-                .context("Failed to write line window")?;
-            timer.track(
-                &format!("cat {}", file.display()),
-                "rtk read",
-                &String::from_utf8_lossy(&bytes),
-                &String::from_utf8_lossy(window),
-            );
-            return Ok(());
-        }
+    let bytes =
+        fs::read(file).with_context(|| format!("Failed to read file: {}", file.display()))?;
+    if level == FilterLevel::None
+        && !line_numbers
+        && let Some(window) = byte_line_window(&bytes, head_lines, tail_lines)
+    {
+        io::stdout()
+            .lock()
+            .write_all(window)
+            .context("Failed to write line window")?;
+        timer.track(
+            &format!("cat {}", file.display()),
+            "rtk read",
+            &String::from_utf8_lossy(&bytes),
+            &String::from_utf8_lossy(window),
+        );
+        return Ok(());
     }
     let content = String::from_utf8(bytes)
         .with_context(|| format!("Failed to decode file: {}", file.display()))?;
@@ -95,12 +96,7 @@ pub fn run(
     };
     let shown = never_worse(&raw, &rtk_output);
     print!("{}", shown);
-    timer.track(
-        &format!("cat {}", file.display()),
-        "rtk read",
-        &raw,
-        shown,
-    );
+    timer.track(&format!("cat {}", file.display()), "rtk read", &raw, shown);
     Ok(())
 }
 
@@ -124,20 +120,21 @@ pub fn run_stdin(
         .lock()
         .read_to_end(&mut bytes)
         .context("Failed to read from stdin")?;
-    if level == FilterLevel::None && !line_numbers {
-        if let Some(window) = byte_line_window(&bytes, head_lines, tail_lines) {
-            io::stdout()
-                .lock()
-                .write_all(window)
-                .context("Failed to write line window")?;
-            timer.track(
-                "cat - (stdin)",
-                "rtk read -",
-                &String::from_utf8_lossy(&bytes),
-                &String::from_utf8_lossy(window),
-            );
-            return Ok(());
-        }
+    if level == FilterLevel::None
+        && !line_numbers
+        && let Some(window) = byte_line_window(&bytes, head_lines, tail_lines)
+    {
+        io::stdout()
+            .lock()
+            .write_all(window)
+            .context("Failed to write line window")?;
+        timer.track(
+            "cat - (stdin)",
+            "rtk read -",
+            &String::from_utf8_lossy(&bytes),
+            &String::from_utf8_lossy(window),
+        );
+        return Ok(());
     }
     let content = String::from_utf8(bytes).context("Failed to decode stdin")?;
 
@@ -284,7 +281,15 @@ fn main() {{
         )?;
 
         // Just verify it doesn't panic
-        run(file.path(), FilterLevel::Minimal, None, None, None, false, 0)?;
+        run(
+            file.path(),
+            FilterLevel::Minimal,
+            None,
+            None,
+            None,
+            false,
+            0,
+        )?;
         Ok(())
     }
 
@@ -360,7 +365,10 @@ fn main() {{
 
     #[test]
     fn test_head_window_empty_input() {
-        assert_eq!(apply_line_window("", None, Some(5), None, &Language::Unknown), "");
+        assert_eq!(
+            apply_line_window("", None, Some(5), None, &Language::Unknown),
+            ""
+        );
     }
 
     #[test]
@@ -408,7 +416,10 @@ fn main() {{
 
     #[test]
     fn test_tail_window_empty_input() {
-        assert_eq!(apply_line_window("", None, None, Some(5), &Language::Unknown), "");
+        assert_eq!(
+            apply_line_window("", None, None, Some(5), &Language::Unknown),
+            ""
+        );
     }
 
     #[test]
@@ -495,7 +506,11 @@ fn main() {{
         writeln!(f2, "charlie\ndelta").unwrap();
 
         let output = std::process::Command::new(&bin)
-            .args(["read", &f1.path().to_string_lossy(), &f2.path().to_string_lossy()])
+            .args([
+                "read",
+                &f1.path().to_string_lossy(),
+                &f2.path().to_string_lossy(),
+            ])
             .output()
             .expect("failed to run rtk read");
 
@@ -515,15 +530,28 @@ fn main() {{
         writeln!(f1, "valid content").unwrap();
 
         let output = std::process::Command::new(&bin)
-            .args(["read", &f1.path().to_string_lossy(), "/tmp/rtk_nonexistent_file.txt"])
+            .args([
+                "read",
+                &f1.path().to_string_lossy(),
+                "/tmp/rtk_nonexistent_file.txt",
+            ])
             .output()
             .expect("failed to run rtk read");
 
-        assert!(!output.status.success(), "should exit non-zero on missing file");
+        assert!(
+            !output.status.success(),
+            "should exit non-zero on missing file"
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stdout.contains("valid content"), "valid file should still be printed");
-        assert!(stderr.contains("rtk_nonexistent_file"), "should report missing file on stderr");
+        assert!(
+            stdout.contains("valid content"),
+            "valid file should still be printed"
+        );
+        assert!(
+            stderr.contains("rtk_nonexistent_file"),
+            "should report missing file on stderr"
+        );
     }
 
     #[test]
