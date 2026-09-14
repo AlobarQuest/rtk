@@ -151,8 +151,20 @@ pub fn classify_command(cmd: &str) -> Classification {
     // aligned with the runtime wrapper behavior.
     let cmd_normalized = strip_golangci_global_opts(&cmd_normalized);
     // Strip pnpm global options (-r, --filter, -w) before the subcommand so
-    // `pnpm -r install` classifies like `pnpm install`.
-    let cmd_normalized = strip_pnpm_global_opts(&cmd_normalized);
+    // `pnpm -r install` classifies like `pnpm install` — but only adopt the
+    // stripped form when it routes to the `rtk pnpm` rule itself. For the tool
+    // rules reachable via `pnpm exec`/`pnpm run` (`pnpm -r exec vitest`,
+    // `pnpm -r lint`, …) the rewrite matches the original flag-first text and
+    // never fires, so classifying the stripped form there would report a
+    // Supported saving the hook can't deliver — misleading `rtk discover` and
+    // `rtk session`, which count `Supported` as covered. See #3275.
+    let cmd_pnpm_stripped = strip_pnpm_global_opts(&cmd_normalized);
+    let cmd_normalized =
+        if cmd_pnpm_stripped != cmd_normalized && matches_pnpm_rule(&cmd_pnpm_stripped) {
+            cmd_pnpm_stripped
+        } else {
+            cmd_normalized
+        };
     let cmd_clean = cmd_normalized.as_str();
 
     // Exclude cat/head/tail with redirect operators — these are writes, not reads (#315)
@@ -382,12 +394,31 @@ fn strip_git_global_opts(cmd: &str) -> String {
 /// flags are preserved (e.g. `pnpm -r install` → `rtk pnpm -r install`).
 /// Returns the original string unchanged if not a pnpm command.
 fn strip_pnpm_global_opts(cmd: &str) -> String {
+    // Require a single ASCII space after `pnpm` — the exact boundary the rewrite's
+    // `strip_word_prefix` enforces — so classify and rewrite can never diverge on a
+    // tab or other whitespace separator (that would resurrect the class of bug
+    // #3275 closes: Supported on one side, un-rewritable on the other). Extra
+    // spaces are still tolerated via `trim_start` (`pnpm  -r  install`), since
+    // `PNPM_GLOBAL_OPT` is `^`-anchored and a leading space would skip the strip.
     if !cmd.starts_with("pnpm ") {
         return cmd.to_string();
     }
-    let after_pnpm = &cmd[5..]; // skip "pnpm "
+    let after_pnpm = cmd[5..].trim_start(); // skip "pnpm ", then any extra spaces
     let stripped = PNPM_GLOBAL_OPT.replace(after_pnpm, "");
     format!("pnpm {}", stripped.trim())
+}
+
+/// True when `cmd` (already normalized) routes to the `rtk pnpm` rule rather than
+/// a tool rule reachable through `pnpm exec`/`pnpm run`. Gates the pnpm
+/// global-option strip in `classify_command`: adopting the stripped form for a
+/// tool rule would diverge from the rewrite, which matches the original
+/// flag-first text and never fires there. See #3275.
+fn matches_pnpm_rule(cmd: &str) -> bool {
+    REGEX_SET
+        .matches(cmd)
+        .into_iter()
+        .next_back()
+        .is_some_and(|idx| RULES[idx].rtk_cmd == "rtk pnpm")
 }
 
 /// Strip golangci-lint global options before the `run` subcommand.
@@ -3021,6 +3052,11 @@ mod tests {
     fn test_rewrite_pnpm_unknown_flag_not_stripped() {
         // `-x` is not a known global opt → not stripped → no subcommand → None.
         assert_eq!(rewrite_command_no_prefixes("pnpm -x build", &[]), None);
+        // Load-bearing case for the fixed-set design: `install` IS a routed
+        // subcommand, so if `-x` were stripped this would rewrite to
+        // `rtk pnpm -x install`, which reaches clap and dies. Only the fixed
+        // allowlist keeps it a safe passthrough (None).
+        assert_eq!(rewrite_command_no_prefixes("pnpm -x install", &[]), None);
     }
 
     #[test]
@@ -3028,6 +3064,79 @@ mod tests {
         // `pnpm lint` classifies as Supported, but the ORIGINAL `pnpm -r lint`
         // matches no lint rewrite-prefix → safe no-op (never a malformed rewrite).
         assert_eq!(rewrite_command_no_prefixes("pnpm -r lint", &[]), None);
+    }
+
+    #[test]
+    fn test_classify_pnpm_flag_first_tool_stays_unsupported() {
+        // #3275 blocker: the strip must not make a tool rule reachable via
+        // `pnpm exec`/`pnpm run` classify as Supported — its rewrite matches the
+        // original flag-first text and never fires, so a Supported verdict would
+        // advertise savings `rtk discover`/`rtk session` can never deliver. These
+        // must classify exactly as on develop: Unsupported(pnpm).
+        for cmd in [
+            "pnpm -r lint",
+            "pnpm -r exec eslint .",
+            "pnpm --filter @app exec vitest run",
+            "pnpm -F web exec playwright test",
+            "pnpm -r exec tsc --noEmit",
+            "pnpm -w exec next build",
+        ] {
+            assert!(
+                matches!(classify_command(cmd), Classification::Unsupported { .. }),
+                "{cmd} must stay Unsupported (rewrite can't fire), got: {:?}",
+                classify_command(cmd)
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_pnpm_flag_first_install_still_supported() {
+        // The gate keeps everything the PR claims: flag-first forms that route to
+        // the `rtk pnpm` rule stay Supported.
+        for cmd in [
+            "pnpm -r install",
+            "pnpm --filter @app list",
+            "pnpm -w install",
+            "pnpm -r outdated",
+        ] {
+            assert!(
+                matches!(
+                    classify_command(cmd),
+                    Classification::Supported {
+                        rtk_equivalent: "rtk pnpm",
+                        ..
+                    }
+                ),
+                "{cmd} must classify as rtk pnpm, got: {:?}",
+                classify_command(cmd)
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_pnpm_extra_whitespace() {
+        // Extra spaces before the global flag must not skip the strip
+        // (`PNPM_GLOBAL_OPT` is `^`-anchored, so the slice is trimmed first).
+        assert_eq!(
+            rewrite_command_no_prefixes("pnpm  -r  install", &[]),
+            Some("rtk pnpm -r  install".into())
+        );
+    }
+
+    #[test]
+    fn test_pnpm_tab_separator_no_classify_rewrite_divergence() {
+        // A non-space separator must NOT be stripped: the rewrite's
+        // `strip_word_prefix` only accepts an ASCII space, so classify has to
+        // agree and stay Unsupported. If the strip tolerated `\t` (or any other
+        // whitespace), classify would say Supported(rtk pnpm) while rewrite
+        // returned None — the exact classify/rewrite divergence #3275 closes.
+        let cmd = "pnpm\t-r install";
+        assert!(
+            matches!(classify_command(cmd), Classification::Unsupported { .. }),
+            "tab-separated pnpm must stay Unsupported, got: {:?}",
+            classify_command(cmd)
+        );
+        assert_eq!(rewrite_command_no_prefixes(cmd, &[]), None);
     }
 
     #[test]
