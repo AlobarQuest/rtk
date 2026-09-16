@@ -445,7 +445,7 @@ For per-agent setup details, override controls, and graceful degradation, see th
 ```toml
 [hooks]
 exclude_commands = ["curl", "playwright"]  # skip rewrite for these (matches `npx playwright` too)
-suppress_hook_warning = false                # suppress missing/outdated hook warnings
+suppress_hook_warning = false                # suppress the missing-hook warning only
 
 [retriever]
 mode = "sqlite"         # sqlite (default) | tee (legacy files) | disabled
