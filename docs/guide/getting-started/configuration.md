@@ -95,7 +95,8 @@ since the agent must type `rtk` itself. `rtk init` prints a note when it does th
 | `RTK_TEE_DIR` | Override the tee directory (tee mode) |
 | `RTK_TELEMETRY_DISABLED=1` | Disable telemetry |
 | `RTK_HOOK_AUDIT=1` | Enable hook audit logging |
-| `RTK_SUPPRESS_HOOK_WARNING=1` | Suppress the missing-hook warning only (not the outdated-hook upgrade prompt) |
+| `RTK_SUPPRESS_HOOK_WARNING=1` | Suppress the missing-hook warning only (not the outdated-hook upgrade prompt); `true`, `yes`, `on` also accepted |
+| `RTK_SUPPRESS_HOOK_WARNING=0` | Force the missing-hook warning back on, overriding `hooks.suppress_hook_warning`; `false`, `no`, `off` also accepted |
 | `SKIP_ENV_VALIDATION=1` | Skip env validation (useful with Next.js) |
 
 ## Recall system
