@@ -385,8 +385,19 @@ fn parse_trx_content(content: &str) -> Option<TestSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filetime::{set_file_mtime, FileTime};
     use std::time::Duration;
+
+    /// Force a file's mtime instead of relying on write ordering: filesystem
+    /// mtime granularity (1 s on some CI filesystems, 2 s on FAT) can make two
+    /// files written microseconds apart indistinguishable.
+    fn set_mtime(path: &Path, time: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for mtime")
+            .set_modified(time)
+            .expect("set mtime");
+    }
 
     #[test]
     fn test_parse_trx_content_extracts_passed_counts() {
@@ -497,17 +508,9 @@ mod tests {
         let old_trx = testresults_dir.join("old.trx");
         let new_trx = testresults_dir.join("new.trx");
         std::fs::write(&old_trx, "old").expect("write old");
-        set_file_mtime(
-            &old_trx,
-            FileTime::from_system_time(SystemTime::now() - Duration::from_secs(10)),
-        )
-        .expect("set old mtime");
+        set_mtime(&old_trx, SystemTime::now() - Duration::from_secs(10));
         std::fs::write(&new_trx, "new").expect("write new");
-        set_file_mtime(
-            &new_trx,
-            FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10)),
-        )
-        .expect("set new mtime");
+        set_mtime(&new_trx, SystemTime::now() + Duration::from_secs(10));
 
         let found = find_recent_trx_in_dir(&testresults_dir).expect("should find newest trx");
         assert_eq!(found, new_trx);
@@ -568,11 +571,7 @@ mod tests {
 <TestRun><ResultSummary><Counters total="2" executed="2" passed="2" failed="0" /></ResultSummary></TestRun>"#;
         let old_path = trx_dir.join("old.trx");
         std::fs::write(&old_path, trx_old).expect("write old trx");
-        set_file_mtime(
-            &old_path,
-            FileTime::from_system_time(SystemTime::now() - Duration::from_secs(10)),
-        )
-        .expect("set old mtime");
+        set_mtime(&old_path, SystemTime::now() - Duration::from_secs(10));
 
         let since = SystemTime::now();
 
@@ -580,11 +579,7 @@ mod tests {
 <TestRun><ResultSummary><Counters total="3" executed="3" passed="2" failed="1" /></ResultSummary></TestRun>"#;
         let new_path = trx_dir.join("new.trx");
         std::fs::write(&new_path, trx_new).expect("write new trx");
-        set_file_mtime(
-            &new_path,
-            FileTime::from_system_time(SystemTime::now() + Duration::from_secs(10)),
-        )
-        .expect("set new mtime");
+        set_mtime(&new_path, SystemTime::now() + Duration::from_secs(10));
 
         let summary = parse_trx_files_in_dir_since(&trx_dir, Some(since)).expect("merged summary");
         assert_eq!(summary.total, 3);
