@@ -28,6 +28,8 @@ pub const PLUGIN_SUBDIR: &str = "plugins";
 pub const OPENCODE_PLUGIN_FILE: &str = "rtk.ts";
 
 pub const CURSOR_DIR: &str = ".cursor";
+/// The Trae tool name RTK's hook registers against.
+pub const TRAE_RUN_COMMAND_MATCHER: &str = "RunCommand";
 pub const TRAE_DIR: &str = ".trae";
 pub const TRAE_CN_DIR: &str = ".trae-cn";
 pub const CODEX_DIR: &str = ".codex";
