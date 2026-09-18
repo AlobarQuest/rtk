@@ -13,6 +13,10 @@ fn run_trae_hook(command: &str, home: &Path, audit: bool) -> Output {
     })
     .to_string();
 
+    run_trae_payload(&payload, home, audit)
+}
+
+fn run_trae_payload(payload: &str, home: &Path, audit: bool) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rtk"))
         .args(["hook", "trae"])
         .env("HOME", home)
@@ -73,4 +77,22 @@ fn trae_hook_records_successful_rewrite_in_audit_log() {
         audit.contains(" | rewrite | git status | rtk git status"),
         "unexpected audit log: {audit}"
     );
+}
+
+#[test]
+fn trae_hook_rewrites_bom_prefixed_payloads() {
+    let home = tempfile::tempdir().unwrap();
+    let payload = json!({"tool_name": "RunCommand", "tool_input": {
+        "command": "git status", "description": "keep", "timeout": 60
+    }})
+    .to_string();
+    let plain = run_trae_payload(&payload, home.path(), false);
+    assert!(plain.status.success());
+    assert!(!plain.stdout.is_empty());
+    for prefix in ["\u{feff}", "\u{feff}\u{feff}"] {
+        let output = run_trae_payload(&format!("{prefix}{payload}"), home.path(), false);
+        assert!(output.status.success());
+        assert_eq!(output.stdout, plain.stdout);
+        assert!(output.stderr.is_empty());
+    }
 }

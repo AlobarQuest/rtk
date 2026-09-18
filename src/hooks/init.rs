@@ -5079,19 +5079,10 @@ fn resolve_trae_hook_paths(global: bool) -> Result<Vec<PathBuf>> {
 }
 
 fn read_trae_hooks_json(path: &Path) -> Result<(serde_json::Value, bool)> {
-    if !path.exists() {
-        return Ok((serde_json::json!({ "version": 1 }), false));
+    match read_json_file(path)? {
+        Some(root) => Ok((root, true)),
+        None => Ok((serde_json::json!({ "version": 1 }), false)),
     }
-
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read Trae hooks file {}", path.display()))?;
-    if content.trim().is_empty() {
-        return Ok((serde_json::json!({ "version": 1 }), true));
-    }
-
-    let root = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse Trae hooks file {} as JSON", path.display()))?;
-    Ok((root, true))
 }
 
 fn validate_trae_hooks_json(root: &serde_json::Value) -> Result<()> {
@@ -5168,6 +5159,7 @@ fn patch_trae_hooks_json_paths(paths: &[PathBuf], ctx: InitContext) -> Result<Ve
         });
     }
 
+    let mut applied = Vec::new();
     for patch in pending {
         if ctx.dry_run {
             println!(
@@ -5180,25 +5172,39 @@ fn patch_trae_hooks_json_paths(paths: &[PathBuf], ctx: InitContext) -> Result<Ve
             continue;
         }
 
-        let parent = patch.path.parent().with_context(|| {
+        let write_result: Result<()> = (|| {
+            let parent = patch.path.parent().with_context(|| {
+                format!(
+                    "Cannot write Trae hooks file {}: path has no parent directory",
+                    patch.path.display()
+                )
+            })?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create Trae directory {}", parent.display()))?;
+
+            if patch.existed {
+                let backup_path = patch.path.with_extension("json.bak");
+                fs::copy(&patch.path, &backup_path)
+                    .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
+                if ctx.verbose > 0 {
+                    eprintln!("Backup: {}", backup_path.display());
+                }
+            }
+
+            atomic_write(&patch.path, &patch.serialized)
+        })();
+        write_result.with_context(|| {
             format!(
-                "Cannot write Trae hooks file {}: path has no parent directory",
-                patch.path.display()
+                "Failed to update Trae hooks file {}. Already updated: {}",
+                patch.path.display(),
+                if applied.is_empty() {
+                    "none".to_string()
+                } else {
+                    applied.join(", ")
+                }
             )
         })?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create Trae directory {}", parent.display()))?;
-
-        if patch.existed {
-            let backup_path = patch.path.with_extension("json.bak");
-            fs::copy(&patch.path, &backup_path)
-                .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
-            if ctx.verbose > 0 {
-                eprintln!("Backup: {}", backup_path.display());
-            }
-        }
-
-        atomic_write(&patch.path, &patch.serialized)?;
+        applied.push(patch.path.display().to_string());
     }
 
     Ok(results)
@@ -5328,20 +5334,10 @@ fn remove_trae_hooks_json_paths(paths: &[PathBuf], ctx: InitContext) -> Result<V
     let mut pending = Vec::new();
 
     for path in paths {
-        if !path.exists() {
+        let Some(mut root) = read_json_file(path)? else {
             results.push(false);
             continue;
-        }
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read Trae hooks file {}", path.display()))?;
-        if content.trim().is_empty() {
-            results.push(false);
-            continue;
-        }
-
-        let mut root: serde_json::Value = serde_json::from_str(&content).with_context(|| {
-            format!("Failed to parse Trae hooks file {} as JSON", path.display())
-        })?;
+        };
         let removed = remove_trae_hook_from_json(&mut root);
         results.push(removed);
         if removed {
@@ -9401,6 +9397,88 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0]["hooks"][0]["command"], "other hook");
         assert_eq!(root["hooks"]["PostToolUse"][0]["matcher"], "WriteFile");
+    }
+
+    #[test]
+    fn test_trae_bom_config_install_and_uninstall() {
+        for prefix in ["\u{feff}", "\u{feff}\u{feff}"] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("hooks.json");
+            let original = serde_json::json!({"version": 1, "custom": true, "hooks": {
+                "PreToolUse": [{"matcher": "ReadFile", "hooks": [{"command": "other hook"}]}]
+            }});
+            fs::write(&path, format!("{prefix}{original}")).unwrap();
+            let paths = vec![path.clone()];
+            assert_eq!(
+                patch_trae_hooks_json_paths(&paths, InitContext::default()).unwrap(),
+                vec![PatchResult::Patched]
+            );
+            let installed = fs::read_to_string(&path).unwrap();
+            assert!(trae_hook_already_present(
+                &serde_json::from_str(&installed).unwrap()
+            ));
+            fs::write(&path, format!("{prefix}{installed}")).unwrap();
+            assert_eq!(
+                remove_trae_hooks_json_paths(&paths, InitContext::default()).unwrap(),
+                vec![true]
+            );
+            let removed: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(removed, original);
+        }
+    }
+
+    #[test]
+    fn test_trae_windows_command_install_is_idempotent_and_uninstalls() {
+        for command in [
+            "rtk.exe hook trae",
+            r#""C:\Program Files\rtk.exe" hook trae"#,
+        ] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("hooks.json");
+            let root = serde_json::json!({"version": 1, "hooks": {"PreToolUse": [{
+                "matcher": "RunCommand|WriteFile", "hooks": [{"command": command, "timeout": 60}]
+            }]}});
+            let original = root.to_string();
+            fs::write(&path, &original).unwrap();
+            let paths = vec![path.clone()];
+            assert_eq!(
+                patch_trae_hooks_json_paths(&paths, InitContext::default()).unwrap(),
+                vec![PatchResult::AlreadyPresent]
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(
+                remove_trae_hooks_json_paths(&paths, InitContext::default()).unwrap(),
+                vec![true]
+            );
+            let removed: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(removed["hooks"]["PreToolUse"], serde_json::json!([]));
+        }
+    }
+
+    #[test]
+    fn test_trae_write_failure_reports_completed_targets() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join(".trae/hooks.json");
+        let second = temp.path().join(".trae-cn/hooks.json");
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&second, "{}").unwrap();
+        // A directory at the backup path fails on every platform, even as root.
+        fs::create_dir(second.with_extension("json.bak")).unwrap();
+        let error =
+            patch_trae_hooks_json_paths(&[first.clone(), second.clone()], InitContext::default())
+                .unwrap_err();
+        assert!(trae_hook_already_present(
+            &read_json_file(&first).unwrap().unwrap()
+        ));
+        assert_eq!(fs::read_to_string(&second).unwrap(), "{}");
+        let message = format!("{error:#}");
+        assert!(message.contains(&second.display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("Already updated: {}", first.display())),
+            "{message}"
+        );
     }
 
     #[test]

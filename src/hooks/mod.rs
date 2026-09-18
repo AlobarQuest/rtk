@@ -40,12 +40,7 @@ pub fn is_codex_hook_command(command: &str) -> bool {
 }
 
 pub fn is_trae_hook_command(command: &str) -> bool {
-    let parts = crate::discover::lexer::shell_split(command);
-    let [binary, hook, trae] = parts.as_slice() else {
-        return false;
-    };
-
-    binary.rsplit(['/', '\\']).next() == Some("rtk") && *hook == "hook" && *trae == "trae"
+    is_rtk_hook_command(command, "trae")
 }
 
 #[cfg(test)]
@@ -77,6 +72,21 @@ mod tests {
         assert!(is_trae_hook_command("/opt/homebrew/bin/rtk hook trae"));
         assert!(is_trae_hook_command("\"/opt/homebrew/bin/rtk\" hook trae"));
         assert!(!is_trae_hook_command("rtk hook claude"));
+    }
+
+    #[test]
+    fn trae_hook_command_matches_windows_rtk_and_rejects_other_commands() {
+        assert!(is_trae_hook_command("rtk.exe hook trae"));
+        assert!(is_trae_hook_command(
+            r#""C:\Program Files\rtk.exe" hook trae"#
+        ));
+        for command in [
+            "not-rtk.exe hook trae",
+            "echo rtk.exe hook trae",
+            "rtk.exe hook codex",
+        ] {
+            assert!(!is_trae_hook_command(command));
+        }
     }
 
     #[test]

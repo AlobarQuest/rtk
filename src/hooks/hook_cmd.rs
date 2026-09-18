@@ -799,7 +799,7 @@ fn process_trae_payload(v: &Value) -> Option<TraeRewrite> {
 /// when it can safely rewrite a `RunCommand` command.
 pub fn run_trae() -> Result<()> {
     let input = read_stdin_limited()?;
-    let input = input.trim();
+    let input = strip_leading_bom(&input).trim();
     if input.is_empty() {
         return Ok(());
     }

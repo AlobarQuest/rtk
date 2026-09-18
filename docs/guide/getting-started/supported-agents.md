@@ -75,6 +75,10 @@ rtk init --global --agent trae    # user-scoped (~/.trae/hooks.json)
 
 Global installation also updates `~/.trae-cn/hooks.json` when the `.trae-cn` directory already exists. Both modes install the native `rtk hook trae` command as a `PreToolUse` hook for `RunCommand`.
 
+Configuration files and hook input may include a UTF-8 BOM. Existing `rtk.exe hook trae` registrations are also recognized during install and uninstall.
+
+If a global install fails while writing a target, the error lists any targets already updated. After fixing the reported filesystem error, rerun the install; completed targets will not receive duplicate hooks.
+
 The hook returns `hookSpecificOutput.updatedInput`, preserving fields such as `description` and `timeout` while replacing only `command`. It deliberately omits `permissionDecision`, leaving command approval to Trae. Commands containing command substitution, process substitution, heredocs, or file-target redirects are left unchanged so Trae evaluates the original command natively.
 
 Uninstall:
