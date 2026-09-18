@@ -5211,21 +5211,14 @@ fn trae_hook_already_present(root: &serde_json::Value) -> bool {
         .and_then(|groups| groups.as_array())
         .is_some_and(|groups| {
             groups.iter().any(|group| {
-                if group.get("matcher").and_then(|matcher| matcher.as_str()) != Some("RunCommand") {
-                    return false;
-                }
                 group
                     .get("hooks")
                     .and_then(|hooks| hooks.as_array())
                     .is_some_and(|hooks| {
                         hooks.iter().any(|hook| {
-                            hook.get("type").and_then(|hook_type| hook_type.as_str())
-                                == Some("command")
-                                && hook
-                                    .get("command")
-                                    .and_then(|command| command.as_str())
-                                    .is_some_and(is_trae_hook_command)
-                                && hook.get("timeout") == Some(&serde_json::json!(30))
+                            hook.get("command")
+                                .and_then(|command| command.as_str())
+                                .is_some_and(is_trae_hook_command)
                         })
                     })
             })
@@ -5273,9 +5266,6 @@ fn remove_trae_hook_from_json(root: &mut serde_json::Value) -> bool {
 
     let mut removed = false;
     groups.retain_mut(|group| {
-        if group.get("matcher").and_then(|matcher| matcher.as_str()) != Some("RunCommand") {
-            return true;
-        }
         let Some(hooks) = group
             .get_mut("hooks")
             .and_then(|hooks| hooks.as_array_mut())
@@ -5285,11 +5275,10 @@ fn remove_trae_hook_from_json(root: &mut serde_json::Value) -> bool {
 
         let original_len = hooks.len();
         hooks.retain(|hook| {
-            !(hook.get("type").and_then(|hook_type| hook_type.as_str()) == Some("command")
-                && hook
-                    .get("command")
-                    .and_then(|command| command.as_str())
-                    .is_some_and(is_trae_hook_command))
+            !hook
+                .get("command")
+                .and_then(|command| command.as_str())
+                .is_some_and(is_trae_hook_command)
         });
         if hooks.len() == original_len {
             return true;
@@ -9299,42 +9288,90 @@ mod tests {
     }
 
     #[test]
-    fn test_trae_hook_detection_requires_run_command_group_and_command_hook_type() {
-        let mut root = serde_json::json!({
-            "version": 1,
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": "ReadFile",
-                    "hooks": [{ "type": "command", "command": "rtk hook trae" }]
-                }, {
-                    "matcher": "RunCommand",
-                    "hooks": [{ "type": "prompt", "command": "rtk hook trae" }]
-                }]
+    fn test_trae_customized_hooks_are_detected_without_duplicate_install_and_removed() {
+        for (matcher, timeout, hook_type) in [
+            (
+                serde_json::json!("RunCommand|WriteFile"),
+                serde_json::json!(30),
+                serde_json::json!("command"),
+            ),
+            (
+                serde_json::json!("RunCommand"),
+                serde_json::json!(60),
+                serde_json::json!("command"),
+            ),
+            (
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::json!("ReadFile"),
+                serde_json::json!(5),
+                serde_json::json!("prompt"),
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("hooks.json");
+            let unrelated = serde_json::json!({ "type": "command", "command": "other hook" });
+            let mut group = serde_json::json!({
+                "hooks": [{ "command": "rtk hook trae" }, unrelated.clone()]
+            });
+            if !matcher.is_null() {
+                group["matcher"] = matcher;
             }
-        });
-
-        assert!(!trae_hook_already_present(&root));
-        insert_trae_hook_entry(&mut root).unwrap();
-        assert_eq!(root["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
-        assert!(trae_hook_already_present(&root));
+            if !timeout.is_null() {
+                group["hooks"][0]["timeout"] = timeout;
+            }
+            if !hook_type.is_null() {
+                group["hooks"][0]["type"] = hook_type;
+            }
+            let root = serde_json::json!({
+                "version": 1,
+                "custom": { "keep": true },
+                "hooks": {
+                    "PreToolUse": [group],
+                    "PostToolUse": [{ "matcher": "WriteFile", "hooks": [] }]
+                }
+            });
+            assert!(trae_hook_already_present(&root), "not detected: {root}");
+            let original = serde_json::to_string_pretty(&root).unwrap();
+            fs::write(&path, &original).unwrap();
+            let paths = vec![path.clone()];
+            assert_eq!(
+                patch_trae_hooks_json_paths(&paths, InitContext::default()).unwrap(),
+                vec![PatchResult::AlreadyPresent]
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(
+                remove_trae_hooks_json_paths(&paths, InitContext::default()).unwrap(),
+                vec![true]
+            );
+            let actual: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let mut expected = root;
+            expected["hooks"]["PreToolUse"][0]["hooks"] = serde_json::json!([unrelated]);
+            assert_eq!(actual, expected);
+            assert!(!trae_hook_already_present(&actual));
+        }
     }
 
     #[test]
-    fn test_trae_hook_detection_requires_timeout_30() {
-        let root = serde_json::json!({
-            "version": 1,
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": "RunCommand",
-                    "hooks": [{
-                        "type": "command",
-                        "command": "rtk hook trae",
-                        "timeout": 5
-                    }]
-                }]
-            }
+    fn test_trae_hook_detection_and_removal_preserve_other_commands() {
+        let mut root = serde_json::json!({
+            "hooks": { "PreToolUse": [{
+                "matcher": "RunCommand",
+                "hooks": [
+                    { "command": "rtk hook cursor" },
+                    { "command": "echo rtk hook trae" },
+                    { "command": "not-rtk hook trae" }
+                ]
+            }] }
         });
+        let original = root.clone();
         assert!(!trae_hook_already_present(&root));
+        assert!(!remove_trae_hook_from_json(&mut root));
+        assert_eq!(root, original);
     }
 
     #[test]
