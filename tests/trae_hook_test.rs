@@ -20,7 +20,6 @@ fn run_trae_payload(payload: &str, home: &Path, audit: bool) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rtk"))
         .args(["hook", "trae"])
         .env("HOME", home)
-        .env("RTK_AUDIT_DIR", home.join("audit"))
         .env("RTK_TELEMETRY_DISABLED", "1")
         .env("RTK_HOOK_AUDIT", if audit { "1" } else { "0" })
         .stdin(Stdio::piped())
@@ -60,6 +59,8 @@ fn trae_hook_defers_unattestable_shell_constructs() {
 }
 
 #[test]
+// dirs::home_dir uses the Windows Known Folder API, so HOME cannot isolate this log.
+#[cfg(unix)]
 fn trae_hook_records_successful_rewrite_in_audit_log() {
     let home = tempfile::tempdir().unwrap();
     let output = run_trae_hook("git status", home.path(), true);
@@ -70,7 +71,7 @@ fn trae_hook_records_successful_rewrite_in_audit_log() {
         "expected a Trae rewrite response"
     );
 
-    let audit_path = home.path().join("audit/hook-audit.log");
+    let audit_path = home.path().join(".local/share/rtk/hook-audit.log");
     let audit = std::fs::read_to_string(&audit_path)
         .unwrap_or_else(|error| panic!("missing audit log at {}: {error}", audit_path.display()));
     assert!(

@@ -526,10 +526,8 @@ fn sanitize_log_field(s: &str) -> String {
 }
 
 fn audit_log_inner(action: &str, original: &str, rewritten: &str) -> Option<()> {
-    let dir = match std::env::var("RTK_AUDIT_DIR") {
-        Ok(dir) => std::path::PathBuf::from(dir),
-        Err(_) => dirs::home_dir()?.join(".local").join("share").join("rtk"),
-    };
+    let home = dirs::home_dir()?;
+    let dir = home.join(".local").join("share").join("rtk");
     crate::core::utils::create_private_dir(&dir).ok()?;
     let path = dir.join("hook-audit.log");
     let mut file = crate::core::utils::open_private(
