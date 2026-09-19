@@ -54,6 +54,8 @@ impl Default for RtkRule {
     }
 }
 
+/// A rule declaring subcommands also needs its tool in
+/// `core::tracking::SUBCOMMAND_ROUTERS`, or its telemetry label stops at the tool name.
 pub const RULES: &[RtkRule] = &[
     RtkRule {
         pattern: r"^(?:git|yadm)\s+(?:-[Cc]\s+\S+\s+)*(status|log|diff|show|add|commit|checkout|push|pull|branch|fetch|stash|worktree)",

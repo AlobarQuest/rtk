@@ -8,6 +8,8 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+/// A tool with a list like this also belongs in `core::tracking::SUBCOMMAND_ROUTERS`,
+/// which keeps the subcommand in its telemetry label.
 const RUFF_SUBCOMMANDS: &[&str] = &[
     "analyze",
     "check",
