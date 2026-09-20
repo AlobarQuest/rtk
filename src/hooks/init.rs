@@ -309,26 +309,90 @@ impl RtkMdScope {
     }
 }
 
-/// A free `<name>.bak` sibling for `path`, numbered when earlier backups are still there so a
-/// second run cannot overwrite the first one's rescue copy.
-fn free_backup_path(path: &Path) -> Result<PathBuf> {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".bak");
-    let first = PathBuf::from(name);
-    if !first.exists() {
-        return Ok(first);
-    }
-    for n in 1..100 {
-        // Built from the `OsString` like the first candidate, not through `display()`, which
-        // is lossy: on a path that is not valid UTF-8 the probe and the rename would disagree.
-        let mut numbered = first.clone().into_os_string();
-        numbered.push(format!(".{n}"));
-        let candidate = PathBuf::from(numbered);
-        if !candidate.exists() {
-            return Ok(candidate);
+/// How many numbered backups may sit beside a file before RTK refuses to make another.
+///
+/// High enough that no ordinary sequence of installs reaches it, and bounded so a file that
+/// keeps producing distinct backups cannot quietly fill its directory: at the ceiling RTK
+/// stops and says so rather than choosing one to overwrite.
+const MAX_BACKUP_ATTEMPTS: usize = 99;
+
+/// A slot to preserve a file's current content in, and what is known about that content.
+///
+/// Reading the source is only ever needed to answer "is this already preserved?", which is
+/// why the unreadable case is its own arm rather than a refusal: a caller that copies cannot
+/// proceed without that answer, while a caller that renames never needed it, since a rename
+/// carries the content whether or not RTK can read it.
+#[derive(Debug)]
+enum BackupSlot {
+    /// Free, and the source differs from every backup already present.
+    Free(PathBuf),
+    /// Identical content already sits here, so a copy would be redundant. A rename still has
+    /// the original to move, and moving it here is what discards the duplicate.
+    AlreadyPreserved(PathBuf),
+    /// Free, but the source could not be read, so whether it is already preserved is unknown.
+    SourceUnreadable(PathBuf),
+}
+
+impl BackupSlot {
+    /// The slot to move the original onto, for a caller that preserves content by renaming.
+    ///
+    /// Every arm gives the same answer: a rename carries content RTK could not read, and
+    /// renaming onto a byte-identical backup discards the duplicate instead of burning a slot.
+    fn for_rename(self) -> PathBuf {
+        match self {
+            BackupSlot::Free(path)
+            | BackupSlot::AlreadyPreserved(path)
+            | BackupSlot::SourceUnreadable(path) => path,
         }
     }
-    anyhow::bail!("Too many backups next to {}", path.display())
+}
+
+/// `path.bak` for the first slot, `path.bak.N` after that.
+///
+/// Built by appending to the `OsString` rather than through `with_extension`, which replaces
+/// an extension instead of extending it, and rather than through `display()`, which is lossy:
+/// on a path that is not valid UTF-8 the probe and the write would disagree.
+fn numbered_backup_path(path: &Path, attempt: usize) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".bak");
+    if attempt > 0 {
+        name.push(format!(".{attempt}"));
+    }
+    PathBuf::from(name)
+}
+
+/// Pick a `.bak` sibling for `path`, numbered when earlier backups are still there so a second
+/// run cannot overwrite the first one's rescue copy.
+fn free_backup_slot(path: &Path) -> Result<BackupSlot> {
+    let source = fs::read(path).ok();
+    for attempt in 0..=MAX_BACKUP_ATTEMPTS {
+        let candidate = numbered_backup_path(path, attempt);
+        match fs::read(&candidate) {
+            // A provisioning loop that reapplies the same local change would otherwise
+            // consume a slot on every run.
+            Ok(existing) if source.as_deref() == Some(existing.as_slice()) => {
+                return Ok(BackupSlot::AlreadyPreserved(candidate));
+            }
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(match source {
+                    Some(_) => BackupSlot::Free(candidate),
+                    None => BackupSlot::SourceUnreadable(candidate),
+                });
+            }
+            // Occupied by something unreadable -- a directory, or a file this user cannot
+            // read. Its content cannot be compared, so treat the slot as taken rather than
+            // overwriting it.
+            Err(_) => continue,
+        }
+    }
+
+    anyhow::bail!(
+        "Cannot back up {}: {} existing backups are already present. \
+         Remove or archive them first.",
+        path.display(),
+        MAX_BACKUP_ATTEMPTS + 1
+    )
 }
 
 /// Agents without a command hook must prefix `rtk` themselves, which only the `full` level
@@ -2931,7 +2995,7 @@ fn back_up_foreign_rtk_md(
     if !path.exists() || scope.owns(path) {
         return Ok(None);
     }
-    let backup = free_backup_path(path)?;
+    let backup = free_backup_slot(path)?.for_rename();
     if ctx.dry_run {
         println!(
             "[dry-run] would move your RTK.md aside: {} -> {}",
@@ -4287,11 +4351,119 @@ fn canonicalize_path_for_comparison(path: &Path) -> PathBuf {
     }
 }
 
-/// How many symlink hops [`ensure_inside_root`] resolves before refusing the path outright.
-/// The bound is what makes a cycle terminate. It is below the kernel's own limit on purpose:
-/// RTK has to be able to say where a write lands, and a chain this deep under a path RTK
-/// joins itself is not one a user maintains.
-const MAX_CONTAINMENT_LINK_HOPS: usize = 32;
+/// How many hops one path's symlink chain is followed before the walk gives up.
+///
+/// The bound is per component, not per walk: [`resolve_symlink_components_within`] spends a
+/// fresh budget on the descent into each target it jumps to. It sits below the kernel's own
+/// limit on purpose -- RTK has to be able to say where a write lands, and a chain this deep
+/// under a path RTK joins itself is not one a user maintains.
+const MAX_SYMLINK_HOPS: usize = 16;
+
+/// What one `readlink` established.
+///
+/// [`Unreadable`](Self::Unreadable) is not [`NotALink`](Self::NotALink): `lstat` already said
+/// this is a symlink, so reporting the read failure as "no link here" would hand a caller a
+/// path nothing resolved and let it compare that as if it had.
+enum SymlinkHop {
+    NotALink,
+    To(PathBuf),
+    Unreadable,
+}
+
+/// What following one path's symlink chain established.
+enum SymlinkChain {
+    /// The path is not a symlink.
+    Settled,
+    /// Followed to a target that is not itself a symlink.
+    Target(PathBuf),
+    /// Still a symlink after [`MAX_SYMLINK_HOPS`]: a cycle, or a chain too deep to vouch for.
+    Exhausted,
+    /// A link on the chain could not be read, so where it leads is unknown.
+    Unreadable,
+}
+
+/// How far a component walk got, and whether it can be trusted as an answer.
+enum Resolution {
+    /// Every symlink along the path was followed to a target that is not a link.
+    Fully(PathBuf),
+    /// The walk gave up: a cycle, a chain too deep, or a link it could not read. The path is
+    /// as far as it got, which a caller that only acts may still use -- the kernel finishes
+    /// the resolution -- but which says nothing about where the write lands.
+    Unresolved(PathBuf),
+}
+
+/// Read one symlink hop, resolving a relative link against the link's own directory.
+fn symlink_hop(path: &Path) -> SymlinkHop {
+    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return SymlinkHop::NotALink;
+    }
+    let Ok(target) = fs::read_link(path) else {
+        return SymlinkHop::Unreadable;
+    };
+    if target.is_absolute() {
+        return SymlinkHop::To(target);
+    }
+    match path.parent() {
+        Some(parent) => SymlinkHop::To(parent.join(target)),
+        None => SymlinkHop::Unreadable,
+    }
+}
+
+/// Follow a chain of symlinks whose final target does not exist yet, stopping at the first
+/// entry that is not a symlink. `canonicalize` reports `ELOOP` for a cycle, so the hop limit
+/// is the only terminator available here.
+fn follow_symlink_chain(path: &Path) -> SymlinkChain {
+    let mut current = match symlink_hop(path) {
+        SymlinkHop::NotALink => return SymlinkChain::Settled,
+        SymlinkHop::Unreadable => return SymlinkChain::Unreadable,
+        SymlinkHop::To(target) => target,
+    };
+    // Inclusive: the bound counts hops followed, and an exclusive range would stop one short
+    // of the chain length the documentation promises.
+    for _ in 1..=MAX_SYMLINK_HOPS {
+        match symlink_hop(&current) {
+            SymlinkHop::NotALink => return SymlinkChain::Target(current),
+            SymlinkHop::Unreadable => return SymlinkChain::Unreadable,
+            SymlinkHop::To(next) => current = next,
+        }
+    }
+    SymlinkChain::Exhausted
+}
+
+/// Jumping to a link's target abandons the components walked so far, and that target may
+/// itself sit behind symlinked ancestors this walk never visited, so it is resolved from the
+/// top. `budget` bounds that descent: the paths involved can form a cycle that
+/// [`follow_symlink_chain`]'s own hop limit does not see, because each jump hands it a
+/// different path.
+fn resolve_symlink_components_within(path: &Path, budget: usize) -> Resolution {
+    let mut resolved = PathBuf::new();
+    let mut settled = true;
+    for component in path.components() {
+        resolved.push(component);
+        match follow_symlink_chain(&resolved) {
+            SymlinkChain::Settled => {}
+            SymlinkChain::Exhausted | SymlinkChain::Unreadable => settled = false,
+            SymlinkChain::Target(target) => match budget.checked_sub(1) {
+                Some(remaining) => match resolve_symlink_components_within(&target, remaining) {
+                    Resolution::Fully(path) => resolved = path,
+                    Resolution::Unresolved(path) => {
+                        resolved = path;
+                        settled = false;
+                    }
+                },
+                None => {
+                    resolved = target;
+                    settled = false;
+                }
+            },
+        }
+    }
+    if settled {
+        Resolution::Fully(resolved)
+    } else {
+        Resolution::Unresolved(resolved)
+    }
+}
 
 /// Refuse a project-scoped write whose path leaves the project.
 ///
@@ -4314,13 +4486,21 @@ fn ensure_inside_root(root: &Path, path: &Path) -> Result<()> {
     // Anchored to the root before resolving: these paths are relative, and
     // `canonicalize_path_for_comparison` hands a relative path straight back when none of its
     // components exist yet, which no absolute root can ever contain.
-    let mut hop = root.join(path);
-    // Follow the chain a link at a time rather than asking `canonicalize` where it ends: it
-    // stops at the first target that does not exist -- which it will, since RTK creates these
-    // files -- and hands back the unresolved path as if it sat where the chain broke.
-    for _ in 0..MAX_CONTAINMENT_LINK_HOPS {
-        let Some(link) = first_symlink_component(&hop) else {
-            let resolved = canonicalize_path_for_comparison(&lexically_normalized(&hop));
+    let site = root.join(path);
+
+    ensure_chain_sits_inside(&root, path, &site)?;
+
+    match resolve_symlink_components_within(&site, MAX_SYMLINK_HOPS) {
+        // A walk that gave up cannot say where the write lands, and a path RTK cannot place
+        // is one it must not write to.
+        Resolution::Unresolved(_) => anyhow::bail!(
+            "{} passes through a symlink RTK cannot follow to an end, \
+             so RTK cannot say where a write to it would land.\n\
+             Remove the symlink, or use --global to configure Codex outside the project.",
+            path.display()
+        ),
+        Resolution::Fully(resolved) => {
+            let resolved = canonicalize_path_for_comparison(&lexically_normalized(&resolved));
             if !resolved.starts_with(&root) {
                 anyhow::bail!(
                     "{} resolves to {}, outside the project at {}.\n\
@@ -4330,64 +4510,62 @@ fn ensure_inside_root(root: &Path, path: &Path) -> Result<()> {
                     root.display()
                 );
             }
-            return Ok(());
-        };
-        // A link standing where the file itself goes has to sit inside the project, not only
-        // point there: `atomic_write` cannot canonicalize a chain whose end does not exist
-        // either, and then writes at the path as the filesystem reads it, replacing that last
-        // link rather than following it. A link further up is always traversed instead, and
-        // whole directory trees hang off one on macOS, so judging those by where they sit
-        // would refuse every absolute target under `/var` or `/tmp`.
-        if link == hop {
-            let site = link_site(&link);
-            if !site.starts_with(&root) {
-                anyhow::bail!(
-                    "{} is a symlink at {}, outside the project at {}.\n\
-                     Remove the symlink, or use --global to configure Codex outside the project.",
-                    path.display(),
-                    site.display(),
-                    root.display()
-                );
+            Ok(())
+        }
+    }
+}
+
+/// Every link the write site itself passes through has to *sit* inside the project, not only
+/// end up pointing back into it.
+///
+/// `atomic_write` cannot canonicalize a chain whose end does not exist, and then writes at the
+/// path as the filesystem reads it, replacing the last link rather than following it. A link
+/// anywhere along that chain is therefore a place the write can land, and one the project does
+/// not contain is one an attacker may own: pointing it back inside passes a check that only
+/// looked at the far end, while leaving the middle free to be re-aimed afterwards.
+///
+/// Only the chain of the site itself is judged this way. Links on *ancestor* components are
+/// traversed, never sited -- whole directory trees hang off one on macOS, so refusing those
+/// would refuse every absolute target under `/var` or `/tmp`.
+fn ensure_chain_sits_inside(root: &Path, named: &Path, site: &Path) -> Result<()> {
+    let mut hop = site.to_path_buf();
+    for _ in 0..=MAX_SYMLINK_HOPS {
+        match symlink_hop(&hop) {
+            SymlinkHop::NotALink => return Ok(()),
+            SymlinkHop::Unreadable => anyhow::bail!(
+                "{} passes through a symlink at {} that RTK cannot read, \
+                 so RTK cannot say where a write to it would land.\n\
+                 Remove the symlink, or use --global to configure Codex outside the project.",
+                named.display(),
+                hop.display()
+            ),
+            SymlinkHop::To(next) => {
+                let at = link_site(&hop);
+                if !at.starts_with(root) {
+                    anyhow::bail!(
+                        "{} is a symlink at {}, outside the project at {}.\n\
+                         Remove the symlink, or use --global to configure Codex outside the project.",
+                        named.display(),
+                        at.display(),
+                        root.display()
+                    );
+                }
+                hop = next;
             }
         }
-        let target = fs::read_link(&link)
-            .with_context(|| format!("Failed to read the symlink {}", link.display()))?;
-        let tail = hop.strip_prefix(&link).unwrap_or(Path::new(""));
-        let anchored = if target.is_absolute() {
-            target
-        } else {
-            link.parent().unwrap_or(Path::new("")).join(target)
-        };
-        hop = anchored.join(tail);
     }
     anyhow::bail!(
-        "{} passes through {MAX_CONTAINMENT_LINK_HOPS} symlinks or more, \
+        "{} passes through more symlinks than RTK follows, \
          so RTK cannot say where a write to it would land.\n\
          Remove the symlink, or use --global to configure Codex outside the project.",
-        path.display()
+        named.display()
     )
 }
 
-/// The shortest prefix of `path` that is a symlink, if any.
+/// Where a symlink sits, as a path free of `.` and `..`.
 ///
-/// A dangling link stops `canonicalize` wherever it sits, not only at the end of the path, and
-/// its fallback then copies that component into the answer verbatim -- so a link anywhere
-/// along the way is a hop the containment walk has to take for itself.
-fn first_symlink_component(path: &Path) -> Option<PathBuf> {
-    let mut prefix = PathBuf::new();
-    for component in path.components() {
-        prefix.push(component);
-        if fs::symlink_metadata(&prefix).is_ok_and(|meta| meta.is_symlink()) {
-            return Some(prefix);
-        }
-    }
-    None
-}
-
-/// Where a symlink found by [`first_symlink_component`] sits, as a path free of `.` and `..`.
-///
-/// Its parent holds no symlink, by construction, so resolving that and re-attaching the name
-/// gives the link's own location rather than its target's.
+/// Resolving the parent and re-attaching the name gives the link's own location rather than
+/// its target's, whether or not the parent itself holds links.
 fn link_site(link: &Path) -> PathBuf {
     match (link.parent(), link.file_name()) {
         (Some(parent), Some(name)) => canonicalize_path_for_comparison(parent).join(name),
@@ -7270,8 +7448,15 @@ mod tests {
             RTK_AWARENESS_HIGH,
             RTK_AWARENESS_FULL,
         ] {
-            assert!(is_rtk_authored_md(payload));
-            assert!(is_rtk_authored_md(&payload.replace('\n', "\r\n")));
+            let remedy = "the awareness text was reworded: delete these two assertions rather \
+                          than adding a digest for the new wording -- every file written from \
+                          then on carries the ownership line, so nothing needs recognising by \
+                          content";
+            assert!(is_rtk_authored_md(payload), "{remedy}");
+            assert!(
+                is_rtk_authored_md(&payload.replace('\n', "\r\n")),
+                "{remedy}"
+            );
         }
         // A line of spaces is not content: the claim is on the first line that is.
         assert!(is_rtk_authored_md(&format!(
@@ -7575,6 +7760,217 @@ mod tests {
         );
     }
 
+    /// A link in the middle of the chain is a place the write can land, so pointing it back
+    /// into the project must not buy it a pass: the far end is not the only thing that moves.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_link_partway_along_the_chain_may_not_sit_outside() {
+        use std::os::unix::fs::symlink;
+
+        let enclosing = TempDir::new().expect("enclosing");
+        let root = fs::canonicalize(enclosing.path()).expect("canonical");
+        let project = root.join("project");
+        fs::create_dir_all(project.join(CODEX_DIR)).expect("project");
+        let outside = root.join("elsewhere");
+        fs::create_dir(&outside).expect("elsewhere");
+
+        // hooks.json -> elsewhere/x -> project/kept.json, whose end sits back inside.
+        symlink(outside.join("x"), project.join(CODEX_DIR).join(HOOKS_JSON)).expect("first");
+        symlink(project.join("kept.json"), outside.join("x")).expect("middle");
+
+        let error = ensure_inside_root(&project, &Path::new(CODEX_DIR).join(HOOKS_JSON))
+            .expect_err("a link outside the project is a write outside the project");
+        let message = error.to_string();
+        assert!(
+            message.contains(&outside.join("x").display().to_string()),
+            "the refusal must name the link that sits outside: {message}"
+        );
+    }
+
+    /// The bound counts hops followed, so a chain of exactly that length still resolves.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_chain_of_exactly_the_hop_limit_still_settles() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tmp");
+        let tmp = fs::canonicalize(temp.path()).expect("canonical");
+        let end = tmp.join("end");
+        fs::write(&end, "landed").expect("end");
+
+        // link1 -> link2 -> ... -> linkN -> end is N hops to a target that is not a link.
+        let link = |n: usize| tmp.join(format!("link{n}"));
+        symlink(&end, link(MAX_SYMLINK_HOPS)).expect("last link");
+        for n in (1..MAX_SYMLINK_HOPS).rev() {
+            symlink(link(n + 1), link(n)).expect("link");
+        }
+
+        match follow_symlink_chain(&link(1)) {
+            SymlinkChain::Target(target) => assert_eq!(target, end),
+            SymlinkChain::Settled => panic!("the head of the chain is a symlink"),
+            SymlinkChain::Exhausted => {
+                panic!("a chain of exactly {MAX_SYMLINK_HOPS} hops is within the bound")
+            }
+            SymlinkChain::Unreadable => panic!("every link in the chain is readable"),
+        }
+    }
+
+    /// One hop past the bound is where the walk must give up rather than keep going.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_chain_one_hop_past_the_limit_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tmp");
+        let tmp = fs::canonicalize(temp.path()).expect("canonical");
+        let end = tmp.join("end");
+        fs::write(&end, "landed").expect("end");
+
+        let over = MAX_SYMLINK_HOPS + 1;
+        let link = |n: usize| tmp.join(format!("link{n}"));
+        symlink(&end, link(over)).expect("last link");
+        for n in (1..over).rev() {
+            symlink(link(n + 1), link(n)).expect("link");
+        }
+
+        assert!(
+            matches!(follow_symlink_chain(&link(1)), SymlinkChain::Exhausted),
+            "a chain longer than the bound cannot be vouched for"
+        );
+    }
+
+    /// A jump lands on a target that may itself sit behind symlinked ancestors the walk
+    /// never visited, so stopping at the jump reports two spellings of one directory.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_symlink_components_resolves_the_jumped_to_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tmp");
+        // Anchored on the canonical form: a macOS temp dir sits under `/var`, itself a link to
+        // `/private/var`, which the resolver rightly follows and `temp.path()` does not.
+        let tmp = fs::canonicalize(temp.path()).expect("canonical tmp");
+        fs::create_dir_all(tmp.join("real/nested")).expect("real/nested");
+        symlink("real", tmp.join("via")).expect("ancestor link");
+        symlink(tmp.join("via/nested"), tmp.join("alias")).expect("alias");
+
+        // The jump lands on a target that itself sits behind `via`, so a walk that stops at
+        // the jump reports two spellings of one directory as two directories.
+        let resolved =
+            resolve_symlink_components_within(&tmp.join("alias/extensions"), MAX_SYMLINK_HOPS);
+        let Resolution::Fully(resolved) = resolved else {
+            panic!("a finite chain resolves fully");
+        };
+        assert_eq!(resolved, tmp.join("real/nested/extensions"));
+    }
+
+    #[test]
+    fn test_a_backup_slot_is_reused_when_it_already_holds_the_same_content() {
+        let tmp = TempDir::new().expect("tmp");
+        let source = tmp.path().join("RTK.md");
+        fs::write(&source, "the user's notes").expect("source");
+        fs::write(tmp.path().join("RTK.md.bak"), "the user's notes").expect("backup");
+
+        // A provisioning loop reapplying the same change must not consume a slot per run.
+        match free_backup_slot(&source).expect("slot") {
+            BackupSlot::AlreadyPreserved(path) => {
+                assert_eq!(path, tmp.path().join("RTK.md.bak"));
+            }
+            _ => panic!("an identical backup is already preserved"),
+        }
+    }
+
+    #[test]
+    fn test_a_differing_backup_does_not_claim_the_content_is_preserved() {
+        let tmp = TempDir::new().expect("tmp");
+        let source = tmp.path().join("RTK.md");
+        fs::write(&source, "the user's notes").expect("source");
+        fs::write(tmp.path().join("RTK.md.bak"), "something else").expect("backup");
+
+        match free_backup_slot(&source).expect("slot") {
+            BackupSlot::Free(path) => assert_eq!(path, tmp.path().join("RTK.md.bak.1")),
+            _ => panic!("differing content needs a slot of its own"),
+        }
+    }
+
+    #[test]
+    fn test_an_unreadable_source_still_gets_a_slot_to_be_renamed_onto() {
+        let tmp = TempDir::new().expect("tmp");
+        // A directory reads as an error the same way an unreadable file does, without
+        // depending on the test user not being root.
+        let source = tmp.path().join("RTK.md");
+        fs::create_dir(&source).expect("unreadable source");
+
+        // Whether it is already preserved cannot be known, but a rename does not need to
+        // read it, so refusing outright would strand content a move could have saved.
+        match free_backup_slot(&source).expect("slot") {
+            BackupSlot::SourceUnreadable(path) => assert_eq!(path, tmp.path().join("RTK.md.bak")),
+            _ => panic!("an unreadable source cannot be compared"),
+        }
+    }
+
+    /// The ceiling test proves the probe refuses once every slot is taken; this proves it does
+    /// not refuse while one is still free. An off-by-one passes the first and fails this.
+    #[test]
+    fn test_the_final_backup_slot_is_offered_rather_than_skipped() {
+        let tmp = TempDir::new().expect("tmp");
+        let source = tmp.path().join("RTK.md");
+        fs::write(&source, "current").expect("source");
+        // Every slot but the last, each holding something different so none can be handed
+        // back by the identical-content shortcut.
+        for attempt in 0..MAX_BACKUP_ATTEMPTS {
+            fs::write(
+                numbered_backup_path(&source, attempt),
+                format!("old {attempt}"),
+            )
+            .expect("occupied slot");
+        }
+
+        // Coupled to the constant, so raising the ceiling cannot quietly void this the way it
+        // voided an earlier test that named a fixed slot.
+        match free_backup_slot(&source).expect("slot") {
+            BackupSlot::Free(path) => {
+                assert_eq!(path, numbered_backup_path(&source, MAX_BACKUP_ATTEMPTS));
+            }
+            other => panic!("the last slot is free: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_backup_slots_run_out_rather_than_overwriting_a_rescue_copy() {
+        let tmp = TempDir::new().expect("tmp");
+        let source = tmp.path().join("RTK.md");
+        fs::write(&source, "current").expect("source");
+        for attempt in 0..=MAX_BACKUP_ATTEMPTS {
+            fs::write(
+                numbered_backup_path(&source, attempt),
+                format!("old {attempt}"),
+            )
+            .expect("occupied slot");
+        }
+
+        let error = free_backup_slot(&source).expect_err("every slot is taken");
+        assert!(
+            error.to_string().contains("Remove or archive them first"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_a_backup_extends_the_name_rather_than_replacing_its_extension() {
+        // `with_extension` would turn `hooks.json` into `hooks.bak`, quietly backing up under
+        // a name that no longer says what the file was.
+        let path = Path::new("/project/.codex/hooks.json");
+        assert_eq!(
+            numbered_backup_path(path, 0),
+            Path::new("/project/.codex/hooks.json.bak")
+        );
+        assert_eq!(
+            numbered_backup_path(path, 3),
+            Path::new("/project/.codex/hooks.json.bak.3")
+        );
+    }
+
     /// The walk must not cost the ordinary in-project symlink its write, and must terminate
     /// on a chain that never ends.
     #[cfg(unix)]
@@ -7667,12 +8063,8 @@ mod tests {
         let rtk_md = project.path().join(RTK_MD);
         fs::write(&rtk_md, "my own notes\n").expect("write");
 
-        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(project.path()).expect("enter project");
-        let result = run_codex_mode(false, InitContext::default());
-        std::env::set_current_dir(&cwd).expect("leave project");
-        result.expect("install");
+        let _cwd = CwdGuard::enter(project.path());
+        run_codex_mode(false, InitContext::default()).expect("install");
 
         assert_eq!(
             fs::read_to_string(rtk_md.with_extension("md.bak")).expect("backup"),
@@ -7690,12 +8082,8 @@ mod tests {
         let rtk_md = project.path().join(RTK_MD);
         fs::write(&rtk_md, "my own notes\n").expect("write");
 
-        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(project.path()).expect("enter project");
-        let result = uninstall_codex(false, InitContext::default());
-        std::env::set_current_dir(&cwd).expect("leave project");
-        result.expect("uninstall");
+        let _cwd = CwdGuard::enter(project.path());
+        uninstall_codex(false, InitContext::default()).expect("uninstall");
 
         assert_eq!(
             fs::read_to_string(&rtk_md).expect("read"),
@@ -7727,12 +8115,9 @@ mod tests {
         )
         .expect("symlink");
 
-        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(project.path()).expect("enter project");
-        let result = uninstall_codex(false, InitContext::default());
-        std::env::set_current_dir(&cwd).expect("leave project");
-        result.expect("uninstall still reports what it did");
+        let _cwd = CwdGuard::enter(project.path());
+        uninstall_codex(false, InitContext::default())
+            .expect("uninstall still reports what it did");
 
         assert!(
             !elsewhere.path().join("stolen.json").exists(),
@@ -7811,11 +8196,8 @@ mod tests {
         let elsewhere = TempDir::new().expect("elsewhere");
         symlink(elsewhere.path(), project.path().join(CODEX_DIR)).expect("symlink");
 
-        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(project.path()).expect("enter project");
+        let _cwd = CwdGuard::enter(project.path());
         let result = run_codex_mode(false, InitContext::default());
-        std::env::set_current_dir(&cwd).expect("leave project");
 
         let error = result.expect_err("install must refuse rather than half-configure");
         assert!(error.to_string().contains("outside the project"), "{error}");
@@ -7848,11 +8230,8 @@ mod tests {
         )
         .expect("symlink");
 
-        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(project.path()).expect("enter project");
+        let _cwd = CwdGuard::enter(project.path());
         let result = run_codex_mode(false, InitContext::default());
-        std::env::set_current_dir(&cwd).expect("leave project");
 
         let error = result.expect_err("install must refuse");
         assert!(error.to_string().contains("outside the project"), "{error}");
@@ -7888,11 +8267,8 @@ mod tests {
         )
         .expect("RTK.md");
 
-        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(project.path()).expect("enter project");
+        let _cwd = CwdGuard::enter(project.path());
         let result = uninstall_codex(false, InitContext::default());
-        std::env::set_current_dir(&cwd).expect("leave project");
 
         result.expect("uninstall still cleans the project");
         assert_eq!(
@@ -11114,6 +11490,58 @@ mod tests {
     use std::sync::Mutex;
     /// Serialises all tests that mutate the process-wide working directory.
     static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Holds the cwd lock and puts the working directory back when it goes out of scope.
+    ///
+    /// Restoring by hand needs the call under test to return rather than panic, so one failing
+    /// assertion used to leave every later test inside a deleted `TempDir`, burying the real
+    /// failure under unrelated ones.
+    struct CwdGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        original: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let _lock = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+            let original = std::env::current_dir().expect("read the current directory");
+            std::env::set_current_dir(dir).expect("enter the test directory");
+            Self { _lock, original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    #[test]
+    fn test_cwd_guard_restores_after_a_panic() {
+        let tmp = TempDir::new().expect("tmp");
+        // Read under the lock: another cwd-mutating test holding it has the process sitting in
+        // its own TempDir, and capturing that would assert against a directory this test never
+        // entered.
+        let before = {
+            let _held = CwdGuard::enter(Path::new("."));
+            std::env::current_dir().expect("cwd")
+        };
+        let panicked = std::panic::catch_unwind(|| {
+            let _cwd = CwdGuard::enter(tmp.path());
+            panic!("the call under test fails");
+        });
+        assert!(panicked.is_err(), "the panic must propagate");
+        // Observed under the lock as well: the unwind dropped the closure's guard, so without
+        // retaking it a concurrent cwd test sitting in its own TempDir is what gets read.
+        let after = {
+            let _held = CwdGuard::enter(Path::new("."));
+            std::env::current_dir().expect("cwd")
+        };
+        assert_eq!(
+            after, before,
+            "a panic must not strand the process in the test directory"
+        );
+    }
 
     fn with_claude_dir_override<F: FnOnce(&Path)>(tmp: &TempDir, f: F) {
         let claude_dir = tmp.path().join(CLAUDE_DIR);
