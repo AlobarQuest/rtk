@@ -5,6 +5,64 @@ All notable changes to rtk (Rust Token Killer) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.51.0](https://github.com/rtk-ai/rtk/compare/v0.50.0...v0.51.0) (2026-10-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cli:** callers that relied on implicit shell expansion in positional arguments must pass the script explicitly, e.g. `rtk test --shell sh 'cargo test && cargo clippy'`.
+
+### Features
+
+* **hook:** add native Google Antigravity plugin lifecycle and hook support ([7efbaef](https://github.com/rtk-ai/rtk/commit/7efbaef462911f0fcb112c8a01025dc90f280617))
+* **hook:** add native Google Antigravity plugin lifecycle and hook support ([27774fe](https://github.com/rtk-ai/rtk/commit/27774feae59c043d22a97332deca87221b256fa7))
+* **search:** fold shared path prefix in file-list passthrough ([feac25d](https://github.com/rtk-ai/rtk/commit/feac25d15f254dcdbb6c6629b91328a821eb24ce))
+
+
+### Bug Fixes
+
+* allow clean-run summaries to bypass never_worse guard for injected JSON ([58f42f2](https://github.com/rtk-ai/rtk/commit/58f42f2ae0078e8488acc90b4f005d7611c7369d))
+* allow clean-run summaries to bypass never_worse guard for injected JSON (fixes [#4218](https://github.com/rtk-ai/rtk/issues/4218)) ([3d829e1](https://github.com/rtk-ai/rtk/commit/3d829e15fc458c84eb19970bf2a79a6aac6b203f))
+* allow tee mode to record recall stats ([9833d66](https://github.com/rtk-ai/rtk/commit/9833d66464e3fd98181aa5b0f25a967ee39fb23e))
+* **cli:** answer for a program that cannot run, not just an unresolvable name ([3ee51b2](https://github.com/rtk-ai/rtk/commit/3ee51b241bcbae7f42f551d191b200b5f8de018d))
+* **cli:** preserve argv boundaries in generic runners ([c298de6](https://github.com/rtk-ai/rtk/commit/c298de6aae4e97476ac5c6969fca7c17be543710))
+* **diff:** return exit code 2 for unreadable files ([bf23cff](https://github.com/rtk-ai/rtk/commit/bf23cff467aa3b4aa314d6a4b956630f1e275a5f))
+* **discover:** distinguish zero-session scans ([bccafef](https://github.com/rtk-ai/rtk/commit/bccafef3387d205b50def9905bd2aabe32947eb9))
+* **discover:** match Claude project dirs case-insensitively on Windows ([2955687](https://github.com/rtk-ai/rtk/commit/2955687e20c5b12078e4f64bbeb97a68ffc9a7ca))
+* **discover:** name the scan scope in the zero-session message ([22ae255](https://github.com/rtk-ai/rtk/commit/22ae255ae8c75b08a475b23e1bf6f2a6385b71a5))
+* **discover:** require token boundaries for rewrite rules ([60446ff](https://github.com/rtk-ai/rtk/commit/60446ff86a2f2c29f15faede324634298c2bc60e))
+* **gradle:** remove the unreachable gradle.toml filter ([b4d2396](https://github.com/rtk-ai/rtk/commit/b4d2396affb508e6ff6a47e8fb315d93b3288a8e))
+* **hooks:** reach deployed hooks with the host scrub, and pin it ([0b07197](https://github.com/rtk-ai/rtk/commit/0b07197a48bf715b7cee2338f303f95944db0185))
+* **init:** --agent cursor installs Cursor only and creates ~/.cursor ([b21c038](https://github.com/rtk-ai/rtk/commit/b21c0383972f917665d5f5b7a79afef3c356f295))
+* **init:** create Claude config dir for global init ([91872ab](https://github.com/rtk-ai/rtk/commit/91872ab49fcd85b3fdd134d3aa692c9fb26fcf1e))
+* **init:** give the Antigravity plugin its awareness rules, and report like the sibling agents ([0671ac5](https://github.com/rtk-ai/rtk/commit/0671ac5b3c3c2a5f59c6c7c2d05a5ab7f4d8cfd5))
+* **openclaw:** let the host own approval without losing RTK's deny gate ([a89a314](https://github.com/rtk-ai/rtk/commit/a89a31494670fcec8ffa20d939dd94c64bd998fb))
+* **openclaw:** let the host own approval without losing RTK's gates ([c6f484f](https://github.com/rtk-ai/rtk/commit/c6f484fda4eb73ca989304c58ffe889d49368db8))
+* **pip:** stop doubling the tool name in pip messages ([720d276](https://github.com/rtk-ai/rtk/commit/720d2764db499653834e6d444dab4c0f24999abc))
+* **pip:** use prog_label in tracking labels too ([05320b9](https://github.com/rtk-ai/rtk/commit/05320b982aa2d67cd96c0e862bf72c7d8cb69457))
+* **pytest:** preserve elapsed duration in summaries ([c529013](https://github.com/rtk-ai/rtk/commit/c529013e100986a39cf54c590e35c488b2255731))
+* **pytest:** preserve long-run durations ([ebb6b72](https://github.com/rtk-ai/rtk/commit/ebb6b720e91e5e7d3c772e5fdcf97eb910f9dd66))
+* **read:** only treat /* at line start as block comment opener ([f3d4d9b](https://github.com/rtk-ai/rtk/commit/f3d4d9b4aa7ab780dd9d73a69402f913e94db38c))
+* **read:** skip one-line strings and comments when tracking Python triple quotes ([ea1ead8](https://github.com/rtk-ai/rtk/commit/ea1ead89f5974e55cd2ebf6437fe5d88ccddca24))
+* **read:** track Python triple-quoted strings in minimal filter ([c75f159](https://github.com/rtk-ai/rtk/commit/c75f15909983c2d6de91a519238f543afacde11c))
+* **ruff:** bypass never_worse only for the format rtk injected ([bff334c](https://github.com/rtk-ai/rtk/commit/bff334ca84ae7d563d52abb6a2e9ced3936e37f9))
+* **search:** leave a file list verbatim when a line is not a plain path ([3223a80](https://github.com/rtk-ai/rtk/commit/3223a80145e482762abbf50ac01656360f906f14))
+* **shell:** run unresolvable single-string commands through the platform shell ([ff9bd8e](https://github.com/rtk-ai/rtk/commit/ff9bd8e6d06cb671e35e00db23a26ceb40645935))
+* **shell:** run unresolvable single-string commands through the platform shell ([a6408ad](https://github.com/rtk-ai/rtk/commit/a6408ad8eddebddc0a33a03ea65338347cc75b3d))
+* **tests:** keep the test suite and the developer's environment apart ([4c8a255](https://github.com/rtk-ai/rtk/commit/4c8a255e42b97011675fc3d8aed687b13196ad39))
+* **tests:** keep the test suite and the developer's environment apart ([e0d99ab](https://github.com/rtk-ai/rtk/commit/e0d99ab54e542cae8880a06817078859e0aa0412))
+* use contains() instead of iter().any() for clippy ([7a446f1](https://github.com/rtk-ai/rtk/commit/7a446f1467743213f9c631de500341b2db787c47))
+
+
+### Reverts
+
+* leave the tee-mode recall store change to [#4263](https://github.com/rtk-ai/rtk/issues/4263) ([f9f4092](https://github.com/rtk-ai/rtk/commit/f9f40924aa1665e2e5a833dc25700745d6eccd62))
+
+
+### Miscellaneous Chores
+
+* release 0.51.0 ([f985ad8](https://github.com/rtk-ai/rtk/commit/f985ad80cdadeaad57157e9e44a482fb7347a345))
+
 ## [0.50.0](https://github.com/rtk-ai/rtk/compare/v0.49.0...v0.50.0) (2026-09-24)
 
 
