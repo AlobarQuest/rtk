@@ -464,6 +464,20 @@ fn evict(conn: &Connection, cfg: &RetrieverConfig, keep_hash: &str) {
     }
 }
 
+#[cfg(feature = "engine")]
+pub fn trim_family(cfg: &RetrieverConfig, prefix: &str, keep: usize) {
+    let _ = with_open(cfg, |conn| {
+        conn.execute(
+            "DELETE FROM recall WHERE rowid IN (
+                SELECT rowid FROM recall WHERE command LIKE ?1 || '%'
+                ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?2
+            )",
+            params![prefix, keep as i64],
+        )?;
+        Ok(())
+    });
+}
+
 pub fn store(
     cfg: &RetrieverConfig,
     content: &[u8],

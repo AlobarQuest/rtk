@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::core::user_dirs;
-use crate::hooks::constants::{CODEX_DIR, CODEX_HOOK_COMMAND, HOOKS_JSON, PRE_TOOL_USE_KEY};
+use crate::hooks::constants::{
+    CLAUDE_PRE_MATCHER, CODEX_DIR, CODEX_HOOK_COMMAND, HOOKS_JSON, PRE_TOOL_USE_KEY,
+};
 use std::path::Component;
 
 /// The line that says an `RTK.md` is RTK's to rewrite and to remove.
@@ -920,7 +922,12 @@ fn patch_codex_hooks_json(path: &Path, ctx: InitContext) -> Result<bool> {
         return Ok(false);
     }
 
-    insert_hook_entry(&mut root, CODEX_HOOK_COMMAND)?;
+    insert_hook_entry(
+        &mut root,
+        PRE_TOOL_USE_KEY,
+        CLAUDE_PRE_MATCHER,
+        CODEX_HOOK_COMMAND,
+    )?;
 
     if !dry_run && let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -1374,24 +1381,6 @@ mod tests {
         assert!(!is_rtk_authored_md("my own notes about rtk\n"));
         assert!(!is_rtk_authored_md(""));
 
-        // The payloads v0.49.0 and the builds after it wrote with nothing claiming them.
-        // Should the awareness text ever be reworded, these assertions go rather than gaining
-        // a digest: every file written from then on carries the ownership line instead.
-        for payload in [
-            RTK_AWARENESS_DEFAULT,
-            RTK_AWARENESS_HIGH,
-            RTK_AWARENESS_FULL,
-        ] {
-            let remedy = "the awareness text was reworded: delete these two assertions rather \
-                          than adding a digest for the new wording -- every file written from \
-                          then on carries the ownership line, so nothing needs recognising by \
-                          content";
-            assert!(is_rtk_authored_md(payload), "{remedy}");
-            assert!(
-                is_rtk_authored_md(&payload.replace('\n', "\r\n")),
-                "{remedy}"
-            );
-        }
         // A line of spaces is not content: the claim is on the first line that is.
         assert!(is_rtk_authored_md(&format!(
             "   \n{RTK_MD_OWNED_HEADER}\n\npayload\n"

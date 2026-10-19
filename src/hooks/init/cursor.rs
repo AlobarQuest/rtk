@@ -477,6 +477,7 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
+    #[cfg(feature = "engine")]
     #[test]
     fn test_remove_cursor_hooks_keeps_malformed_json_best_effort() {
         let temp = TempDir::new().unwrap();

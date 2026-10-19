@@ -76,6 +76,7 @@ const KNOWN_PI_PLUGIN_HASHES: &[&str] = &[
     "eb56dd08b8d5f4704906d037d70b357d84d827abe1063135cc7c998efe6cf7f2",
     "628308173ae41c488b76bcf90eafbd4c0c72435927645d81cdbec652eac4b107",
     "3eb16108f51a29c2a62a453d5c97a6ea2da8aea1061da34c50fdcfaa32dc0ff7",
+    "def594058835ce23d82abd6872a8359144a4486ed0905ff12e59fedb2260b472",
 ];
 
 /// Resolve Pi config directory, honouring `PI_CODING_AGENT_DIR` override.

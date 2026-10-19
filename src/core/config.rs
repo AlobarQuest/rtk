@@ -36,7 +36,7 @@ pub struct Config {
 /// How much the agent is told about RTK by the instructions file `rtk init` writes.
 ///
 /// - `default`: output contract only. The agent never learns rtk exists.
-/// - `high`: adds what RTK is and its meta commands (`rtk gain`, `rtk proxy`, `RTK_DISABLED=1`).
+/// - `high`: adds what RTK is and its meta commands (`rtk gain`, `rtk bypass`, `RTK_DISABLED=1`).
 /// - `full`: adds "prefix every command with `rtk`". Required for agents without a command
 ///   hook; those agents always receive `full` regardless of this setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

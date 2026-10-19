@@ -68,22 +68,23 @@ pub(crate) fn track_tee_read(cmd: &str) {
 /// Prints the RTK-rewritten command to stdout and exits with a code that tells
 /// the caller how to handle permissions:
 ///
-/// | Exit | Stdout   | Meaning                                                      |
-/// |------|----------|--------------------------------------------------------------|
-/// | 0    | rewritten| Rewrite allowed — hook may auto-allow the rewritten command. |
-/// | 1    | (none)   | No RTK equivalent — hook passes through unchanged.           |
-/// | 2    | (none)   | Deny rule matched — hook defers to Claude Code native deny.  |
-/// | 3    | rewritten| Ask rule or no rule matched — hook rewrites, host prompts.   |
+/// | Exit | Stdout   | Meaning                                                                  |
+/// |------|----------|--------------------------------------------------------------------------|
+/// | 0    | rewritten| Allow rules cover every command — hook may auto-allow the rewrite.       |
+/// | 1    | (none)   | No rewrite, or a deny rule matched inside a shell wrapper's script ([`decision::decide`] deferred) — hook passes through. |
+/// | 2    | (none)   | Deny rule matched — hook defers to the host's native deny.               |
+/// | 3    | rewritten| Ask rule, or allow rules short of every command (also with no rules) — hook rewrites, host prompts. |
 ///
 /// The decision itself is [`decision::decide`], shared with the in-process
 /// `rtk hook <agent>` path; this function is only its exit-code rendering.
 ///
 /// A delegate that gates the rewritten command itself can set
-/// [`decision::REWRITE_HOST_ENV`] to its own agent name, which renders a
-/// *default* ask (no rule matched) as exit 0 for it and nothing else — see
-/// [`decision::ApprovalOwner`]. An explicit `ask` rule the user wrote still
-/// renders as exit 3, so the host can keep prompting for the command the user
-/// asked about, and [`decision::ApprovalOwner::apply`] cannot transform a
+/// [`decision::REWRITE_HOST_ENV`] to its agent name (`openclaw` is the only one
+/// that resolves to [`decision::ApprovalOwner::Delegate`]), which renders a
+/// *default* ask (no ask rule, allow rules short of every command) as exit 0
+/// for it and nothing else. An explicit `ask` rule the user wrote still renders
+/// as exit 3, so the host can keep prompting for the command the user asked
+/// about, and [`decision::ApprovalOwner::apply`] cannot transform a
 /// [`HookDecision::Deny`]: an explicit deny still reaches this function as
 /// `Deny` and still renders as exit 2, for every delegate, named or not.
 pub fn run(cmd: &str) -> anyhow::Result<()> {
@@ -223,12 +224,14 @@ mod tests {
         ///   Ask    → 3 (process::exit(3))
         ///   Default→ 3 (process::exit(3)) — grouped with Ask
         ///   Deny   → 2 (process::exit(2)) — handled before rewrite match
+        ///   Defer  → 1 (process::exit(1)) — passthrough, no rewrite
         fn expected_exit_code(verdict: &PermissionVerdict) -> i32 {
             match verdict {
                 PermissionVerdict::Allow => 0,
                 PermissionVerdict::Deny => 2,
                 PermissionVerdict::Ask => 3,
                 PermissionVerdict::Default => 3, // MUST be 3, not 0!
+                PermissionVerdict::Defer => 1,
             }
         }
 
@@ -242,6 +245,15 @@ mod tests {
                 3,
                 "Default verdict MUST exit with code 3 (ask), not 0 (allow)"
             );
+        }
+
+        #[test]
+        fn test_defer_verdict_maps_to_passthrough_exit_code() {
+            let deny = vec!["git push:*".to_string()];
+            let allow = vec!["*".to_string()];
+            let verdict = check_command_with_rules("env bash -c 'git push'", &deny, &[], &allow);
+            assert_eq!(verdict, PermissionVerdict::Defer);
+            assert_eq!(expected_exit_code(&verdict), 1);
         }
 
         #[test]
