@@ -1,0 +1,11 @@
+# AlobarQuest/rtk: the token-filtering CLI installed on Devon's Mac by the tool-installer lane.
+upstream = "rtk-ai/rtk"
+ecosystem = "cargo"
+release_tag_pattern = '^v(\d+\.\d+\.\d+)$'
+
+[review]
+# The only legitimate network caller, and the skills/commands that auto-load into Claude Code:
+# any change to either needs a person.
+paths_watched = ["src/core/telemetry.rs", ".claude/*"]
+# The command-rewrite rules every proxied command passes through.
+trust_critical = ["src/discover/registry.rs", "src/core/*"]

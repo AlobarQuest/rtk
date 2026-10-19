@@ -1,37 +1,31 @@
+# Rendered by `fork-sync scaffold` (AlobarQuest/orchestrator); `fork-sync check` reports drift.
+#
+# Rebuilds the `upstream-sync` branch from upstream's newest release matching
+# `.github/fork-sync.toml`, keeps this fork's whole `.github/` (so upstream workflows never enter),
+# and opens or edits ONE rolling pull request to main. It does not review: the `security review`
+# and `build and test` jobs in ci.yml run on that pull request and are required checks, so a sync
+# lands only when both pass.
+#
+# The App `fork-secure-upstream-sync` authors the branch and the pull request, so the inert
+# landing lane can permit that one author by name rather than every workflow here.
 name: Upstream Sync
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # 6 AM UTC daily
+    - cron: '0 6 * * *'
   workflow_dispatch:
 
 concurrency:
   group: upstream-sync
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-
     steps:
-      # A DEDICATED IDENTITY FOR THIS LANE, and the reason is a landing permission rather than
-      # hygiene. Until 2026-09-05 this workflow acted as `GITHUB_TOKEN`, so its pull request's
-      # author read `github-actions[bot]` -- the identity of ANY workflow in this repository. The
-      # estate's inert landing lane permits authors BY NAME, so declaring that one would have
-      # granted "may land unattended" to every workflow-authored pull request here rather than to
-      # the sync. Devon chose the narrower option on 2026-09-05.
-      #
-      # The App's installation is what bounds this now, and it is installed on this repository
-      # alone. Deliberately NOT the `Alobar SDS Dispatch` App, which could already reach here: its
-      # wide grant was left in place on 2026-09-02 BECAUSE every one of its call sites is bounded
-      # by the orchestrator's own allowlists, and a fork's sync authoring pull requests would be a
-      # call site outside them -- removing the ground that ruling stands on.
-      #
-      # ALL THREE uses move together. A checkout as one identity and a pull request as another
-      # would push a branch nobody could attribute to the actor that opened it.
       - name: Mint GitHub App token
         id: app-token
         uses: actions/create-github-app-token@v1
@@ -44,115 +38,58 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Configure git
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Find the upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          UPSTREAM=$(python3 .github/scripts/fork_sync_review.py upstream)
+          gh api "repos/${UPSTREAM}/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          TAG=$(python3 .github/scripts/fork_sync_review.py next-release "$RUNNER_TEMP/releases.json")
+          echo "Upstream ${UPSTREAM}: ${TAG:-nothing new}"
+          echo "upstream=${UPSTREAM}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      # Submodule gitlinks come across exactly as upstream has them; nothing here fetches their
+      # content. The security review reports any pointer change as a finding.
+      - name: Rebuild the sync branch
+        if: steps.release.outputs.tag != ''
+        env:
+          UPSTREAM: ${{ steps.release.outputs.upstream }}
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/rtk-ai/rtk.git || true
-          git fetch upstream --tags
-
-      - name: Check for new stable release
-        id: check
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          TAG=$(gh api repos/rtk-ai/rtk/releases/latest --jq .tag_name) || { echo "No stable upstream release found — nothing to do."; echo "has_changes=false" >> $GITHUB_OUTPUT; exit 0; }
-          CURRENT="v$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          case "$CURRENT" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "Could not parse fork version from Cargo.toml (got: $CURRENT)"; exit 1 ;;
-          esac
-          echo "Latest upstream stable: ${TAG} — fork main: ${CURRENT}"
-          if [ "$TAG" = "$CURRENT" ]; then
-            echo "Fork is up to date — nothing to do."
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-          else
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            echo "tag=$TAG" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create or reset sync branch
-        if: steps.check.outputs.has_changes == 'true'
-        run: |
-          git checkout -B upstream-sync "${{ steps.check.outputs.tag }}"
-          # Fork owns .github entirely — drop upstream CI, restore ours
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --no-tags upstream "refs/tags/${TAG}:refs/tags/${TAG}"
+          git checkout -B upstream-sync "refs/tags/${TAG}"
           rm -rf .github
           git checkout origin/main -- .github/
           git add -A .github
-          git diff --cached --quiet || git commit -m "ci: replace upstream CI with fork sync workflow"
-          git push origin upstream-sync --force
+          git diff --cached --quiet || git commit -m "fork-sync: keep the fork's .github over ${TAG}"
+          git push --force origin upstream-sync
 
-      - name: Run cargo audit
-        if: steps.check.outputs.has_changes == 'true'
-        run: |
-          rustup update stable
-          cargo install cargo-audit --locked
-          [ -f Cargo.lock ] || cargo generate-lockfile
-          set +e
-          cargo audit > /tmp/cargo_audit.txt 2>&1
-          echo "cargo audit exit code: $?" >> /tmp/cargo_audit.txt
-          set -e
-          cat /tmp/cargo_audit.txt
-
-      # `continue-on-error` so the pull request is still opened and still carries the warning --
-      # the state must stay VISIBLE. The run is failed at the end instead, by the gate below.
-      - name: Generate AI security review
-        id: review
-        if: steps.check.outputs.has_changes == 'true'
-        continue-on-error: true
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          BASE_REF: origin/main
-          HEAD_REF: ${{ steps.check.outputs.tag }}
-        run: python3 .github/scripts/ai_security_review.py
-
-      - name: Open or update PR
-        if: steps.check.outputs.has_changes == 'true'
+      - name: Open or update the pull request
+        if: steps.release.outputs.tag != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          UPSTREAM: ${{ steps.release.outputs.upstream }}
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
-          TAG="${{ steps.check.outputs.tag }}"
-          COMMITS=$(git log origin/main.."$TAG" --oneline -- . ':!.github' | head -50)
-          RELEASE_NOTES=$(gh api repos/rtk-ai/rtk/releases/latest --jq .body | head -60)
-
           {
-            printf '## Upstream Sync — %s\n\n' "$TAG"
-            printf '**Upstream release notes ([rtk-ai/rtk](https://github.com/rtk-ai/rtk/releases)):**\n%s\n\n' "$RELEASE_NOTES"
-            printf '**Commits (first 50):**\n```\n%s\n```\n\n---\n\n' "$COMMITS"
-            printf '## 🤖 AI Security Review\n\n'
-            cat /tmp/ai_review.md
-            printf '\n\n---\n\n## 🔒 cargo audit (RustSec)\n\n```\n'
-            cat /tmp/cargo_audit.txt
-            printf '```\n\n---\n\n'
-            printf '**After merging, rebuild your local binary:**\n```\ncargo install --git https://github.com/AlobarQuest/rtk --branch main --locked --force rtk\n```\n\n'
-            printf '*Auto-generated by upstream-sync workflow*\n'
-          } > /tmp/pr_body.md
-
-          EXISTING=$(gh pr list --repo "${{ github.repository }}" --base main --head upstream-sync --json number --jq '.[0].number' 2>/dev/null)
-
-          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
-            gh pr edit "$EXISTING" --repo "${{ github.repository }}" \
-              --title "⬆️ Upstream sync — ${TAG}" \
-              --body-file /tmp/pr_body.md
-            echo "Updated existing PR #${EXISTING}"
+            printf '## Upstream sync: %s\n\n' "$TAG"
+            printf 'Release notes: https://github.com/%s/releases/tag/%s\n\n' "$UPSTREAM" "$TAG"
+            printf 'Commits (first 50), as an indented block so no subject can end it:\n\n'
+            git log origin/main..upstream-sync --oneline -- . ':!.github' | head -50 | sed 's/^/    /'
+            printf '\nThe `security review` check posts its findings as a comment.\n'
+          } > "$RUNNER_TEMP/body.md"
+          EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --head upstream-sync --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --title "Upstream sync: ${TAG}" --body-file "$RUNNER_TEMP/body.md"
           else
-            gh pr create --repo "${{ github.repository }}" \
-              --base main \
-              --head upstream-sync \
-              --title "⬆️ Upstream sync — ${TAG}" \
-              --body-file /tmp/pr_body.md
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head upstream-sync --title "Upstream sync: ${TAG}" --body-file "$RUNNER_TEMP/body.md"
           fi
-
-      # THE GATE. Without it this workflow reported `success` for six consecutive days while its
-      # security review was answering HTTP 401 -- the failure was written into the pull-request
-      # body and nowhere else, so the only reader was whoever happened to scroll that far.
-      #
-      # Deliberately AFTER the pull request step: a sync whose review did not run should still be
-      # visible, and should not be mergeable-looking. Visible and red, not hidden and green.
-      - name: Fail the run if the security review did not happen
-        if: steps.check.outputs.has_changes == 'true' && steps.review.outcome == 'failure'
-        run: |
-          echo "::error::the AI security review did not run; the pull request body says why."
-          echo "This run opened or updated the pull request so the state is visible, and fails"
-          echo "here so it is not silently green. Read the body, fix the cause, re-run."
-          exit 1
