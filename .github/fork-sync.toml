@@ -1,0 +1,31 @@
+# AlobarQuest/rtk: the token-filtering CLI installed on Devon's Mac by the tool-installer lane.
+upstream = "rtk-ai/rtk"
+ecosystem = "cargo"
+release_tag_pattern = '^v(\d+\.\d+\.\d+)$'
+
+[review]
+# Every path that can reach the network or write the operator's Claude Code configuration, and
+# the skills/commands that auto-load into Claude Code: any change needs a person. Since v1.0.1
+# telemetry is one network caller of several (classifiers, tasks, pipeline install, LLM proxy).
+paths_watched = [
+    "src/core/telemetry.rs",
+    "src/core/telemetry_cmd.rs",
+    "src/core/classify.rs",
+    "src/core/task_cmd.rs",
+    "src/core/pipeline_remote.rs",
+    "src/core/pipeline_cmd.rs",
+    "src/llm_proxy.rs",
+    "src/hooks/session_start.rs",
+    "src/hooks/init/*",
+    ".claude/*",
+    "proxy/Cargo.toml",
+]
+# The command-rewrite rules and hook decisions every proxied command passes through, the project
+# trust gate, and the default pipelines applied to every command.
+trust_critical = [
+    "src/discover/registry.rs",
+    "src/core/*",
+    "src/hooks/*",
+    "engine/builtin/*.toml",
+    "engine/src/*",
+]

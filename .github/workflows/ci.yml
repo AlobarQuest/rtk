@@ -1,472 +1,82 @@
+# Rendered by `fork-sync scaffold` (AlobarQuest/orchestrator); `fork-sync check` reports drift.
+#
+# Both JOB names are the branch-protection contexts (`build and test`, `security review`), and
+# both report on every pull request: no path filter, or a pull request waits forever for a check
+# that never runs. Commands come from `.github/fork-sync.toml`.
 name: CI
 
 on:
   pull_request:
-    branches: [develop, master]
+  push:
+    branches: [main]
 
 permissions:
   contents: read
-  pull-requests: read
 
-env:
-  CARGO_TERM_COLOR: always
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # ─── Fast gates (fail early, save CI minutes) ───
-
-  check-test-presence:
-    name: test presence
-    runs-on: ubuntu-latest
+  build-and-test:
+    name: build and test
+    runs-on: macos-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
-          fetch-depth: 50
-      - name: Check filter modules have tests
-        run: |
-          git fetch origin "${{ github.base_ref }}" --depth=1 || true
-          bash scripts/check-test-presence.sh "origin/${{ github.base_ref }}"
-
-  fmt:
-    name: fmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+          persist-credentials: false
+      - uses: actions/setup-python@v5
         with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  clippy:
-    name: clippy
-    needs: fmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        # `proxy/` is not a workspace member (it would break
-        # `cargo install --git`), so it gets its own job below. Here
-        # --workspace covers `rtk` + `engine`; a bare `cargo clippy` would
-        # never lint the daemon.
-      - run: cargo clippy --workspace --all-targets
-
-  rustdoc:
-    name: rustdoc
-    needs: fmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+          python-version: '3.14'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps
+      - name: Build
+        run: python3 .github/scripts/fork_sync_review.py run build
+      - name: Test
+        run: python3 .github/scripts/fork_sync_review.py run test
 
-  # ─── Parallel gates (all need code to compile) ───
-
-  # `proxy/` is not a workspace member -- a second binary-bearing package
-  # breaks `cargo install --git`, the command every README prints. So the
-  # daemon gets its own lint and test job here; --workspace above covers only
-  # `rtk` + `engine`.
-  proxy:
-    name: proxy (lint + test)
+  # Executes nothing from the pull request. The checkout is the BASE (so this script, the
+  # declaration and the acknowledgements are main's); the head's objects are fetched and read
+  # with git, never checked out. Audits run on copies of the head's lockfile in a scratch
+  # directory with fixed arguments.
+  security-review:
+    name: security review
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    needs: clippy
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GIT_NO_REPLACE_OBJECTS: '1'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v5
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --manifest-path proxy/Cargo.toml --all --check
-      - run: cargo clippy --manifest-path proxy/Cargo.toml --all-targets
-      - run: cargo test --manifest-path proxy/Cargo.toml
-
-  # The Apache-2.0 edition. Two things must hold: it builds and passes its own
-  # tests, and its dependency graph contains no BUSL crate. The purity check is
-  # what stops the feature rotting -- without it the first ungated
-  # `rtk_engine::` call breaks the oss build and nobody notices until a release.
-  oss:
-    name: oss edition (build + purity)
-    runs-on: ubuntu-latest
-    needs: clippy
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --no-default-features --all-targets
-      - run: cargo test --no-default-features
-      # Match the crate-name column, not the whole line: the checkout path
-      # can contain 'rtk-engine', which would match every line's path and
-      # fail a clean tree.
-      - name: No BUSL crate in the Apache-2.0 edition
-        run: |
-          crates=$(cargo tree -p rtk --no-default-features -e normal --prefix none | awk '{print $1}' | sort -u)
-          if printf '%s\n' "$crates" | grep -qx 'rtk-engine'; then
-            echo "::error::rtk-engine reached the Apache-2.0 edition's dependency graph"
-            cargo tree -p rtk --no-default-features -e normal | grep -nE '(^|[^a-z-])rtk-engine v'
-            exit 1
-          fi
-          echo "Apache-2.0 edition links no BUSL crate."
-
-  test:
-    name: test (${{ matrix.os }})
-    needs: clippy
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v7
-        with:
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        # `--all` is `--workspace`: `rtk` + `engine`. `proxy/` is tested in
-        # its own job, since it is not a member.
-      - run: cargo test --all
-
-  security:
-    name: Security Scan
-    needs: clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
+          persist-credentials: false
+      - uses: actions/setup-python@v5
         with:
-          fetch-depth: 0
-
+          python-version: '3.14'
       - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
+      # Installed outside the checkout, so no repository cargo config applies.
       - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Cargo Audit (CVE check)
-        run: |
-          echo "## Security Scan Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Dependency Vulnerabilities" >> $GITHUB_STEP_SUMMARY
-          if cargo audit 2>&1 | tee audit.log; then
-            echo "No known vulnerabilities detected" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "Vulnerabilities found:" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            cat audit.log >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "::warning::Dependency vulnerabilities detected - review required"
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-      - name: Critical files check
-        run: |
-          echo "### Critical Files Modified" >> $GITHUB_STEP_SUMMARY
-          CRITICAL=$(git diff --name-only origin/master...HEAD | grep -E "(runner|summary|tracking|init|pnpm_cmd|container)\.rs|Cargo\.toml|workflows/.*\.yml" || true)
-          if [ -n "$CRITICAL" ]; then
-            echo "**HIGH RISK**: The following critical files were modified:" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "$CRITICAL" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Required Actions:**" >> $GITHUB_STEP_SUMMARY
-            echo "- [ ] Manual security review by 2 maintainers" >> $GITHUB_STEP_SUMMARY
-            echo "- [ ] Verify no shell injection vectors" >> $GITHUB_STEP_SUMMARY
-            echo "- [ ] Check input validation remains intact" >> $GITHUB_STEP_SUMMARY
-            echo "::warning::Critical RTK files modified - enhanced review required"
-          else
-            echo "No critical files modified" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-      - name: Dangerous patterns scan
-        run: |
-          echo "### Dangerous Code Patterns" >> $GITHUB_STEP_SUMMARY
-          PATTERNS=$(git diff origin/master...HEAD | grep -E "Command::new\(\"sh\"|Command::new\(\"bash\"|\.env\(\"LD_PRELOAD|\.env\(\"PATH|reqwest::|std::net::|TcpStream|UdpSocket|unsafe \{|\.unwrap\(\) |panic!\(|todo!\(|unimplemented!\(" || true)
-          if [ -n "$PATTERNS" ]; then
-            echo "**Potentially dangerous patterns detected:**" >> $GITHUB_STEP_SUMMARY
-            echo '```diff' >> $GITHUB_STEP_SUMMARY
-            echo "$PATTERNS" | head -30 >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Security Concerns:**" >> $GITHUB_STEP_SUMMARY
-            echo "$PATTERNS" | grep -q "Command::new" && echo "- Shell command execution detected" >> $GITHUB_STEP_SUMMARY || true
-            echo "$PATTERNS" | grep -q "\.env\(\"" && echo "- Environment variable manipulation" >> $GITHUB_STEP_SUMMARY || true
-            echo "$PATTERNS" | grep -q "reqwest::\|std::net::\|TcpStream\|UdpSocket" && echo "- Network operations added" >> $GITHUB_STEP_SUMMARY || true
-            echo "$PATTERNS" | grep -q "unsafe" && echo "- Unsafe code blocks" >> $GITHUB_STEP_SUMMARY || true
-            echo "$PATTERNS" | grep -q "\.unwrap\(\)\|panic!\(" && echo "- Panic-inducing code" >> $GITHUB_STEP_SUMMARY || true
-            echo "::warning::Dangerous code patterns detected - manual review required"
-          else
-            echo "No dangerous patterns detected" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-      - name: New dependencies check
-        run: |
-          echo "### Dependencies Changes" >> $GITHUB_STEP_SUMMARY
-          if git diff origin/master...HEAD Cargo.toml | grep -E "^\+.*=" | grep -v "^\+\+\+" > new_deps.txt; then
-            echo "**New dependencies added:**" >> $GITHUB_STEP_SUMMARY
-            echo '```toml' >> $GITHUB_STEP_SUMMARY
-            cat new_deps.txt >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Required Actions:**" >> $GITHUB_STEP_SUMMARY
-            echo "- [ ] Audit each new dependency on crates.io" >> $GITHUB_STEP_SUMMARY
-            echo "- [ ] Check maintainer reputation and download counts" >> $GITHUB_STEP_SUMMARY
-            echo "- [ ] Verify no typosquatting (e.g., 'reqwest' vs 'request')" >> $GITHUB_STEP_SUMMARY
-            echo "::warning::New dependencies require supply chain audit"
-          else
-            echo "No new dependencies added" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-      - name: Clippy security lints
-        run: |
-          echo "### Clippy Security Lints" >> $GITHUB_STEP_SUMMARY
-          if cargo clippy --workspace --all-targets -- -W clippy::unwrap_used -W clippy::panic -W clippy::expect_used 2>&1 | tee clippy.log | grep -E "warning:|error:"; then
-            echo "Security-related lints triggered:" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            grep -E "warning:|error:" clippy.log | head -20 >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "::warning::Clippy security lints failed"
-          else
-            echo "All security lints passed" >> $GITHUB_STEP_SUMMARY
-          fi
-
-      - name: Summary verdict
-        run: |
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Security Review Verdict" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**This is an automated security scan. A human maintainer must:**" >> $GITHUB_STEP_SUMMARY
-          echo "1. Review all warnings above" >> $GITHUB_STEP_SUMMARY
-          echo "2. Verify PR intent matches actual code changes" >> $GITHUB_STEP_SUMMARY
-          echo "3. Check for subtle backdoors or logic bombs" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**For high-risk PRs (critical files modified):**" >> $GITHUB_STEP_SUMMARY
-          echo "- Require approval from 2 maintainers" >> $GITHUB_STEP_SUMMARY
-          echo "- Test in isolated environment before merge" >> $GITHUB_STEP_SUMMARY
-
-  semgrep:
-    name: semgrep security scan
-    needs: clippy
-    runs-on: ubuntu-latest
-    container:
-      image: semgrep/semgrep
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      # `--error` alone fails on any finding at any severity, so the rules
-      # below .semgrep.yml's "non-blocking, flag for review" divider would block too.
-      # Gate on ERROR; report WARNING without failing, as that divider promises.
-      - run: semgrep scan --config .semgrep.yml --baseline-commit ${{ github.event.pull_request.base.sha }} --severity ERROR --error
-      - run: semgrep scan --config .semgrep.yml --baseline-commit ${{ github.event.pull_request.base.sha }} --severity WARNING || true
-
-  benchmark:
-    name: benchmark
-    needs: clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build rtk
-        run: cargo build --release
-
-      - name: Install system tools
-        run: sudo apt-get install -y tree ripgrep
-
-      - name: Install Python tools
-        run: pip install ruff pytest mypy
-
-      - name: Install Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: "stable"
-
-      - name: Install Go tools
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
-
-      - name: Run benchmark
-        run: ./scripts/benchmark.sh
-
-  # ─── AI Doc Review: develop PRs only ───
-
-  doc-review:
-    name: doc review
-    if: github.base_ref == 'develop'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      # `gh pr diff` uses the diff media type, which GitHub refuses with HTTP
-      # 406 above 20,000 lines -- and this job is advisory, so a large PR must
-      # not fail it. The files API has no such ceiling, so fall back to
-      # per-file patches and carry on with whatever context is available.
-      - name: Gather PR context
+        working-directory: ${{ runner.temp }}
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Fetch the head without checking it out
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          PR_NUM=${{ github.event.pull_request.number }}
-          gh pr view "$PR_NUM" --json title,body \
-            --jq '"PR Title: \(.title)\nPR Description: \(.body)"' > pr_info.txt
-
-          if gh pr diff "$PR_NUM" --name-only > changed_files.txt 2>/dev/null; then
-            gh pr diff "$PR_NUM" | head -c 12000 > diff.txt
-          else
-            echo "::notice::diff too large for the diff API - using the files API"
-            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUM}/files" --paginate \
-              --jq '.[].filename' > changed_files.txt
-            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUM}/files" --paginate \
-              --jq '.[] | select(.patch != null) | "--- \(.filename)\n\(.patch)"' \
-              | head -c 12000 > diff.txt
-          fi
-
-      - name: Build prompt files
-        run: |
-          # System prompt
-          cat <<'EOF' > system_prompt.txt
-          You are a documentation reviewer for the RTK project.
-          You will receive the project's CONTRIBUTING.md (which contains the documentation rules), the PR info, changed files, and diff.
-          Your job: based ONLY on the documentation rules in CONTRIBUTING.md, decide if the PR includes the required documentation updates.
-
-          IMPORTANT:
-          - CI/CD changes, test-only changes, and refactors with no user-facing impact do NOT require doc updates.
-          - Be practical, not pedantic. Small obvious fixes don't need CHANGELOG entries.
-          - Only flag missing docs when there is a clear user-facing change.
-          EOF
-
-          # User prompt: concatenate files (no printf, no variable expansion issues)
-          {
-            cat pr_info.txt
-            echo ""
-            echo "---"
-            echo "CONTRIBUTING.md:"
-            cat CONTRIBUTING.md
-            echo ""
-            echo "---"
-            echo "Changed files:"
-            cat changed_files.txt
-            echo ""
-            echo "---"
-            echo "Diff (may be truncated):"
-            cat diff.txt
-          } > user_prompt.txt
-
-      - name: AI documentation review
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git fetch --no-tags origin "$HEAD_SHA"
+      - name: Review
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.RTK_DOCS_ANTHROPIC_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        # A base without the script fails the check (the scaffold pull request only).
         run: |
-          echo "## Documentation Review (AI)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "::warning::ANTHROPIC_API_KEY not configured — skipping AI doc review"
-            echo "Skipped: ANTHROPIC_API_KEY secret not configured." >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
-
-          echo "::group::Preparing API request"
-          echo "System prompt: $(wc -c < system_prompt.txt) bytes"
-          echo "User prompt: $(wc -c < user_prompt.txt) bytes"
-          SYSTEM_JSON=$(jq -Rs . < system_prompt.txt)
-          USER_JSON=$(jq -Rs . < user_prompt.txt)
-          echo "::endgroup::"
-
-          echo "::group::Calling Claude API (claude-sonnet-4-6)"
-          RESPONSE=$(curl -s -w "\n%{http_code}" https://api.anthropic.com/v1/messages \
-            -H "content-type: application/json" \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -d "{
-              \"model\": \"claude-sonnet-4-6\",
-              \"max_tokens\": 1024,
-              \"messages\": [{\"role\": \"user\", \"content\": $USER_JSON}],
-              \"system\": $SYSTEM_JSON,
-              \"output_config\": {
-                \"format\": {
-                  \"type\": \"json_schema\",
-                  \"schema\": {
-                    \"type\": \"object\",
-                    \"properties\": {
-                      \"status\": {\"type\": \"string\", \"enum\": [\"PASS\", \"FAIL\"]},
-                      \"reasoning\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}},
-                      \"files_to_update\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}
-                    },
-                    \"required\": [\"status\", \"reasoning\", \"files_to_update\"],
-                    \"additionalProperties\": false
-                  }
-                }
-              }
-            }")
-
-          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-          echo "HTTP status: $HTTP_CODE"
-          echo "::endgroup::"
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::warning::Claude API returned HTTP $HTTP_CODE — skipping doc review"
-            echo "Skipped: API error (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "$BODY" | head -10 >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
-
-          # Parse structured JSON response
-          REVIEW_JSON=$(echo "$BODY" | jq -r '.content[0].text // empty')
-
-          if [ -z "$REVIEW_JSON" ]; then
-            echo "::warning::Empty response from Claude API — skipping doc review"
-            echo "Skipped: empty API response" >> $GITHUB_STEP_SUMMARY
-            echo "Raw response:"
-            echo "$BODY" | head -20
-            exit 0
-          fi
-
-          echo "::group::AI Review Result"
-          echo "$REVIEW_JSON" | jq .
-          echo "::endgroup::"
-
-          STATUS=$(echo "$REVIEW_JSON" | jq -r '.status')
-          REASONING=$(echo "$REVIEW_JSON" | jq -r '.reasoning[]' 2>/dev/null)
-          FILES=$(echo "$REVIEW_JSON" | jq -r '.files_to_update[]' 2>/dev/null)
-
-          echo "### Verdict: ${STATUS}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          if [ -n "$REASONING" ]; then
-            echo "**Reasoning:**" >> $GITHUB_STEP_SUMMARY
-            echo "$REASONING" | while IFS= read -r line; do
-              echo "- $line" >> $GITHUB_STEP_SUMMARY
-            done
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          if [ "$STATUS" = "FAIL" ] && [ -n "$FILES" ]; then
-            echo "**Files to update:**" >> $GITHUB_STEP_SUMMARY
-            echo "$FILES" | while IFS= read -r f; do
-              echo "- \`$f\`" >> $GITHUB_STEP_SUMMARY
-            done
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          if [ "$STATUS" = "PASS" ]; then
-            echo "Documentation review passed."
-          elif [ "$STATUS" = "FAIL" ]; then
-            echo "::error::Documentation review failed — see summary for details"
-            exit 1
-          else
-            echo "::warning::Unexpected status '${STATUS}' — skipping"
-            echo "Unexpected AI response status: ${STATUS}" >> $GITHUB_STEP_SUMMARY
-          fi
+          test -f .github/scripts/fork_sync_review.py \
+            || { echo "::error::the base has no review script"; exit 2; }
+          python3 .github/scripts/fork_sync_review.py review
