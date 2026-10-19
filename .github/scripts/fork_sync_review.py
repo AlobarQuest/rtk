@@ -664,17 +664,103 @@ def lock_review(change: Change, read: Callable[[str], bytes | None]) -> LockRevi
 def _audit_argv(ecosystem: str, directory: Path) -> tuple[list[str], dict[str, str]]:
     """The audit, fixed per ecosystem, against copies in a directory holding nothing else."""
     if ecosystem == "npm":
-        argv = ["npm", "audit", "--audit-level=high", "--userconfig", "/dev/null"]
+        argv = ["npm", "audit", "--json", "--audit-level=high", "--userconfig", "/dev/null"]
         return [*argv, "--registry", NPM_REGISTRY.rstrip("/")], {}
     lockfile = str(directory / "Cargo.lock")
-    return ["cargo-audit", "audit", "--file", lockfile], {"CARGO_HOME": str(directory / "home")}
+    argv = ["cargo-audit", "audit", "--json", "--file", lockfile]
+    return argv, {"CARGO_HOME": str(directory / "home")}
 
 
-AuditRunner = Callable[[list[str], Path, dict[str, str]], int]
+AuditRunner = Callable[[list[str], Path, dict[str, str]], tuple[int, bytes]]
+"""`(argv, cwd, env) -> (exit code, stdout)`."""
 
 
-def _run_audit(argv: list[str], cwd: Path, env: dict[str, str]) -> int:
-    return subprocess.run(argv, cwd=cwd, env=os.environ | env).returncode
+def _run_audit(argv: list[str], cwd: Path, env: dict[str, str]) -> tuple[int, bytes]:
+    result = subprocess.run(argv, cwd=cwd, env=os.environ | env, stdout=subprocess.PIPE)
+    return result.returncode, result.stdout
+
+
+@dataclass(frozen=True)
+class Advisory:
+    id: str
+    package: str
+    version: str
+    title: str
+    severity: str
+    fix: str
+
+
+def cargo_advisories(report: Mapping[str, Any], _lock: bytes) -> list[Advisory]:
+    """`vulnerabilities.list[]` of `cargo-audit audit --json`. Warnings (unmaintained, unsound,
+    yanked) are not advisories: cargo-audit does not fail on them, and neither does this."""
+    return [
+        Advisory(
+            id=item["advisory"]["id"],
+            package=item["package"]["name"],
+            version=item["package"]["version"],
+            title=item["advisory"]["title"],
+            severity=item["advisory"].get("cvss") or "no CVSS",
+            fix=", ".join(item["versions"]["patched"]) or "none",
+        )
+        for item in report["vulnerabilities"]["list"]
+    ]
+
+
+NPM_FAILING_SEVERITIES = frozenset({"high", "critical"})
+
+
+def npm_advisories(report: Mapping[str, Any], lock: bytes) -> list[Advisory]:
+    """Each advisory at or above `high` in `npm audit --json`'s `vulnerabilities[*].via`, once
+    per installed copy. A `via` that is a string names another vulnerable package, which is
+    listed under its own name; the installed version comes from the lockfile, not the report."""
+    installed = _npm_packages(lock)
+    advisories = []
+    for vulnerability in report["vulnerabilities"].values():
+        fix = vulnerability.get("fixAvailable")
+        fixed = f"{fix['name']} {fix['version']}" if isinstance(fix, dict) else str(fix).lower()
+        for via in vulnerability["via"]:
+            if isinstance(via, str) or via["severity"] not in NPM_FAILING_SEVERITIES:
+                continue
+            ident = str(via.get("url") or via["source"]).rpartition("/")[2]
+            for node in vulnerability["nodes"]:
+                advisories.append(
+                    Advisory(
+                        ident,
+                        vulnerability["name"],
+                        installed[node]["version"],
+                        via["title"],
+                        via["severity"],
+                        fixed,
+                    )
+                )
+    return advisories
+
+
+ADVISORY_READERS = {"cargo": cargo_advisories, "npm": npm_advisories}
+
+
+def advisory_findings(
+    ecosystem: str, code: int, output: bytes, lock: bytes, lockfile: str
+) -> list[Finding]:
+    """One finding per advisory, fingerprinted by the advisory, package and installed version: an
+    acknowledgement names exactly what it accepts and lasts until that version changes."""
+    if code == 0:
+        return []
+    try:
+        advisories = ADVISORY_READERS[ecosystem](json.loads(output), lock)
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        raise ReviewUnavailable(f"the audit's JSON is unreadable: {type(error).__name__}") from None
+    if not advisories:
+        raise ReviewUnavailable(f"the audit exited {code} and listed no advisory")
+    return [
+        Finding(
+            "audit",
+            lockfile,
+            f"{a.id} {a.package} {a.version}: {a.title} ({a.severity}; fix: {a.fix})",
+            "\0".join((a.id, a.package, a.version)),
+        )
+        for a in advisories
+    ]
 
 
 def audit_findings(
@@ -689,11 +775,8 @@ def audit_findings(
         (directory / spec.lockfile).write_bytes(lock)
         (directory / spec.manifest).write_bytes(manifest)
         argv, env = _audit_argv(ecosystem, directory)
-        code = run(argv, directory, env)
-    if code == 0:
-        return []
-    summary = f"`{' '.join(argv[:2])}` failed (exit {code})"
-    return [Finding("audit", spec.lockfile, summary, _digest(lock))]
+        code, output = run(argv, directory, env)
+    return advisory_findings(ecosystem, code, output, lock, spec.lockfile)
 
 
 # ---- the model ------------------------------------------------------------------------------
