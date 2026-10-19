@@ -270,3 +270,9 @@ fingerprint = "5b06a1e10df6cffd"
 by = "devon (approved in session; recorded by Claude)"
 date = "2026-10-19"
 reason = "rtk v1.0.1 cargo-lock-source proxy/Cargo.lock: rtk-ai/icm (same org, Apache-2.0) at a pinned rev, used only by the separate rtk-proxy crate, which the root workspace excludes; cargo install of rtk never fetches it."
+
+[[ack]]
+fingerprint = "5389ed4fa2a2efef"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 too-large: the 0.51.0 -> 1.0.1 diff (3.66M characters) was reviewed for its network, credential, install-time and dependency surface instead (targeted review, 2026-10-19): no default-on network call, no listener in rtk, no new non-crates.io source in rtk's Cargo.lock, build.rs unchanged."
