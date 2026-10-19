@@ -317,6 +317,15 @@ def parse_raw_diff(raw: bytes) -> list[Change]:
     return changes
 
 
+def merged_changes(since_merge_base: list[Change], since_base_tip: list[Change]) -> list[Change]:
+    """The changes the merge would bring in: each path changed since the merge base whose head
+    content still differs from the base tip's. A path the base tip already holds verbatim -- the
+    fork's own `.github/`, which the sync restores from main -- introduces nothing, so it is
+    neither reviewed nor allowed to move the review's digest when main's `.github/` changes."""
+    differs = {change.path for change in since_base_tip}
+    return [change for change in since_merge_base if change.path in differs]
+
+
 def _utf8(data: bytes | None) -> bool:
     if data is None:
         return True
@@ -1009,8 +1018,11 @@ def build_report(
     span = f"{base}...{head}"
     report = Report(head)
     try:
-        changes = parse_raw_diff(
-            _git_bytes("diff", "--raw", "-z", "--no-renames", "--no-abbrev", span)
+        changes = merged_changes(
+            parse_raw_diff(_git_bytes("diff", "--raw", "-z", "--no-renames", "--no-abbrev", span)),
+            parse_raw_diff(
+                _git_bytes("diff", "--raw", "-z", "--no-renames", "--no-abbrev", base, head)
+            ),
         )
 
         def head_file(path: str) -> bytes | None:
