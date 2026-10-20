@@ -1,0 +1,52 @@
+# Rendered by `fork-sync scaffold` (AlobarQuest/orchestrator); `fork-sync check` reports drift.
+#
+# The weekly audit of main: main's dependencies against main's acknowledgements, read from git, so
+# an advisory published against a version already installed is found between upstream releases.
+# A workflow of its own, triggered only by the schedule and by hand, so a run of it can never
+# report a required check (`build and test`, `security review`) on a pull request's head.
+name: Fork-sync audit
+
+on:
+  schedule:
+    - cron: '0 13 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: weekly audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GIT_NO_REPLACE_OBJECTS: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: dtolnay/rust-toolchain@stable
+      # Installed outside the checkout, so no repository cargo config applies.
+      - name: Install cargo-audit
+        working-directory: ${{ runner.temp }}
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Audit
+        id: audit
+        run: python3 .github/scripts/fork_sync_review.py audit-main
+      # Any outcome but success alerts, including a setup step that failed before the audit ran.
+      - name: Notify
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ALERT_KIND: audit
+          RESULT: ${{ steps.audit.outcome == 'success' && 'success' || 'failure' }}
+          HEAD_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 .github/scripts/fork_sync_review.py notify

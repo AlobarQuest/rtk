@@ -19,6 +19,10 @@ paths_watched = [
     "src/hooks/init/*",
     ".claude/*",
     "proxy/Cargo.toml",
+    # Repository config a trusted checkout applies to command output, and the command that
+    # builds plugins from upstream's repository.
+    ".rtk/*",
+    "src/core/plugins_cmd.rs",
 ]
 # The command-rewrite rules and hook decisions every proxied command passes through, the project
 # trust gate, and the default pipelines applied to every command.

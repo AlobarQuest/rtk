@@ -2,7 +2,9 @@
 #
 # Both JOB names are the branch-protection contexts (`build and test`, `security review`), and
 # both report on every pull request: no path filter, or a pull request waits forever for a check
-# that never runs. Commands come from `.github/fork-sync.toml`.
+# that never runs. Commands come from `.github/fork-sync.toml`. `notify` raises the alert issue
+# for a failed review. Only `pull_request` and `push` trigger this workflow: a manual run on a
+# pull request's branch would report the required jobs as skipped, which counts as passing.
 name: CI
 
 on:
@@ -80,3 +82,36 @@ jobs:
           test -f .github/scripts/fork_sync_review.py \
             || { echo "::error::the base has no review script"; exit 2; }
           python3 .github/scripts/fork_sync_review.py review
+
+  # Opens, comments on or closes one issue on this fork, so a held sync reaches the maintainer.
+  # Only for the sync pull request: a person's own pull request is watched by that person.
+  # Holds no secret; its token can write issues and nothing else. It runs the BASE's script.
+  notify:
+    name: notify
+    needs: security-review
+    if: >-
+      always() && github.event_name == 'pull_request'
+      && github.head_ref == 'upstream-sync'
+      && contains(fromJSON('["success", "failure"]'), needs.security-review.result)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Notify
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ALERT_KIND: review
+          RESULT: ${{ needs.security-review.result }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 .github/scripts/fork_sync_review.py notify
