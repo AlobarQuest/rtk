@@ -11,6 +11,8 @@ Subcommands, each invoked by a rendered workflow:
   next-release FILE      given upstream's releases as JSON, print the tag to sync to, or nothing
   run build|test         run the configured build or test commands
   review                 the `security review` required check
+  audit-main             the weekly audit of main's dependencies, against main's acknowledgements
+  notify                 open, update or close the fork's alert issue for a review or an audit
 
 `review` runs in a checkout of the BASE, with the head's objects fetched but never checked out, so
 nothing from the head executes. Every changed path must be accounted for: its diff (or, for a
@@ -90,7 +92,8 @@ class ReviewUnavailable(RuntimeError):
 @dataclass(frozen=True)
 class Ecosystem:
     manifest: str
-    lockfile: str
+    lockfile: str | None
+    """`None` for a fork with no dependencies: nothing to audit, and declaring one is a finding."""
     build: tuple[str, ...]
     test: tuple[str, ...]
 
@@ -106,6 +109,12 @@ ECOSYSTEMS: dict[str, Ecosystem] = {
         manifest="package.json",
         lockfile="package-lock.json",
         build=("npm run build",),
+        test=("npm test",),
+    ),
+    "npm-no-deps": Ecosystem(
+        manifest="package.json",
+        lockfile=None,
+        build=(),
         test=("npm test",),
     ),
 }
@@ -215,7 +224,7 @@ def load_config(root: Path = Path()) -> Config:
 
 def manifest_version(ecosystem: str, text: str) -> str:
     """The version the fork's manifest declares, which is what a sync is compared against."""
-    if ecosystem == "npm":
+    if ECOSYSTEMS[ecosystem].manifest == "package.json":
         version = json.loads(text).get("version")
     else:
         manifest = tomllib.loads(text)
@@ -405,6 +414,9 @@ PATH_RULES: dict[str, tuple[PathRule, ...]] = {
         ),
     ),
     "npm": (("npmrc", "changes npm's registry or behaviour", lambda p: _basename(p) == ".npmrc"),),
+    "npm-no-deps": (
+        ("npmrc", "changes npm's registry or behaviour", lambda p: _basename(p) == ".npmrc"),
+    ),
     "cargo": (
         ("build-script", "runs at build time", lambda p: _basename(p) == "build.rs"),
         ("cargo-config", "changes cargo's behaviour", lambda p: ".cargo" in p.split("/")[:-1]),
@@ -772,10 +784,30 @@ def advisory_findings(
     ]
 
 
+def declared_dependencies(manifest: bytes | None) -> list[Finding]:
+    """For an ecosystem that audits nothing: a finding while the manifest declares any dependency
+    or workspace (whose packages' dependencies an install would fetch), fingerprinted by the
+    declared tables, so an acknowledgement lasts until they change."""
+    try:
+        tables = {
+            key: _json_object(manifest).get(key) for key in (*NPM_DEPENDENCY_KEYS, "workspaces")
+        }
+    except ValueError:
+        return [Finding("manifest-unreadable", "package.json", "not readable JSON", "unreadable")]
+    declared = {key: value for key, value in tables.items() if value}
+    if not declared:
+        return []
+    summary = f"declares {', '.join(sorted(declared))}, but this ecosystem audits no dependencies"
+    content = _digest(json.dumps(declared, sort_keys=True).encode())
+    return [Finding("dependencies-declared", "package.json", summary, content)]
+
+
 def audit_findings(
     ecosystem: str, head_file: Callable[[str], bytes | None], run: AuditRunner
 ) -> list[Finding]:
     spec = ECOSYSTEMS[ecosystem]
+    if spec.lockfile is None:
+        return declared_dependencies(head_file(spec.manifest))
     lock, manifest = head_file(spec.lockfile), head_file(spec.manifest)
     if lock is None or manifest is None:
         return [Finding("audit", spec.lockfile, "no lockfile at the head to audit", "absent")]
@@ -842,6 +874,13 @@ def parse_verdict(text: str) -> list[Finding]:
 
 
 Opener = Callable[[urllib.request.Request], Any]
+HTTP_TIMEOUT_SECONDS = 300
+"""A hung call must end as "the review could not run" (exit 2), which fails the check and raises
+the alert, not run on until the job's own timeout, which GitHub may report as cancelled."""
+
+
+def _urlopen(request: urllib.request.Request) -> Any:
+    return urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS)
 
 
 def ask_model(model: str, prompt: str, api_key: str, opener: Opener) -> str:
@@ -918,6 +957,7 @@ class Report:
     head: str
     findings: list[Finding] = field(default_factory=list)
     unavailable: str | None = None
+    title: str = "Fork-sync security review"
 
     def failing(self, acks: Mapping[str, Ack]) -> list[Finding]:
         return [f for f in self.findings if f.fingerprint() not in acks]
@@ -928,7 +968,7 @@ class Report:
         return 1 if self.failing(acks) else 0
 
     def markdown(self, acks: Mapping[str, Ack]) -> str:
-        lines = [COMMENT_MARKER, f"## Fork-sync security review ({self.head[:12]})", ""]
+        lines = [COMMENT_MARKER, f"## {self.title} ({self.head[:12]})", ""]
         if self.unavailable is not None:
             lines += [f"**The review could not run:** {_cell(self.unavailable)}. It fails.", ""]
         if not self.findings:
@@ -1029,7 +1069,7 @@ def build_report(
             return _show(head, path)
 
         report.findings += path_findings(config, changes, _blob)
-        if config.ecosystem == "npm":
+        if ECOSYSTEMS[config.ecosystem].manifest == "package.json":
             report.findings += npm_manifest_findings(changes, _blob, head_file)
         else:
             report.findings += cargo_manifest_findings(changes, _blob)
@@ -1055,7 +1095,7 @@ def build_report(
 
 def review(
     env: Mapping[str, str],
-    opener: Opener = urllib.request.urlopen,
+    opener: Opener = _urlopen,
     run_audit: AuditRunner = _run_audit,
 ) -> int:
     # The declaration and the acknowledgements come from the BASE, as does this script (ci.yml
@@ -1090,6 +1130,135 @@ def review(
     return report.exit_code(acks)
 
 
+def audit_main(env: Mapping[str, str], run_audit: AuditRunner = _run_audit) -> int:
+    """The weekly audit: main's dependencies against main's acknowledgements, so a new advisory
+    against a version already installed is found between upstream releases. It reads from git at
+    HEAD (the checkout of main) and executes nothing from the repository."""
+    head = _git("rev-parse", "HEAD").strip()
+    config_text = _show(head, CONFIG_PATH)
+    if config_text is None:
+        print(f"::error::main has no {CONFIG_PATH}")
+        return 2
+    config = parse_config(config_text.decode())
+    acks_text = _show(head, ACKS_PATH)
+    acks = parse_acks(acks_text.decode()) if acks_text is not None else {}
+    report = Report(head, title="Fork-sync weekly audit of main")
+    try:
+        report.findings += audit_findings(
+            config.ecosystem, lambda path: _show(head, path), run_audit
+        )
+    except ReviewUnavailable as error:
+        report.unavailable = str(error)
+    body = report.markdown(acks)
+    print(body)
+    if env.get("GITHUB_STEP_SUMMARY"):
+        with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+            summary.write(body)
+    return report.exit_code(acks)
+
+
+# ---- the alert ------------------------------------------------------------------------------
+
+ALERT_TITLES = {
+    "review": "Fork-sync: a security review is holding an upstream sync",
+    "audit": "Fork-sync: the weekly audit of main failed",
+}
+
+
+def alert_body(kind: str, env: Mapping[str, str]) -> str:
+    """Fixed fields only. Finding text comes from upstream's diff, so it stays in the report the
+    run links to and never reaches the issue."""
+    owner = env["GITHUB_REPOSITORY_OWNER"]
+    run = env["RUN_URL"]
+    head = env["HEAD_SHA"][:12]
+    if kind == "review":
+        pull = f"{env['GITHUB_SERVER_URL']}/{env['GITHUB_REPOSITORY']}/pull/{env['PR_NUMBER']}"
+        what = (
+            f"`security review` failed on pull request {pull} at `{head}`, so it can't land. "
+            "Read the review comment on the pull request. Acknowledge what you accept in "
+            f"`{ACKS_PATH}` on main, or leave the sync held. If the comment says the review "
+            "couldn't run, re-run the failed `security review` job: nothing re-runs it for you."
+        )
+    else:
+        what = (
+            f"The weekly audit of main at `{head}` failed: an advisory isn't acknowledged, or the "
+            f"audit couldn't run. The report is in the run's summary. Acknowledge what you "
+            f"accept in `{ACKS_PATH}` on main."
+        )
+    return f"<!-- fork-sync-alert:{kind} -->\n@{owner} {what}\n\nRun: {run}\n"
+
+
+class _Issues:
+    """The fork's issues, through the workflow's token."""
+
+    def __init__(self, env: Mapping[str, str], opener: Opener) -> None:
+        self.api = f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}/issues"
+        self.headers = {
+            "Authorization": f"Bearer {env['GITHUB_TOKEN']}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "fork-sync-review/1",
+        }
+        self.opener = opener
+
+    def call(self, path: str, method: str = "GET", payload: Any = None) -> Any:
+        data = json.dumps(payload).encode() if payload is not None else None
+        url = f"{self.api}{path}"
+        request = urllib.request.Request(url, data=data, headers=self.headers, method=method)
+        with self.opener(request) as response:
+            return json.loads(response.read() or b"null")
+
+    def alert(self, marker: str) -> dict[str, Any] | None:
+        """The open alert: an issue (not a pull request) the workflow bot opened with `marker`."""
+        issues = self.call("?state=open&creator=github-actions%5Bbot%5D&per_page=100")
+        return next(
+            (i for i in issues if "pull_request" not in i and marker in (i.get("body") or "")),
+            None,
+        )
+
+    def texts(self, issue: Mapping[str, Any]) -> list[str]:
+        """The issue's body and every comment, all pages."""
+        texts, page = [issue.get("body") or ""], 1
+        while batch := self.call(f"/{issue['number']}/comments?per_page=100&page={page}"):
+            texts += [comment.get("body") or "" for comment in batch]
+            page += 1
+        return texts
+
+
+def notify(env: Mapping[str, str], opener: Opener = _urlopen) -> int:
+    """One open issue per kind of alert. A failure opens it, or comments on it once per new head;
+    a pass closes it. A failure to raise an alert fails the job; a failure to close one only
+    warns, because a red job would hold a pull request that passed its review."""
+    kind, result = env["ALERT_KIND"], env["RESULT"]
+    if kind not in ALERT_TITLES:
+        print(f"::error::unknown alert kind {kind!r}")
+        return 2
+    if result not in ("success", "failure"):
+        return 0
+    # One comment per head and pull request: a sync pull request closed and re-opened on the
+    # same head is a new pull request to name. The workflow raises a review alert only for the
+    # sync pull request, so any pass of one clears it.
+    head = f"<!-- head:{env['HEAD_SHA']} -->"
+    subject = f"<!-- pr:{env['PR_NUMBER']} -->" if kind == "review" else ""
+    issues = _Issues(env, opener)
+    try:
+        issue = issues.alert(f"<!-- fork-sync-alert:{kind} -->")
+        if result == "failure":
+            body = f"{alert_body(kind, env)}{head}{subject}\n"
+            if issue is None:
+                issues.call("", "POST", {"title": ALERT_TITLES[kind], "body": body})
+            elif not any(head in text and subject in text for text in issues.texts(issue)):
+                issues.call(f"/{issue['number']}/comments", "POST", {"body": body})
+        elif issue is not None:
+            passed = f"Passed at `{env['HEAD_SHA'][:12]}` ({env['RUN_URL']}). Closing.\n"
+            issues.call(f"/{issue['number']}/comments", "POST", {"body": passed})
+            issues.call(f"/{issue['number']}", "PATCH", {"state": "closed"})
+    except Exception as error:  # every failure to reach GitHub is reported the same way
+        level = "error" if result == "failure" else "warning"
+        print(f"::{level}::could not update the fork-sync alert issue: {type(error).__name__}")
+        return 1 if result == "failure" else 0
+    return 0
+
+
 def run_commands(commands: Sequence[str]) -> int:
     for command in commands:
         print(f"$ {command}", flush=True)
@@ -1115,7 +1284,14 @@ def main(argv: Sequence[str]) -> int:
         return run_commands(config.build_commands if rest == ["build"] else config.test_commands)
     if command == "review":
         return review(os.environ)
-    print(f"usage: {Path(sys.argv[0]).name} upstream|next-release FILE|run build|run test|review")
+    if command == "audit-main":
+        return audit_main(os.environ)
+    if command == "notify":
+        return notify(os.environ)
+    print(
+        f"usage: {Path(sys.argv[0]).name} "
+        "upstream|next-release FILE|run build|run test|review|audit-main|notify"
+    )
     return 64
 
 

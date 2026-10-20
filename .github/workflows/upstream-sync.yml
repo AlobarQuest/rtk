@@ -71,7 +71,15 @@ jobs:
           git checkout origin/main -- .github/
           git add -A .github
           git diff --cached --quiet || git commit -m "fork-sync: keep the fork's .github over ${TAG}"
-          git push --force origin upstream-sync
+          # Push only a different tree. A rebuild of the same tag over the same .github differs
+          # only in its commit date, and pushing it would re-run the review and re-raise the alert
+          # every day while a sync is held.
+          PUBLISHED=$(git rev-parse --verify --quiet "origin/upstream-sync^{tree}" || true)
+          if [ "$PUBLISHED" = "$(git rev-parse 'HEAD^{tree}')" ]; then
+            echo "upstream-sync already holds this tree; nothing to push"
+          else
+            git push --force origin upstream-sync
+          fi
 
       - name: Open or update the pull request
         if: steps.release.outputs.tag != ''
