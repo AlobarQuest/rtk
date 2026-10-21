@@ -2,7 +2,8 @@
 #
 # Rebuilds the `upstream-sync` branch from upstream's newest release matching
 # `.github/fork-sync.toml`, keeps this fork's whole `.github/` (so upstream workflows never enter),
-# and opens or edits ONE rolling pull request to main. It does not review: the `security review`
+# commits a resolved lockfile when the declaration sets `generate_lockfile`, and opens or edits ONE
+# rolling pull request to main. It does not review: the `security review`
 # and `build and test` jobs in ci.yml run on that pull request and are required checks, so a sync
 # lands only when both pass.
 #
@@ -42,6 +43,13 @@ jobs:
         with:
           python-version: '3.14'
 
+      # For `lock`, which resolves a lockfile only when the declaration sets `generate_lockfile`.
+      # An exact version: npm's output can change between releases, and a lockfile that changed
+      # with the runner would re-review and re-alert a held sync on every rebuild.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.4.0'
+
       - name: Find the upstream release
         id: release
         env:
@@ -70,6 +78,7 @@ jobs:
           rm -rf .github
           git checkout origin/main -- .github/
           git add -A .github
+          python3 .github/scripts/fork_sync_review.py lock "$TAG"
           git diff --cached --quiet || git commit -m "fork-sync: keep the fork's .github over ${TAG}"
           # Push only a different tree. A rebuild of the same tag over the same .github differs
           # only in its commit date, and pushing it would re-run the review and re-raise the alert

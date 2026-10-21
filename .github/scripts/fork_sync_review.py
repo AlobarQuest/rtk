@@ -9,6 +9,7 @@ Subcommands, each invoked by a rendered workflow:
 
   upstream               print the declared upstream (`owner/name`)
   next-release FILE      given upstream's releases as JSON, print the tag to sync to, or nothing
+  lock TAG               write and stage the lockfile upstream doesn't commit (`generate_lockfile`)
   run build|test         run the configured build or test commands
   review                 the `security review` required check
   audit-main             the weekly audit of main's dependencies, against main's acknowledgements
@@ -40,6 +41,7 @@ import tomllib
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +73,9 @@ NPM_DEPENDENCY_KEYS = (
     "peerDependencies",
 )
 SCRIPT_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".sh", ".py")
-SAFE_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+-]*")
+# `@` for an npm monorepo's scoped release tags (`@n8n-as-code/n8n-manager-v0.7.1`): it is valid in
+# a ref except as `@{`, and `{` is refused.
+SAFE_TAG = re.compile(r"[A-Za-z0-9@][A-Za-z0-9._/+@-]*")
 # Git runs with no replace objects, literal pathspecs and NO attributes at all (no global file,
 # and the empty tree as the attribute source): an attribute the base carries, perhaps from an
 # upstream release acknowledged earlier, could otherwise turn a script into "binary" or route it
@@ -136,6 +140,12 @@ class Config:
     build_commands: tuple[str, ...]
     test_commands: tuple[str, ...]
     review: ReviewConfig
+    version_manifest: str
+    """The manifest whose version a sync is compared against: the ecosystem's, at the root, unless
+    upstream is a monorepo whose root never moves (n8n-as-code's is a private `0.2.0`)."""
+    generate_lockfile: bool = False
+    """Upstream commits no lockfile, so the sync resolves one (`lock`) and commits it beside the
+    fork's `.github/`. Without it there is nothing to install from, audit or review."""
 
 
 _TOP_KEYS = {
@@ -144,6 +154,8 @@ _TOP_KEYS = {
     "release_tag_pattern",
     "build_commands",
     "test_commands",
+    "version_manifest",
+    "generate_lockfile",
     "review",
 }
 _REVIEW_KEYS = {"paths_watched", "trust_critical", "model", "max_diff_chars"}
@@ -205,6 +217,15 @@ def parse_config(text: str) -> Config:
         raise ConfigError(f"release_tag_pattern is not a regex: {error}") from None
     if groups < 1:
         raise ConfigError("release_tag_pattern needs a capture group holding the version")
+    version_manifest = _string(table, "version_manifest", ecosystem.manifest)
+    parts = version_manifest.split("/")
+    if parts[-1] != ecosystem.manifest or version_manifest.startswith("/") or ".." in parts:
+        raise ConfigError(f"version_manifest must be a relative path to a {ecosystem.manifest}")
+    generate_lockfile = table.get("generate_lockfile", False)
+    if not isinstance(generate_lockfile, bool):
+        raise ConfigError("generate_lockfile must be true or false")
+    if generate_lockfile and name != "npm":
+        raise ConfigError("generate_lockfile applies only to the npm ecosystem")
     return Config(
         upstream=upstream,
         ecosystem=name,
@@ -212,6 +233,8 @@ def parse_config(text: str) -> Config:
         build_commands=_strings(table, "build_commands", ecosystem.build),
         test_commands=_strings(table, "test_commands", ecosystem.test),
         review=_review(table.get("review", {})),
+        version_manifest=version_manifest,
+        generate_lockfile=generate_lockfile,
     )
 
 
@@ -592,8 +615,13 @@ def _npm_entry_problems(
     path: str, old: dict[str, Any] | None, new: dict[str, Any]
 ) -> list[tuple[str, str]]:
     problems = []
+    # Only a `node_modules/` entry is installed under a name. A folder entry (a workspace, or a
+    # `file:` target) is keyed by its path, so its own name is no alias, and its version moves
+    # every release. What it could shadow, it shadows through a link, and a new or changed link
+    # is always a finding: workspace links name only a path, so they stay unchanged once
+    # acknowledged.
     installed_as = path.rpartition("node_modules/")[2]
-    if new.get("name") not in (None, installed_as):
+    if "node_modules/" in path and new.get("name") not in (None, installed_as):
         problems.append(("npm-lock-alias", f"installs {new.get('name')} as {installed_as}"))
     resolved = new.get("resolved")
     if new.get("link"):
@@ -1259,6 +1287,97 @@ def notify(env: Mapping[str, str], opener: Opener = _urlopen) -> int:
     return 0
 
 
+LockRunner = Callable[[list[str], Path], int]
+"""`(argv, cwd) -> exit code`."""
+
+NPM_LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json")
+REGULAR_FILE_MODES = frozenset({"100644", "100755"})
+
+
+def _run_lock(argv: list[str], cwd: Path) -> int:
+    return subprocess.run(argv, cwd=cwd).returncode
+
+
+def _copy_manifests(commit: str, into: Path) -> int:
+    """Every `package.json` the commit tracks as a regular file, from git's objects, and nothing
+    else: no `.npmrc` and no file a symlink names reaches the resolver. Returns the count."""
+    listing = _git_bytes("ls-tree", "-r", "-z", "--full-tree", commit).split(b"\0")
+    copied = 0
+    for line in filter(None, listing):
+        meta, _, raw = line.partition(b"\t")
+        mode, kind, blob = meta.decode().split()
+        path = os.fsdecode(raw)
+        parts = path.split("/")
+        # Git can carry a tree entry named `..` (fsck only warns); never write above `into`.
+        if any(part in ("", ".", "..") for part in parts):
+            raise ConfigError(f"the tag's tree has a path npm must not see: {path!r}")
+        if kind != "blob" or mode not in REGULAR_FILE_MODES or parts[-1] != "package.json":
+            continue
+        if "node_modules" in parts:
+            continue
+        target = into.joinpath(*parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(_git_bytes("cat-file", "blob", blob))
+        copied += 1
+    return copied
+
+
+def lock(config: Config, tag: str, run: LockRunner = _run_lock) -> int:
+    """Resolve the lockfile upstream doesn't commit, for `tag`, and stage it in the working tree.
+
+    Upstream's tree is untrusted, so npm never runs in it. It resolves in an empty scratch
+    directory holding only the tag's tracked `package.json` files, read from git objects: no
+    project `.npmrc` (whose `git=` key would otherwise run a program of upstream's choosing, with
+    the sync's token in `.git/config`), and no symlink followed. User and global configuration are
+    empty, the registry is fixed, `--ignore-scripts` runs no lifecycle script, and `git` is
+    `false`, so a git dependency fails the sync rather than being fetched. The result is written
+    with an exclusive create, which never writes through a link.
+
+    Resolution is pinned to versions published before the tag's commit, so it records what
+    upstream's users got at that release, and a rerun on the same npm writes the same file: the
+    sync pushes only a changed tree, and a lockfile that moved daily would re-review and re-alert
+    a held sync every day. A commit dated in the future would unpin it, so it is refused.
+    """
+    if not config.generate_lockfile:
+        print("the declaration generates no lockfile")
+        return 0
+    lockfile = ECOSYSTEMS[config.ecosystem].lockfile
+    assert lockfile is not None  # parse_config allows generate_lockfile only for npm
+    if not SAFE_TAG.fullmatch(tag):
+        raise ConfigError(f"tag {tag!r} has characters a ref must not")
+    present = [name for name in NPM_LOCKFILES if os.path.lexists(name)]
+    if present:
+        print(f"::error::{tag} has its own {present[0]}; remove generate_lockfile")
+        return 1
+    commit = _git("rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}").strip()
+    published_before = _git("log", "-1", "--format=%cI", commit).strip()
+    if datetime.fromisoformat(published_before) > datetime.now(UTC):
+        print(f"::error::{tag}'s commit is dated {published_before}, in the future")
+        return 1
+    argv = ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"]
+    argv += ["--git", "false", "--registry", NPM_REGISTRY.rstrip("/")]
+    argv += ["--before", published_before]
+    with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP")) as scratch:
+        # npm refuses one file as both user and global config, so each gets an empty one of its
+        # own, outside the directory it resolves in.
+        for scope in ("user", "global"):
+            (Path(scratch) / scope).write_bytes(b"")
+            argv += [f"--{scope}config", str(Path(scratch) / scope)]
+        directory = Path(scratch) / "tree"
+        directory.mkdir()
+        if not (_copy_manifests(commit, directory) and (directory / "package.json").is_file()):
+            print(f"::error::{tag} has no package.json at its root")
+            return 1
+        code = run(argv, directory)
+        if code != 0:
+            return code
+        resolved = (directory / lockfile).read_bytes()
+    with open(lockfile, "xb") as out:
+        out.write(resolved)
+    _git("add", "--force", "--", lockfile)
+    return 0
+
+
 def run_commands(commands: Sequence[str]) -> int:
     for command in commands:
         print(f"$ {command}", flush=True)
@@ -1275,10 +1394,12 @@ def main(argv: Sequence[str]) -> int:
         return 0
     if command == "next-release":
         config = load_config()
-        manifest = Path(ECOSYSTEMS[config.ecosystem].manifest).read_text(encoding="utf-8")
+        manifest = Path(config.version_manifest).read_text(encoding="utf-8")
         releases = json.loads(Path(rest[0]).read_text(encoding="utf-8"))
         print(next_release(config, releases, manifest_version(config.ecosystem, manifest)) or "")
         return 0
+    if command == "lock" and len(rest) == 1:
+        return lock(load_config(), rest[0])
     if command == "run" and rest in (["build"], ["test"]):
         config = load_config()
         return run_commands(config.build_commands if rest == ["build"] else config.test_commands)
@@ -1290,7 +1411,7 @@ def main(argv: Sequence[str]) -> int:
         return notify(os.environ)
     print(
         f"usage: {Path(sys.argv[0]).name} "
-        "upstream|next-release FILE|run build|run test|review|audit-main|notify"
+        "upstream|next-release FILE|lock TAG|run build|run test|review|audit-main|notify"
     )
     return 64
 
