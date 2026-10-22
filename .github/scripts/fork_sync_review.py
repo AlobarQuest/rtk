@@ -353,7 +353,10 @@ def merged_changes(since_merge_base: list[Change], since_base_tip: list[Change])
     """The changes the merge would bring in: each path changed since the merge base whose head
     content still differs from the base tip's. A path the base tip already holds verbatim -- the
     fork's own `.github/`, which the sync restores from main -- introduces nothing, so it is
-    neither reviewed nor allowed to move the review's digest when main's `.github/` changes."""
+    neither reviewed nor allowed to move the review's digest when main's `.github/` changes.
+
+    A sync commit has main as a parent, so its merge base is the base tip and both lists agree;
+    they differ for a branch built before that, or when main moves after the rebuild."""
     differs = {change.path for change in since_base_tip}
     return [change for change in since_merge_base if change.path in differs]
 

@@ -79,12 +79,17 @@ jobs:
           git checkout origin/main -- .github/
           git add -A .github
           python3 .github/scripts/fork_sync_review.py lock "$TAG"
-          git diff --cached --quiet || git commit -m "fork-sync: keep the fork's .github over ${TAG}"
+          # main is a second parent, so the pull request never three-way merges: a file only the
+          # fork has, such as a lockfile it owns, would otherwise conflict with every release
+          # (both sides add it). The tree is still the release plus the fork's .github alone.
+          SYNC=$(git commit-tree "$(git write-tree)" -p HEAD -p origin/main -m "fork-sync: keep the fork's .github over ${TAG}")
+          git reset --quiet --soft "$SYNC"
           # Push only a different tree. A rebuild of the same tag over the same .github differs
           # only in its commit date, and pushing it would re-run the review and re-raise the alert
           # every day while a sync is held.
           PUBLISHED=$(git rev-parse --verify --quiet "origin/upstream-sync^{tree}" || true)
-          if [ "$PUBLISHED" = "$(git rev-parse 'HEAD^{tree}')" ]; then
+          if [ "$PUBLISHED" = "$(git rev-parse 'HEAD^{tree}')" ] \
+            && git merge-base --is-ancestor origin/main origin/upstream-sync; then
             echo "upstream-sync already holds this tree; nothing to push"
           else
             git push --force origin upstream-sync
