@@ -23,7 +23,8 @@ neither fails the review. Exit codes are the check's verdict: 0 no unacknowledge
 
 Upstream content is untrusted: the diff reaches the model as data, and a person accepts a finding
 by its fingerprint in `.github/fork-sync-acks.toml` on main. A fingerprint names the exact content
-the finding is about, so an acknowledgement never covers a later change.
+the finding is about, so an acknowledgement never covers a later change; a model finding's
+acknowledgement also names the highest severity it accepts.
 """
 
 from __future__ import annotations
@@ -396,11 +397,27 @@ class Finding:
         return _digest("\0".join((self.kind, self.path, self.content)).encode())[:16]
 
 
+# The model's severities, lowest first. A severity outside this list is never acknowledged.
+MODEL_SEVERITIES = ("low", "medium", "high")
+
+
 @dataclass(frozen=True)
 class Ack:
     by: str
     date: str
     reason: str
+    severity: str | None = None
+    """For a model finding, the highest severity accepted on that content."""
+
+    def covers(self, finding: Finding) -> bool:
+        """A model finding's fingerprint leaves out its wording and severity, since the model
+        rewords a concern on every run; what was accepted is the content up to a severity, so a
+        concern rated higher than the acknowledgement fails again."""
+        if finding.kind != "ai":
+            return True
+        return self.severity is not None and MODEL_SEVERITIES.index(
+            finding.severity
+        ) <= MODEL_SEVERITIES.index(self.severity)
 
 
 def parse_acks(text: str) -> dict[str, Ack]:
@@ -409,10 +426,20 @@ def parse_acks(text: str) -> dict[str, Ack]:
         missing = [key for key in ("fingerprint", "by", "date", "reason") if not entry.get(key)]
         if missing:
             raise ConfigError(f"an [[ack]] entry is missing {', '.join(missing)}")
+        if str(entry["fingerprint"]) in acks:
+            raise ConfigError(f"fingerprint {entry['fingerprint']} is acknowledged twice")
+        severity = entry.get("severity")
+        if severity is not None and severity not in MODEL_SEVERITIES:
+            raise ConfigError(f"an [[ack]] severity must be one of {', '.join(MODEL_SEVERITIES)}")
         acks[str(entry["fingerprint"])] = Ack(
-            str(entry["by"]), str(entry["date"]), str(entry["reason"])
+            str(entry["by"]), str(entry["date"]), str(entry["reason"]), severity
         )
     return acks
+
+
+def covering_ack(acks: Mapping[str, Ack], finding: Finding) -> Ack | None:
+    ack = acks.get(finding.fingerprint())
+    return ack if ack is not None and ack.covers(finding) else None
 
 
 def _matches(path: str, globs: Iterable[str]) -> bool:
@@ -900,7 +927,12 @@ def parse_verdict(text: str) -> list[Finding]:
             isinstance(item.get(key), str) for key in ("severity", "path", "summary")
         ):
             raise ReviewUnavailable("a finding in the model's verdict is malformed")
-        findings.append(Finding("ai", item["path"], item["summary"], "", item["severity"]))
+        # A severity outside the ranked three is read as the gravest, so it fails until a person
+        # accepts it at `high`, and never as one no acknowledgement can reach.
+        severity = item["severity"].lower()
+        if severity not in MODEL_SEVERITIES:
+            severity = MODEL_SEVERITIES[-1]
+        findings.append(Finding("ai", item["path"], item["summary"], "", severity))
     return findings
 
 
@@ -967,9 +999,8 @@ def ai_findings(
             f.kind,
             f.path,
             f.summary,
-            # The severity and the wording are part of what was accepted: an acknowledged low
-            # remark does not cover a later high one on the same content.
-            "\0".join((contents.get(f.path, digest), f.severity, _digest(f.summary.encode()))),
+            # Only the content: its acknowledgement names the severity it accepts (`Ack.covers`).
+            contents.get(f.path, digest),
             f.severity,
         )
         for f in verdict
@@ -991,7 +1022,7 @@ class Report:
     title: str = "Fork-sync security review"
 
     def failing(self, acks: Mapping[str, Ack]) -> list[Finding]:
-        return [f for f in self.findings if f.fingerprint() not in acks]
+        return [f for f in self.findings if covering_ack(acks, f) is None]
 
     def exit_code(self, acks: Mapping[str, Ack]) -> int:
         if self.unavailable is not None:
@@ -1008,7 +1039,12 @@ class Report:
             lines += ["| | kind | path | finding | fingerprint |", "|-|-|-|-|-|"]
             for finding in self.findings:
                 ack = acks.get(finding.fingerprint())
-                mark = f"acknowledged by {_cell(ack.by)} ({ack.date})" if ack else "**fails**"
+                if ack is None:
+                    mark = "**fails**"
+                elif ack.covers(finding):
+                    mark = f"acknowledged by {_cell(ack.by)} ({ack.date})"
+                else:
+                    mark = f"**fails** (acknowledged up to {_cell(ack.severity or 'no severity')})"
                 lines.append(
                     f"| {mark} | {finding.kind} ({_cell(finding.severity)}) "
                     f"| `{_cell(finding.path)}` | {_cell(finding.summary)} "
@@ -1017,7 +1053,8 @@ class Report:
             lines += [
                 "",
                 f"To accept a finding, add an `[[ack]]` with its fingerprint to `{ACKS_PATH}` "
-                "on main (`fingerprint`, `by`, `date`, `reason`), then re-run this check.",
+                "on main (`fingerprint`, `by`, `date`, `reason`, and for an `ai` finding "
+                "`severity`, the highest accepted), then re-run this check.",
             ]
         return "\n".join(lines) + "\n"
 
