@@ -276,3 +276,15 @@ fingerprint = "5389ed4fa2a2efef"
 by = "devon (approved in session; recorded by Claude)"
 date = "2026-10-19"
 reason = "rtk v1.0.1 too-large: the 0.51.0 -> 1.0.1 diff (3.66M characters) was reviewed for its network, credential, install-time and dependency surface instead (targeted review, 2026-10-19): no default-on network call, no listener in rtk, no new non-crates.io source in rtk's Cargo.lock, build.rs unchanged."
+
+[[ack]]
+fingerprint = "7ec9468a236a4023"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-23"
+reason = "rtk on main. RUSTSEC-2026-0382 rustls-webpki 0.103.13: certificate verification may accept distrusted intermediates. Upstream dependency advisory; reported, not fixed in the lane (ADR-0056 amendment 1)."
+
+[[ack]]
+fingerprint = "a4e6f703c72f505d"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-23"
+reason = "rtk on main. RUSTSEC-2026-0381 webpki-roots 1.0.6: bundled roots trust distrusted emSign intermediates. Upstream dependency advisory; reported, not fixed in the lane (ADR-0056 amendment 1)."
