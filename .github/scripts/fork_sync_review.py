@@ -18,8 +18,9 @@ Subcommands, each invoked by a rendered workflow:
 `review` runs in a checkout of the BASE, with the head's objects fetched but never checked out, so
 nothing from the head executes. Every changed path must be accounted for: its diff (or, for a
 lockfile, a summary) reaches the model, or it carries a deterministic finding. A path that is
-neither fails the review. Exit codes are the check's verdict: 0 no unacknowledged finding;
-1 findings, so nothing lands; 2 the review could not run, which also fails the check.
+neither fails the review. A finding either holds the sync or is only reported (amendment 4).
+Exit codes are the check's verdict: 0 no unacknowledged finding that holds; 1 one or more, so
+nothing lands; 2 the review could not run, which also fails the check.
 
 Upstream content is untrusted: the diff reaches the model as data, and a person accepts a finding
 by its fingerprint in `.github/fork-sync-acks.toml` on main. A fingerprint names the exact content
@@ -32,6 +33,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -392,6 +394,9 @@ class Finding:
     content: str
     """The exact content the finding is about: a blob id, a sha256, or a digest of the entry."""
     severity: str = "high"
+    holds: bool = True
+    """Whether it holds the sync until acknowledged. The review decides, never the acknowledgements
+    file; a reported finding is listed for a person to read and fails nothing (amendment 4)."""
 
     def fingerprint(self) -> str:
         return _digest("\0".join((self.kind, self.path, self.content)).encode())[:16]
@@ -478,6 +483,72 @@ PATH_RULES: dict[str, tuple[PathRule, ...]] = {
 }
 
 
+RELEASE_VERSION = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?")
+# Keys whose contents run, resolve or install something: a `version` anywhere below one is a
+# script, a dependency or a constraint, never the manifest's own release (amendment 4).
+VERSION_GUARDED_KEYS = frozenset(
+    {
+        "scripts",
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+        "bundleDependencies",
+        "bundledDependencies",
+        "overrides",
+        "resolutions",
+        "bin",
+        "exports",
+        "engines",
+        "config",
+    }
+)
+
+
+def _release_version(value: Any) -> bool:
+    return isinstance(value, str) and RELEASE_VERSION.fullmatch(value) is not None
+
+
+def _same_but_release_versions(old: Any, new: Any, guarded: bool = False) -> bool:
+    """`old` and `new` are equal except, perhaps, for `version` keys whose two values are both
+    plain release versions (`1.2.3`, `1.2.3-rc.1+b5`) and that sit below none of
+    `VERSION_GUARDED_KEYS`. A key added or removed, a range, a URL or a type change is a
+    difference."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        if old.keys() != new.keys():
+            return False
+        return all(
+            (
+                key == "version"
+                and not guarded
+                and _release_version(old[key])
+                and _release_version(new[key])
+            )
+            or _same_but_release_versions(
+                old[key], new[key], guarded or key in VERSION_GUARDED_KEYS
+            )
+            for key in old
+        )
+    if isinstance(old, list) and isinstance(new, list):
+        return len(old) == len(new) and all(
+            _same_but_release_versions(a, b, guarded) for a, b in zip(old, new, strict=True)
+        )
+    return type(old) is type(new) and old == new
+
+
+def only_versions_differ(path: str, old: bytes | None, new: bytes | None) -> bool:
+    """A JSON file whose two sides, parsed, differ only in release `version` values: a release
+    bumping its manifest. An added or deleted side, a side that is not JSON, or duplicate keys (one
+    reader would see one value and another reader the other) is a change like any other."""
+    if not path.endswith(".json") or old is None or new is None:
+        return False
+    try:
+        before, after = (json.loads(side, object_pairs_hook=_unique_keys) for side in (old, new))
+    except ValueError:
+        return False
+    return _same_but_release_versions(before, after)
+
+
 def path_findings(
     config: Config,
     changes: Sequence[Change],
@@ -488,7 +559,14 @@ def path_findings(
     findings = []
     for change in changes:
         if _matches(change.path, config.review.paths_watched):
-            findings.append(Finding("watched-path", change.path, "a watched path", change.content))
+            # A version bump to a watched manifest is reported; anything else in it holds.
+            if only_versions_differ(change.path, read(change.old_blob), read(change.new_blob)):
+                summary, holds = "a watched path (only `version` values changed)", False
+            else:
+                summary, holds = "a watched path", True
+            findings.append(
+                Finding("watched-path", change.path, summary, change.content, holds=holds)
+            )
         for kind, why, applies in rules:
             if applies(change.path):
                 findings.append(Finding(kind, change.path, why, change.content))
@@ -682,7 +760,10 @@ def npm_lock_review(change: Change, old: bytes | None, new: bytes | None) -> Loc
         )
         entry = _digest(f"{change.content}\0{name}".encode())
         for kind, why in _npm_entry_problems(name, was, now):
-            review.findings.append(Finding(kind, change.path, f"{name}: {why}", entry))
+            # CI and the tool installer install with lifecycle scripts disabled, so a script
+            # that would run at install is reported, not held (amendment 4).
+            holds = kind != "npm-install-script"
+            review.findings.append(Finding(kind, change.path, f"{name}: {why}", entry, holds=holds))
     return review
 
 
@@ -759,6 +840,10 @@ def _run_audit(argv: list[str], cwd: Path, env: dict[str, str]) -> tuple[int, by
     return result.returncode, result.stdout
 
 
+CRITICAL_SCORE = 9.0
+"""The CVSS base score at and above which an advisory holds a sync."""
+
+
 @dataclass(frozen=True)
 class Advisory:
     id: str
@@ -767,11 +852,97 @@ class Advisory:
     title: str
     severity: str
     fix: str
+    score: float | None = None
+    """The CVSS base score, where the audit gives one as a number."""
+
+    @property
+    def critical(self) -> bool:
+        """What holds a sync (amendment 4): npm's `critical`, or a base score of 9.0 or more,
+        given by npm or computed from cargo-audit's CVSS v3 vector. An advisory with no score
+        (no CVSS, or a vector that is not a well-formed v3.0 or v3.1 base vector) is reported."""
+        return self.severity == "critical" or (
+            self.score is not None and self.score >= CRITICAL_SCORE
+        )
+
+
+# CVSS v3.0 and v3.1 base metric weights (FIRST, "CVSS v3.1: Specification Document", section 7.4;
+# v3.0 uses the same). Privileges Required weighs more when the scope changes. Scope has no weight
+# of its own: it selects the equations, and is listed so that only its two values parse.
+CVSS_WEIGHTS: dict[str, dict[str, float]] = {
+    "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
+    "AC": {"L": 0.77, "H": 0.44},
+    "PR": {"N": 0.85, "L": 0.62, "H": 0.27},
+    "UI": {"N": 0.85, "R": 0.62},
+    "S": {"U": 0.0, "C": 0.0},
+    "C": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "I": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "A": {"H": 0.56, "L": 0.22, "N": 0.0},
+}
+CVSS_PR_SCOPE_CHANGED = {"N": 0.85, "L": 0.68, "H": 0.5}
+# The temporal and environmental metrics (section 7.4), each with its values. A vector may carry
+# them; the base score ignores them, but a name or value outside these is still refused.
+CVSS_OTHER_METRICS: dict[str, frozenset[str]] = {
+    "E": frozenset("XUPFH"),
+    "RL": frozenset("XOTWU"),
+    "RC": frozenset("XURC"),
+    **{name: frozenset("XLMH") for name in ("CR", "IR", "AR")},
+    "MAV": frozenset("XNALP"),
+    "MAC": frozenset("XLH"),
+    "MPR": frozenset("XNLH"),
+    "MUI": frozenset("XNR"),
+    "MS": frozenset("XUC"),
+    **{name: frozenset("XNLH") for name in ("MC", "MI", "MA")},
+}
+
+
+def _roundup_v31(value: float) -> float:
+    """CVSS v3.1 Appendix A: the smallest number of one decimal place at or above `value`, worked
+    in integers so that floating-point error never rounds 4.0 up to 4.1."""
+    whole = round(value * 100_000)
+    return whole / 100_000.0 if whole % 10_000 == 0 else (math.floor(whole / 10_000) + 1) / 10.0
+
+
+def _roundup_v30(value: float) -> float:
+    """CVSS v3.0: round up to one decimal place."""
+    return math.ceil(value * 10) / 10
+
+
+def cvss_base_score(vector: str) -> float | None:
+    """The base score of a CVSS v3.0 or v3.1 vector, or `None` for anything else: no vector, another
+    version, a base metric missing, any metric repeated or unknown, or a value outside its
+    metric's. Temporal and environmental metrics are allowed and play no part in the base score.
+    Strict, because only a score holds a sync, and a vector read loosely could be scored as
+    critical."""
+    version, _, rest = vector.partition("/")
+    roundup = {"CVSS:3.1": _roundup_v31, "CVSS:3.0": _roundup_v30}.get(version)
+    if roundup is None or not rest:
+        return None
+    metrics: dict[str, str] = {}
+    for part in rest.split("/"):
+        name, _, value = part.partition(":")  # no colon leaves an empty value, which no metric has
+        allowed = CVSS_WEIGHTS[name] if name in CVSS_WEIGHTS else CVSS_OTHER_METRICS.get(name, {})
+        if name in metrics or value not in allowed:
+            return None
+        metrics[name] = value
+    if not set(CVSS_WEIGHTS) <= set(metrics):
+        return None
+    weight = {name: CVSS_WEIGHTS[name][metrics[name]] for name in CVSS_WEIGHTS}
+    changed = metrics["S"] == "C"
+    if changed:
+        weight["PR"] = CVSS_PR_SCOPE_CHANGED[metrics["PR"]]
+    iss = 1 - (1 - weight["C"]) * (1 - weight["I"]) * (1 - weight["A"])
+    impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15 if changed else 6.42 * iss
+    if impact <= 0:
+        return 0.0
+    exploitability = 8.22 * weight["AV"] * weight["AC"] * weight["PR"] * weight["UI"]
+    total = 1.08 * (impact + exploitability) if changed else impact + exploitability
+    return roundup(min(total, 10))
 
 
 def cargo_advisories(report: Mapping[str, Any], _lock: bytes) -> list[Advisory]:
     """`vulnerabilities.list[]` of `cargo-audit audit --json`. Warnings (unmaintained, unsound,
-    yanked) are not advisories: cargo-audit does not fail on them, and neither does this."""
+    yanked) are not advisories: cargo-audit does not fail on them, and neither does this. The
+    `cvss` it gives is a vector string, scored here (`cvss_base_score`)."""
     return [
         Advisory(
             id=item["advisory"]["id"],
@@ -780,25 +951,37 @@ def cargo_advisories(report: Mapping[str, Any], _lock: bytes) -> list[Advisory]:
             title=item["advisory"]["title"],
             severity=item["advisory"].get("cvss") or "no CVSS",
             fix=", ".join(item["versions"]["patched"]) or "none",
+            score=cvss_base_score(item["advisory"].get("cvss") or ""),
         )
         for item in report["vulnerabilities"]["list"]
     ]
+
+
+def _npm_score(via: Mapping[str, Any]) -> float | None:
+    score = (via.get("cvss") or {}).get("score")
+    return float(score) if isinstance(score, int | float) and not isinstance(score, bool) else None
 
 
 NPM_FAILING_SEVERITIES = frozenset({"high", "critical"})
 
 
 def npm_advisories(report: Mapping[str, Any], lock: bytes) -> list[Advisory]:
-    """Each advisory at or above `high` in `npm audit --json`'s `vulnerabilities[*].via`, once
-    per installed copy. A `via` that is a string names another vulnerable package, which is
-    listed under its own name; the installed version comes from the lockfile, not the report."""
+    """Each advisory at or above `high` in `npm audit --json`'s `vulnerabilities[*].via`, or with
+    a critical CVSS score whatever npm rates it, once per installed copy. A `via` that is a string
+    names another vulnerable package, which is listed under its own name; the installed version
+    comes from the lockfile, not the report."""
     installed = _npm_packages(lock)
     advisories = []
     for vulnerability in report["vulnerabilities"].values():
         fix = vulnerability.get("fixAvailable")
         fixed = f"{fix['name']} {fix['version']}" if isinstance(fix, dict) else str(fix).lower()
         for via in vulnerability["via"]:
-            if isinstance(via, str) or via["severity"] not in NPM_FAILING_SEVERITIES:
+            if isinstance(via, str):
+                continue
+            score = _npm_score(via)
+            if via["severity"] not in NPM_FAILING_SEVERITIES and not (
+                score is not None and score >= CRITICAL_SCORE
+            ):
                 continue
             ident = str(via.get("url") or via["source"]).rpartition("/")[2]
             for node in vulnerability["nodes"]:
@@ -810,6 +993,7 @@ def npm_advisories(report: Mapping[str, Any], lock: bytes) -> list[Advisory]:
                         via["title"],
                         via["severity"],
                         fixed,
+                        score,
                     )
                 )
     return advisories
@@ -822,24 +1006,37 @@ def advisory_findings(
     ecosystem: str, code: int, output: bytes, lock: bytes, lockfile: str
 ) -> list[Finding]:
     """One finding per advisory, fingerprinted by the advisory, package and installed version: an
-    acknowledgement names exactly what it accepts and lasts until that version changes."""
-    if code == 0:
+    acknowledgement names exactly what it accepts and lasts until that version changes. Only a
+    critical advisory holds; the rest are reported.
+
+    A passing npm audit is still read: npm passes `--audit-level=high` with only `low` and
+    `moderate` advisories, and one of those can carry a critical CVSS score. Its output, if it does
+    not parse, lists nothing, as before. cargo-audit fails whenever it lists a vulnerability."""
+    if code == 0 and ecosystem != "npm":
         return []
+    if code == 0:
+        try:
+            advisories = ADVISORY_READERS[ecosystem](json.loads(output), lock)
+        except ValueError, KeyError, TypeError, AttributeError:
+            return []
+        return [_advisory_finding(a, lockfile) for a in advisories]
     try:
         advisories = ADVISORY_READERS[ecosystem](json.loads(output), lock)
     except (ValueError, KeyError, TypeError, AttributeError) as error:
         raise ReviewUnavailable(f"the audit's JSON is unreadable: {type(error).__name__}") from None
     if not advisories:
         raise ReviewUnavailable(f"the audit exited {code} and listed no advisory")
-    return [
-        Finding(
-            "audit",
-            lockfile,
-            f"{a.id} {a.package} {a.version}: {a.title} ({a.severity}; fix: {a.fix})",
-            "\0".join((a.id, a.package, a.version)),
-        )
-        for a in advisories
-    ]
+    return [_advisory_finding(a, lockfile) for a in advisories]
+
+
+def _advisory_finding(a: Advisory, lockfile: str) -> Finding:
+    return Finding(
+        "audit",
+        lockfile,
+        f"{a.id} {a.package} {a.version}: {a.title} ({a.severity}; fix: {a.fix})",
+        "\0".join((a.id, a.package, a.version)),
+        holds=a.critical,
+    )
 
 
 def declared_dependencies(manifest: bytes | None) -> list[Finding]:
@@ -1002,12 +1199,17 @@ def ai_findings(
             # Only the content: its acknowledgement names the severity it accepts (`Ack.covers`).
             contents.get(f.path, digest),
             f.severity,
+            # A `low` concern is reported; `medium` and `high` hold (amendment 4).
+            holds=f.severity != MODEL_SEVERITIES[0],
         )
         for f in verdict
     ]
 
 
 # ---- the report -----------------------------------------------------------------------------
+
+
+REPORTED_MARK = "reported"
 
 
 def _cell(text: str) -> str:
@@ -1022,7 +1224,9 @@ class Report:
     title: str = "Fork-sync security review"
 
     def failing(self, acks: Mapping[str, Ack]) -> list[Finding]:
-        return [f for f in self.findings if covering_ack(acks, f) is None]
+        """The holding findings no acknowledgement covers. A reported finding never fails, so an
+        acknowledgement of one is harmless and changes nothing."""
+        return [f for f in self.findings if f.holds and covering_ack(acks, f) is None]
 
     def exit_code(self, acks: Mapping[str, Ack]) -> int:
         if self.unavailable is not None:
@@ -1039,7 +1243,9 @@ class Report:
             lines += ["| | kind | path | finding | fingerprint |", "|-|-|-|-|-|"]
             for finding in self.findings:
                 ack = acks.get(finding.fingerprint())
-                if ack is None:
+                if not finding.holds:
+                    mark = REPORTED_MARK
+                elif ack is None:
                     mark = "**fails**"
                 elif ack.covers(finding):
                     mark = f"acknowledged by {_cell(ack.by)} ({ack.date})"
@@ -1050,6 +1256,12 @@ class Report:
                     f"| `{_cell(finding.path)}` | {_cell(finding.summary)} "
                     f"| `{finding.fingerprint()}` |"
                 )
+            if any(not finding.holds for finding in self.findings):
+                lines += [
+                    "",
+                    f"Rows marked `{REPORTED_MARK}` are listed to be read: they fail nothing "
+                    "and need no acknowledgement (ADR-0056 amendment 4).",
+                ]
             lines += [
                 "",
                 f"To accept a finding, add an `[[ack]]` with its fingerprint to `{ACKS_PATH}` "
