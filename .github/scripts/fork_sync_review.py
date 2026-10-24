@@ -57,18 +57,12 @@ NPM_REGISTRY = "https://registry.npmjs.org/"
 CRATES_IO = frozenset(
     {"registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/"}
 )
-NPM_LIFECYCLE_SCRIPTS = frozenset(
-    {
-        "preinstall",
-        "install",
-        "postinstall",
-        "prepublish",
-        "prepare",
-        "prepack",
-        "postpack",
-        "prepublishOnly",
-    }
-)
+# The scripts npm runs when the package itself is installed in its own directory (`prepublish`,
+# though deprecated, still runs on a bare `npm install`). `prepack`, `postpack` and
+# `prepublishOnly` run only on pack or publish, which the lane never does, and every npm call the
+# tool installer makes, `npm pack` included, disables scripts. Counting them held claude-octopus
+# v11.15.1 on a `prepublishOnly` that only checks a file exists (ADR-0056 amendment 7).
+NPM_LIFECYCLE_SCRIPTS = frozenset({"preinstall", "install", "postinstall", "prepublish", "prepare"})
 NPM_DEPENDENCY_KEYS = (
     "dependencies",
     "devDependencies",
@@ -607,13 +601,25 @@ def _lifecycle(manifest: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _referenced_files(command: str) -> set[str]:
-    """Files a script command runs: words naming a path or a script (`node install.js`)."""
+    """Files a script command mentions: words naming a path or a script (`node install.js`).
+
+    Every mention counts, a `test -f` operand included. Telling a checked path from a run one means
+    parsing shell (separators, newlines, substitutions, flags that differ per command), and three
+    attempts to exempt `test -f` were each bypassed in review (ADR-0056 amendment 7); a rare false
+    hold is the safe direction.
+    """
     try:
         words = shlex.split(command)
     except ValueError:
         words = command.split()
+    # Two readings, unioned: the shell words (a quoted path with spaces stays whole) and a split on
+    # every operator character, since shell punctuation clings to words (`` `sh x.sh` ``,
+    # `$(node y.js)`, `a.sh;echo`). Counting one too many only holds a sync.
+    candidates = set(words) | set(re.split(r"[\s;&|`$(){}<>'\"]+", command))
     return {
-        word.removeprefix("./") for word in words if "/" in word or word.endswith(SCRIPT_SUFFIXES)
+        word.removeprefix("./")
+        for word in candidates
+        if word and ("/" in word or word.endswith(SCRIPT_SUFFIXES))
     }
 
 
