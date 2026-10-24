@@ -57,18 +57,14 @@ NPM_REGISTRY = "https://registry.npmjs.org/"
 CRATES_IO = frozenset(
     {"registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/"}
 )
-NPM_LIFECYCLE_SCRIPTS = frozenset(
-    {
-        "preinstall",
-        "install",
-        "postinstall",
-        "prepublish",
-        "prepare",
-        "prepack",
-        "postpack",
-        "prepublishOnly",
-    }
-)
+# The scripts npm runs when the package itself is installed in its own directory (`prepublish`,
+# though deprecated, still runs on a bare `npm install`). `prepack`, `postpack` and
+# `prepublishOnly` run only on pack or publish, which the lane never does, and every npm call the
+# tool installer makes, `npm pack` included, disables scripts. Counting them held claude-octopus
+# v11.15.1 on a `prepublishOnly` that only checks a file exists (ADR-0056 amendment 7).
+NPM_LIFECYCLE_SCRIPTS = frozenset({"preinstall", "install", "postinstall", "prepublish", "prepare"})
+# File-test operators (`test -f path`, `[ -e path ]`): the path after one is checked, not run.
+FILE_TEST_FLAGS = frozenset({"-e", "-f", "-d", "-s", "-r", "-w", "-x", "-L", "-h"})
 NPM_DEPENDENCY_KEYS = (
     "dependencies",
     "devDependencies",
@@ -613,7 +609,9 @@ def _referenced_files(command: str) -> set[str]:
     except ValueError:
         words = command.split()
     return {
-        word.removeprefix("./") for word in words if "/" in word or word.endswith(SCRIPT_SUFFIXES)
+        word.removeprefix("./")
+        for previous, word in zip(["", *words[:-1]], words, strict=True)
+        if previous not in FILE_TEST_FLAGS and ("/" in word or word.endswith(SCRIPT_SUFFIXES))
     }
 
 
