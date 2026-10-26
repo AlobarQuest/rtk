@@ -1,0 +1,398 @@
+# Acknowledged fork-sync findings. Read by the security review from main (the base), never
+# from a pull request's head. Each fingerprint binds the exact content accepted.
+
+[[ack]]
+fingerprint = "416a3ddd796b68a3"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 cargo-config .cargo/config.toml: Only sets [env] RUST_MIN_STACK=8388608 for builds; no alias, linker, registry or flags."
+
+[[ack]]
+fingerprint = "368d0d3bd1b6487c"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/agents/code-reviewer.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "57f0c55957657641"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/agents/debugger.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "2fb51ec45ad99b90"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/agents/rtk-testing-specialist.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "aae8fa1c32a59f29"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/agents/rust-rtk.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "2d433d9344e8916d"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/agents/system-architect.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "c6029812a6f11668"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/agents/technical-writer.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "54385dd55098df5e"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/commands/tech/codereview.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "8e3a3d45dbc3c52c"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/commands/test-routing.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "7939d982ba652d83"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/hooks/rtk-suggest.sh: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "ba21a27462245b0d"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/rules/cli-testing.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "c5030b2dde145d36"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/rules/rust-patterns.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "38f3097e06f50fa6"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/skills/issue-triage/templates/issue-comment.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "197f49f8d2fc0663"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/skills/performance/SKILL.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "d0d59164a4de0354"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/skills/pr-triage/SKILL.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "5e5da4a8595b611a"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/skills/pr-triage/templates/review-comment.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "f59c639c8efb98e9"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path .claude/skills/tdd-rust/SKILL.md: Developer-only Claude Code material in the rtk repo (wording changes); nothing installs it onto the operator's machine."
+
+[[ack]]
+fingerprint = "f8b25354e2836f5f"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 git-config-file .gitattributes: Widens hooks/**/*.ts -text to hooks/** -text; line-ending handling only."
+
+[[ack]]
+fingerprint = "585ee6699e9e2f21"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 shell-script install.sh: Adds an RTK_EDITION=oss download option, checksum check unchanged; Devon installs via cargo install --git, not install.sh."
+
+[[ack]]
+fingerprint = "7628a00faab4769f"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path proxy/Cargo.toml: Separate rtk-proxy crate excluded from the root workspace; not built by cargo install of rtk."
+
+[[ack]]
+fingerprint = "4e30ad25bab30a70"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/core/classify.rs: New opt-in network path (classifiers, tasks, pipeline install, LLM proxy, session start); runs only after a pipeline is installed or a project pipeline is approved with rtk trust. Now a watched path."
+
+[[ack]]
+fingerprint = "c2aa15d54ea8baab"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/core/pipeline_cmd.rs: New opt-in network path (classifiers, tasks, pipeline install, LLM proxy, session start); runs only after a pipeline is installed or a project pipeline is approved with rtk trust. Now a watched path."
+
+[[ack]]
+fingerprint = "3be45afbf7fd12f2"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/core/pipeline_remote.rs: New opt-in network path (classifiers, tasks, pipeline install, LLM proxy, session start); runs only after a pipeline is installed or a project pipeline is approved with rtk trust. Now a watched path."
+
+[[ack]]
+fingerprint = "32b9d5ceb579dae0"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/core/task_cmd.rs: New opt-in network path (classifiers, tasks, pipeline install, LLM proxy, session start); runs only after a pipeline is installed or a project pipeline is approved with rtk trust. Now a watched path."
+
+[[ack]]
+fingerprint = "c921d3e4cd875bfd"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/core/telemetry.rs: Two lines: usage-count command renamed proxy -> bypass. URL is compile-time and absent in a cargo install --git build, so it never sends; still consent-gated."
+
+[[ack]]
+fingerprint = "3caef85b8e3addf6"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/hooks/init/claude.rs: rtk init writers; the proxy prompt defaults to N and is never asked under --auto-patch or without a TTY. Operator answers N."
+
+[[ack]]
+fingerprint = "e671f68a3051a1a8"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/hooks/init/codex.rs: rtk init writers; the proxy prompt defaults to N and is never asked under --auto-patch or without a TTY. Operator answers N."
+
+[[ack]]
+fingerprint = "d4d5377a41ce7453"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/hooks/init/copilot.rs: rtk init writers; the proxy prompt defaults to N and is never asked under --auto-patch or without a TTY. Operator answers N."
+
+[[ack]]
+fingerprint = "fd0359a523fe8865"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/hooks/init/cursor.rs: rtk init writers; the proxy prompt defaults to N and is never asked under --auto-patch or without a TTY. Operator answers N."
+
+[[ack]]
+fingerprint = "011919b823d2bb62"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/hooks/init/gemini.rs: rtk init writers; the proxy prompt defaults to N and is never asked under --auto-patch or without a TTY. Operator answers N."
+
+[[ack]]
+fingerprint = "83d09d5030af598b"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/hooks/init/mod.rs: rtk init writers; the proxy prompt defaults to N and is never asked under --auto-patch or without a TTY. Operator answers N."
+
+[[ack]]
+fingerprint = "0199ae47097c0682"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/hooks/init/opencode.rs: rtk init writers; the proxy prompt defaults to N and is never asked under --auto-patch or without a TTY. Operator answers N."
+
+[[ack]]
+fingerprint = "6cd3ad9105ed47d1"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/hooks/init/pi.rs: rtk init writers; the proxy prompt defaults to N and is never asked under --auto-patch or without a TTY. Operator answers N."
+
+[[ack]]
+fingerprint = "0504dd942e3db253"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/hooks/init/vibe.rs: rtk init writers; the proxy prompt defaults to N and is never asked under --auto-patch or without a TTY. Operator answers N."
+
+[[ack]]
+fingerprint = "9bccd7e28bab7c93"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/hooks/session_start.rs: New opt-in network path (classifiers, tasks, pipeline install, LLM proxy, session start); runs only after a pipeline is installed or a project pipeline is approved with rtk trust. Now a watched path."
+
+[[ack]]
+fingerprint = "21bdcbbbe1e56e71"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 watched-path src/llm_proxy.rs: New opt-in network path (classifiers, tasks, pipeline install, LLM proxy, session start); runs only after a pipeline is installed or a project pipeline is approved with rtk trust. Now a watched path."
+
+[[ack]]
+fingerprint = "991391143f55e75b"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 audit Cargo.lock: Already shipped in 0.51.0 (installed); v1.0.1 adds no advisory. quick-xml uses plain Reader (not NsReader) for .NET test results; rustls only via ureq for opt-in HTTPS paths. Accepted for this exact package version until upstream bumps it."
+
+[[ack]]
+fingerprint = "d138222d35fdd03e"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 audit Cargo.lock: Already shipped in 0.51.0 (installed); v1.0.1 adds no advisory. quick-xml uses plain Reader (not NsReader) for .NET test results; rustls only via ureq for opt-in HTTPS paths. Accepted for this exact package version until upstream bumps it."
+
+[[ack]]
+fingerprint = "2753ba86440f7041"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 audit Cargo.lock: Already shipped in 0.51.0 (installed); v1.0.1 adds no advisory. quick-xml uses plain Reader (not NsReader) for .NET test results; rustls only via ureq for opt-in HTTPS paths. Accepted for this exact package version until upstream bumps it."
+
+[[ack]]
+fingerprint = "754452fc19a56406"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 audit Cargo.lock: Already shipped in 0.51.0 (installed); v1.0.1 adds no advisory. quick-xml uses plain Reader (not NsReader) for .NET test results; rustls only via ureq for opt-in HTTPS paths. Accepted for this exact package version until upstream bumps it."
+
+[[ack]]
+fingerprint = "fcdfe8358d3f49fd"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 audit Cargo.lock: Already shipped in 0.51.0 (installed); v1.0.1 adds no advisory. quick-xml uses plain Reader (not NsReader) for .NET test results; rustls only via ureq for opt-in HTTPS paths. Accepted for this exact package version until upstream bumps it."
+
+[[ack]]
+fingerprint = "a672b1a79b93bbb3"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 audit Cargo.lock: Already shipped in 0.51.0 (installed); v1.0.1 adds no advisory. quick-xml uses plain Reader (not NsReader) for .NET test results; rustls only via ureq for opt-in HTTPS paths. Accepted for this exact package version until upstream bumps it."
+
+[[ack]]
+fingerprint = "8a2de51901b26f4f"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 audit Cargo.lock: Already shipped in 0.51.0 (installed); v1.0.1 adds no advisory. quick-xml uses plain Reader (not NsReader) for .NET test results; rustls only via ureq for opt-in HTTPS paths. Accepted for this exact package version until upstream bumps it."
+
+[[ack]]
+fingerprint = "78bbb0c12820c206"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 cargo-lock-source proxy/Cargo.lock: rtk-ai/icm (same org, Apache-2.0) at a pinned rev, used only by the separate rtk-proxy crate, which the root workspace excludes; cargo install of rtk never fetches it."
+
+[[ack]]
+fingerprint = "5b06a1e10df6cffd"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 cargo-lock-source proxy/Cargo.lock: rtk-ai/icm (same org, Apache-2.0) at a pinned rev, used only by the separate rtk-proxy crate, which the root workspace excludes; cargo install of rtk never fetches it."
+
+[[ack]]
+fingerprint = "5389ed4fa2a2efef"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-19"
+reason = "rtk v1.0.1 too-large: the 0.51.0 -> 1.0.1 diff (3.66M characters) was reviewed for its network, credential, install-time and dependency surface instead (targeted review, 2026-10-19): no default-on network call, no listener in rtk, no new non-crates.io source in rtk's Cargo.lock, build.rs unchanged."
+
+[[ack]]
+fingerprint = "7ec9468a236a4023"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-23"
+reason = "rtk on main. RUSTSEC-2026-0382 rustls-webpki 0.103.13: certificate verification may accept distrusted intermediates. Upstream dependency advisory; reported, not fixed in the lane (ADR-0056 amendment 1)."
+
+[[ack]]
+fingerprint = "a4e6f703c72f505d"
+by = "devon (approved in session; recorded by Claude)"
+date = "2026-10-23"
+reason = "rtk on main. RUSTSEC-2026-0381 webpki-roots 1.0.6: bundled roots trust distrusted emSign intermediates. Upstream dependency advisory; reported, not fixed in the lane (ADR-0056 amendment 1)."
+
+[[ack]]
+fingerprint = "0736a725ffab1966"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 build-script build.rs: runs at build time. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "5566f7149a50a87a"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path proxy/Cargo.toml: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "6d2ea89313c618e6"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/core/task_cmd.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "162f762ca5fd7aea"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/agents_md.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "de6cd5585b49cbba"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/antigravity.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "c530bbc99e6076b6"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/claude.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "0805b36c6ad8dbe9"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/codex.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "f203edc016f1227a"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/cursor.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "a7f124c3bc7519f4"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/droid.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "667fe05c7002498c"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/gemini.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "a99ffc1aad6b6de9"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/hermes.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "977570b7822bef62"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/mod.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "e6fa7587e99ca30f"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/opencode.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "7046e7d1554c5f9e"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/pi.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "fff8b1c9c078f1e3"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/trae.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "0db3b26236b532f3"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/vibe.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "47b8fd393eb9e21b"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/llm_proxy.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "904ae562072d74f0"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 too-large : the diff is 914518 characters, over max_diff_chars (400000); it was not reviewed. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
