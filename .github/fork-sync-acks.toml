@@ -288,3 +288,111 @@ fingerprint = "a4e6f703c72f505d"
 by = "devon (approved in session; recorded by Claude)"
 date = "2026-10-23"
 reason = "rtk on main. RUSTSEC-2026-0381 webpki-roots 1.0.6: bundled roots trust distrusted emSign intermediates. Upstream dependency advisory; reported, not fixed in the lane (ADR-0056 amendment 1)."
+
+[[ack]]
+fingerprint = "0736a725ffab1966"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 build-script build.rs: runs at build time. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "5566f7149a50a87a"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path proxy/Cargo.toml: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "6d2ea89313c618e6"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/core/task_cmd.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "162f762ca5fd7aea"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/agents_md.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "de6cd5585b49cbba"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/antigravity.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "c530bbc99e6076b6"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/claude.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "0805b36c6ad8dbe9"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/codex.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "f203edc016f1227a"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/cursor.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "a7f124c3bc7519f4"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/droid.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "667fe05c7002498c"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/gemini.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "a99ffc1aad6b6de9"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/hermes.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "977570b7822bef62"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/mod.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "e6fa7587e99ca30f"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/opencode.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "7046e7d1554c5f9e"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/pi.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "fff8b1c9c078f1e3"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/trae.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "0db3b26236b532f3"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/hooks/init/vibe.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "47b8fd393eb9e21b"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 watched-path src/llm_proxy.rs: a watched path. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
+
+[[ack]]
+fingerprint = "904ae562072d74f0"
+by = "devon (approved in session 2026-10-26; recorded by Claude)"
+date = 2026-10-26
+reason = "AlobarQuest/rtk Upstream sync: v1.1.0 too-large : the diff is 914518 characters, over max_diff_chars (400000); it was not reviewed. Read the held paths' diff: build.rs only picks the Windows stack flag by target; hook installers write the same hooks and permissions, and uninstall removes more (rtk's own loopback ANTHROPIC_BASE_URL, exact @RTK.md lines); no new network, crates or execution."
