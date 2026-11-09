@@ -1,0 +1,117 @@
+# Rendered by `fork-sync scaffold` (AlobarQuest/orchestrator); `fork-sync check` reports drift.
+#
+# Rebuilds the `upstream-sync` branch from upstream's newest release matching
+# `.github/fork-sync.toml`, keeps this fork's whole `.github/` (so upstream workflows never enter),
+# commits a resolved lockfile when the declaration sets `generate_lockfile`, and opens or edits ONE
+# rolling pull request to main. It does not review: the `security review`
+# and `build and test` jobs in ci.yml run on that pull request and are required checks, so a sync
+# lands only when both pass.
+#
+# The App `fork-secure-upstream-sync` authors the branch and the pull request, so the inert
+# landing lane can permit that one author by name rather than every workflow here.
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      # For `lock`, which resolves a lockfile only when the declaration sets `generate_lockfile`.
+      # An exact version: npm's output can change between releases, and a lockfile that changed
+      # with the runner would re-review and re-alert a held sync on every rebuild.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.4.0'
+
+      - name: Find the upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          UPSTREAM=$(python3 .github/scripts/fork_sync_review.py upstream)
+          gh api "repos/${UPSTREAM}/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          TAG=$(python3 .github/scripts/fork_sync_review.py next-release "$RUNNER_TEMP/releases.json")
+          echo "Upstream ${UPSTREAM}: ${TAG:-nothing new}"
+          echo "upstream=${UPSTREAM}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      # Submodule gitlinks come across exactly as upstream has them; nothing here fetches their
+      # content. The security review reports any pointer change as a finding.
+      - name: Rebuild the sync branch
+        if: steps.release.outputs.tag != ''
+        env:
+          UPSTREAM: ${{ steps.release.outputs.upstream }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --no-tags upstream "refs/tags/${TAG}:refs/tags/${TAG}"
+          git checkout -B upstream-sync "refs/tags/${TAG}"
+          rm -rf .github
+          git checkout origin/main -- .github/
+          git add -A .github
+          python3 .github/scripts/fork_sync_review.py lock "$TAG"
+          # main is a second parent, so the pull request never three-way merges: a file only the
+          # fork has, such as a lockfile it owns, would otherwise conflict with every release
+          # (both sides add it). The tree is still the release plus the fork's .github alone.
+          SYNC=$(git commit-tree "$(git write-tree)" -p HEAD -p origin/main -m "fork-sync: keep the fork's .github over ${TAG}")
+          git reset --quiet --soft "$SYNC"
+          # Push only a different tree. A rebuild of the same tag over the same .github differs
+          # only in its commit date, and pushing it would re-run the review and re-raise the alert
+          # every day while a sync is held.
+          PUBLISHED=$(git rev-parse --verify --quiet "origin/upstream-sync^{tree}" || true)
+          if [ "$PUBLISHED" = "$(git rev-parse 'HEAD^{tree}')" ] \
+            && git merge-base --is-ancestor origin/main origin/upstream-sync; then
+            echo "upstream-sync already holds this tree; nothing to push"
+          else
+            git push --force origin upstream-sync
+          fi
+
+      - name: Open or update the pull request
+        if: steps.release.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          UPSTREAM: ${{ steps.release.outputs.upstream }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          {
+            printf '## Upstream sync: %s\n\n' "$TAG"
+            printf 'Release notes: https://github.com/%s/releases/tag/%s\n\n' "$UPSTREAM" "$TAG"
+            printf 'Commits (first 50), as an indented block so no subject can end it:\n\n'
+            git log origin/main..upstream-sync --oneline -- . ':!.github' | head -50 | sed 's/^/    /'
+            printf '\nThe `security review` check posts its findings as a comment.\n'
+          } > "$RUNNER_TEMP/body.md"
+          EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --head upstream-sync --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --title "Upstream sync: ${TAG}" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head upstream-sync --title "Upstream sync: ${TAG}" --body-file "$RUNNER_TEMP/body.md"
+          fi
